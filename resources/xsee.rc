@@ -1,0 +1,16 @@
+// Xsee application icon: 7 sizes, 16..256, all of them the focus-bracket
+// artwork. Regenerate with work/ui/make_ico.py.
+IDI_XSEE ICON "xsee.ico"
+
+// 文件格式牌：资源号 101 起，顺序必须和 fmticon::FMTS 一致，
+// 关联里按 `"<exe>",-<101 + 下标>` 引。由 cargo run --bin mkicons 生成。
+101 ICON "fmt\\jpg.ico"
+102 ICON "fmt\\png.ico"
+103 ICON "fmt\\psd.ico"
+104 ICON "fmt\\gif.ico"
+105 ICON "fmt\\bmp.ico"
+106 ICON "fmt\\tif.ico"
+107 ICON "fmt\\webp.ico"
+108 ICON "fmt\\heic.ico"
+109 ICON "fmt\\ico.ico"
+110 ICON "fmt\\raw.ico"

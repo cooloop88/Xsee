@@ -1,0 +1,7 @@
+/target
+/.build/
+/data
+/thumbs
+*.exe
+*.pdb
+*.prev_*
