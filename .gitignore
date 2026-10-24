@@ -5,3 +5,4 @@
 *.exe
 *.pdb
 *.prev_*
+/dist/
