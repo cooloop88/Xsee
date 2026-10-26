@@ -26,6 +26,7 @@ fn ext(path: &str) -> Option<String> {
 
 /// 相机 RAW 后缀。WIC 一个都不认，档里那条内嵌 JPEG 是唯一能看的东西。
 /// 这个判断只这一处，扫描器列不列它们也走它。
+/// 2026-10-26 对照 ACDSee 的 RAW 清单补齐 12 个：crw/nrw/rwl/mrw/kdc/k25/dcr/erf/mos/srf/sr2/raw。
 pub fn is_raw(path: &str) -> bool {
     matches!(
         ext(path).as_deref(),
@@ -43,6 +44,18 @@ pub fn is_raw(path: &str) -> bool {
             | Some("3fr")
             | Some("fff")
             | Some("iiq")
+            | Some("crw")
+            | Some("nrw")
+            | Some("rwl")
+            | Some("mrw")
+            | Some("kdc")
+            | Some("k25")
+            | Some("dcr")
+            | Some("erf")
+            | Some("mos")
+            | Some("srf")
+            | Some("sr2")
+            | Some("raw")
     )
 }
 

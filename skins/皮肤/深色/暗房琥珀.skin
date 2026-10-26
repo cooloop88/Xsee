@@ -1,0 +1,32 @@
+﻿# C 暗房：炭褐、铜色，哑光、不刺眼。
+# 与圆角卡片同一套几何和字号，只换配色；字体/渐变可在“皮肤设置”里再调。
+name=暗房琥珀
+style=cards_rich
+order=6
+default=0
+
+base=0x191614
+surface=0x201c18
+canvas=0x131110
+ink=0xece5da
+dim=0xa79c8d
+accent=0xc9955c
+border=0x3a332b
+mark=0xe4b97f
+
+chrome=0x201c18
+chrome_hi=0x25201b
+pane=0x1b1815
+pane_head=0x171411
+grid=0x27221c
+line=0x3a332b
+line_soft=0x2c2721
+off=0x6d6458
+inv=0x1f160d
+hov=0x2a241d
+prs=0x322b23
+sel=0x4a3621
+sel_ink=0xf6e1c4
+acc_soft=0x4a3724
+flash=0x3a2b1b
+focus=0xc9955c

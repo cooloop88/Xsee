@@ -10,6 +10,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::ExtendedColorType;
 
 use crate::Rgba;
+use crate::scan;
 
 /// 自己的缩略图缓存：定长索引 + 只追加的数据段。
 /// 索引每条 80 字节，数据段存 JPEG，读命中只要解一张几十 KB 的小 JPEG。
@@ -492,6 +493,22 @@ pub fn peek(path: &str, bw: u32, bh: u32) -> Option<Rgba> {
     cached(path, bw, bh).and_then(|(_, jpg)| jpg.as_deref().and_then(to_rgba))
 }
 
+/// 这条路径在这一档有没有"现在还作数"的缩略图：原图时间戳、大小都得对得上，
+/// 长度还得真有数据（只剩指纹的记录不算）。只查索引不解 JPEG，也不碰数据段——
+/// 扫描文件夹判断"这张扫过没有"靠它，几万张也只是几万次 stat 加查表。
+pub fn has_thumb(path: &str, bw: u32, bh: u32) -> bool {
+    if !enabled() || bw > u16::MAX as u32 || bh > u16::MAX as u32 {
+        return false;
+    }
+    let Some(st) = stamp(path) else { return false };
+    let key = (fnv(path), bw as u16, bh as u16);
+    idx().lock().map_or(false, |i| {
+        i.map
+            .get(&key)
+            .is_some_and(|s| s.len > 0 && s.mtime == st.mtime && s.size == st.size)
+    })
+}
+
 /// 这一轮里有多少张是缓存直接给的（一张原图都没解）。
 pub fn hits() -> u64 {
     HITS.load(Ordering::Relaxed)
@@ -554,6 +571,11 @@ pub fn move_path(old: &str, new: &str) {
                     break;
                 }
                 if f.write_all(&jpg).is_err() {
+                    // 半途失败时真实 EOF 已越过 pos（append 的写永远落在文件尾），
+                    // 先对齐再退出，别让后面每条记录都指向残骸。
+                    if let Ok(m) = f.metadata() {
+                        pos = m.len();
+                    }
                     break;
                 }
                 copied.push((
@@ -657,8 +679,22 @@ fn put(path: &str, st: Stamp, key: Key, img: &Rgba, fp: Option<Fp>) {
         if off.checked_add(jpg.len() as u64).unwrap_or(u64::MAX) > u32::MAX as u64 {
             return;
         }
-        let Some(f) = d.file.as_mut() else { return };
-        if f.write_all(&jpg).is_err() {
+        let mut wrote = false;
+        let mut sync_pos: Option<u64> = None;
+        if let Some(f) = d.file.as_mut() {
+            wrote = f.write_all(&jpg).is_ok();
+            if !wrote {
+                // 半途失败（典型是盘满）时真实 EOF 已经越过 pos；append 句柄的写
+                // 永远落在真实文件尾，不同步回去，后面每条记录的 off 都指向残骸。
+                if let Ok(m) = f.metadata() {
+                    sync_pos = Some(m.len());
+                }
+            }
+        }
+        if let Some(p) = sync_pos {
+            d.pos = p;
+        }
+        if !wrote {
             return;
         }
         d.pos = off + jpg.len() as u64;
@@ -691,8 +727,9 @@ pub fn stats() -> (usize, u64) {
 
 /// 把一枚指纹挂到已有的索引键上。缩略图指针原样留着——指纹和缩略图是一条记录，
 /// 这一步只补那 40 个字节。原图时间戳对不上就不硬挂：旧指纹配新图会认错。
+/// 排除规则命中的路一律不挂：贴图的缩略图照常缓存，但不进搜图库。
 pub fn attach_fp(path: &str, bw: u32, bh: u32, fp: Fp) {
-    if !enabled() || bw > u16::MAX as u32 || bh > u16::MAX as u32 {
+    if !enabled() || scan::excluded(path) || bw > u16::MAX as u32 || bh > u16::MAX as u32 {
         return;
     }
     let Some(st) = stamp(path) else { return };
@@ -825,7 +862,7 @@ pub fn import_fps(rows: &[(String, u32, u32, u32, u64, Fp)]) -> bool {
         let Ok(mut i) = idx().lock() else { return false };
         let mut buf = Vec::new();
         for (path, bw, bh, mtime, size, fp) in rows {
-            if *bw > u16::MAX as u32 || *bh > u16::MAX as u32 {
+            if *bw > u16::MAX as u32 || *bh > u16::MAX as u32 || scan::excluded(path) {
                 continue;
             }
             let key = (fnv(path), *bw as u16, *bh as u16);

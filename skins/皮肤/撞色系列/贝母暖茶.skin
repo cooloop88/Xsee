@@ -1,0 +1,33 @@
+# 贝母暖茶：颜色直接取自参考图的像素，不照抄图上印的 RGB 文字。
+#   贝母白圆盘中位像素 #EAE6DE（234,230,222），暖茶白圆盘 #CCB8A1（204,184,161）。
+# 所有中性层按贝母白同色相等比提亮/压暗，饱和度不抬；暖茶只出现在标题栏、选中、悬停、标记。
+name=贝母暖茶
+style=cards_rich
+order=30
+default=0
+
+base=0xeae6de
+surface=0xebe8e0
+canvas=0xdcd8d1
+ink=0x1f1e1b
+dim=0x4a4945
+accent=0xccb8a1
+border=0xb7b1a8
+mark=0x73675b
+
+chrome=0xebe8e0
+chrome_hi=0xece9e2
+pane=0xeae6de
+pane_head=0xd7d3ca
+grid=0xe2dfd9
+line=0xb7b1a8
+line_soft=0xcdc8bf
+off=0x94938e
+inv=0xfffcf3
+hov=0xe6dfd5
+prs=0xe2dacd
+sel=0xa59582
+sel_ink=0x1d1c19
+acc_soft=0xe3dbd0
+flash=0xe3dbd0
+focus=0xd0bda8

@@ -102,15 +102,17 @@ fn decode(path: &str, bw: u32, bh: u32) -> Result<Thumb> {
     // （44MP 峰值 350MB）且 16 位上慢 7 倍，端到端持平，所以仍旧只走 WIC。
     // 档内预览坏掉不能把整张图判死：内嵌段解不动就回落到老实开原图。
     // （xmppmax_v1_10_1_5_g.jpg 正是这种：内嵌那段报 0x88982F61，原图 WIC 全解 243ms 好好的。）
-    let made = from_embedded(path, bw, bh).unwrap_or_else(|| {
-        // PSD 没有 WIC 解码器，档内预览又不可用时只剩自己解合成图这一条。
-        if let Some(t) = from_psd(path, bw, bh) {
-            return t;
-        }
-        // 没有可用的档内预览才要开原图，这一步才是内存大户。
-        let _p = if big_file(path) { big_permit() } else { None };
-        make_wic(path, bw, bh)
-    });
+    let made = from_embedded(path, bw, bh)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            // PSD 没有 WIC 解码器，档内预览又不可用时只剩自己解合成图这一条。
+            if let Some(t) = from_psd(path, bw, bh) {
+                return t;
+            }
+            // 没有可用的档内预览才要开原图，这一步才是内存大户。
+            let _p = if big_file(path) { big_permit() } else { None };
+            make_wic(path, bw, bh)
+        });
     let mut t = match made {
         Ok(t) => t,
         Err(e) => {
@@ -276,13 +278,16 @@ pub fn embedded_view(path: &str, bw: u32, bh: u32) -> Option<View> {
     Some(View { w, h, nw, nh, px })
 }
 
-/// 有档内预览就直接用，省掉整张解码。预览撑不满目标框就不如老实解码，返回 None。
-fn from_embedded(path: &str, bw: u32, bh: u32) -> Option<Result<Thumb>> {
+/// 有档内预览就直接用，省掉整张解码。预览撑不满目标框、或预览段解不出像素
+/// （建得出帧、CopyPixels 失败的坏预览）都返回 None，让调用方回落老实解码。
+fn from_embedded(path: &str, bw: u32, bh: u32) -> Option<Thumb> {
     let e = embedded_frame(path, bw.min(bh))?;
-    Some(crate::dec::source_to_box(&e.factory, &e.frame, bw, bh).map(|img| Thumb {
-        img,
-        from_preview: true,
-    }))
+    crate::dec::source_to_box(&e.factory, &e.frame, bw, bh)
+        .ok()
+        .map(|img| Thumb {
+            img,
+            from_preview: true,
+        })
 }
 
 /// 解 PSD 合成图并缩到目标框，返回 (原图宽, 原图高, 出图宽, 出图高, BGRA)。

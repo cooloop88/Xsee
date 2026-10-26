@@ -18,6 +18,7 @@ pub mod psd;
 pub mod refwin;
 pub mod scan;
 pub mod sim;
+pub mod sysicon;
 pub mod theme;
 pub mod viewer;
 

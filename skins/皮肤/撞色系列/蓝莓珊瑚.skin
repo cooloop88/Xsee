@@ -1,0 +1,33 @@
+# 蓝莓珊瑚：颜色取自参考图像素，不照抄图上印的 RGB 文字。
+#   珊瑚粉红圆盘中位像素 #B597A4（181,151,164），蓝莓圆盘 #3C3F49（60,63,73）。
+# 蓝莓深底铺浅白正文（11.3:1），珊瑚粉只给标题栏、选中、悬停、标记；中性层按蓝莓同色相等比明暗派生。
+name=蓝莓珊瑚
+style=cards_rich
+order=34
+default=0
+
+base=0x3c3f49
+surface=0x454852
+canvas=0x33363f
+ink=0xf9f7fa
+dim=0xc6c4cd
+accent=0xb597a4
+border=0x2a2c33
+mark=0xc7a3b1
+
+chrome=0x454852
+chrome_hi=0x4c4f59
+pane=0x393c45
+pane_head=0x41444d
+grid=0x3f424c
+line=0x2a2c33
+line_soft=0x343740
+off=0x8d8b96
+inv=0x2a2026
+hov=0x55535d
+prs=0x625d67
+sel=0x776471
+sel_ink=0xfaf8fb
+acc_soft=0x57525d
+flash=0x57525d
+focus=0xbd9fac

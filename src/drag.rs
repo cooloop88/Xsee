@@ -6,7 +6,7 @@
 use windows::core::{implement, PCWSTR, Interface, BOOL, HRESULT, Result};
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
-    E_NOTIMPL, OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
+    E_NOTIMPL, GlobalFree, OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
 };
 use windows::Win32::System::Com::{
     DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
@@ -16,15 +16,15 @@ use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
     CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DoDragDrop,
-    IDropSource, IDropSource_Impl,
+    IDropSource, IDropSource_Impl, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::{
     CFSTR_PERFORMEDDROPEFFECT, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
 };
 
-/// 目标程序拿这个决定"不按 Ctrl 时算复制还是剪切"。往别的文件夹或桌面拖
-/// 默认是复制，原文件留在原处；按住 Shift 由目标程序自己改成移动。
+/// 目标程序拿这个决定"不按 Ctrl 时算复制还是移动"。默认按移动报过去，
+/// 拖进别的文件夹就是搬走，原位置不留；按住 Ctrl 由目标程序自己改成复制。
 const PREF: PCWSTR = CFSTR_PREFERREDDROPEFFECT;
 const PERF: PCWSTR = CFSTR_PERFORMEDDROPEFFECT;
 
@@ -68,6 +68,7 @@ unsafe fn dword(v: u32) -> Result<STGMEDIUM> {
     let h = GlobalAlloc(GMEM_MOVEABLE, 4)?;
     let p = GlobalLock(h);
     if p.is_null() {
+        let _ = GlobalFree(Some(h));
         return Err(E_NOTIMPL.into());
     }
     (p as *mut u32).write(v);
@@ -84,7 +85,7 @@ impl IDataObject_Impl for FileDrop_Impl {
         unsafe {
             let f = &*pformatetcin;
             if is_name(f, PREF) {
-                return dword(DROPEFFECT_COPY.0);
+                return dword(DROPEFFECT_MOVE.0);
             }
             if is_name(f, PERF) {
                 return dword(self.performed.load(std::sync::atomic::Ordering::SeqCst));
@@ -103,6 +104,7 @@ impl IDataObject_Impl for FileDrop_Impl {
             let h = GlobalAlloc(GMEM_MOVEABLE, bytes)?;
             let p = GlobalLock(h);
             if p.is_null() {
+                let _ = GlobalFree(Some(h));
                 return Err(E_NOTIMPL.into());
             }
             let df = p as *mut DROPFILES;
@@ -154,7 +156,7 @@ impl IDataObject_Impl for FileDrop_Impl {
     }
 
     /// 目标程序 drop 完会写回它实际做了什么效果。这里必须收下，否则 OLE 报错。
-    fn SetData(&self, f: *const FORMATETC, m: *const STGMEDIUM, _r: BOOL) -> Result<()> {
+    fn SetData(&self, f: *const FORMATETC, m: *const STGMEDIUM, f_release: BOOL) -> Result<()> {
         unsafe {
             let fm = &*f;
             if is_name(fm, PERF) && (*m).tymed == TYMED_HGLOBAL.0 as u32 {
@@ -167,6 +169,11 @@ impl IDataObject_Impl for FileDrop_Impl {
                         let _ = GlobalUnlock(h);
                     }
                 }
+            }
+            // fRelease=TRUE 时 medium 的所有权归收方：读完要按契约放掉，
+            // 不然有些目标程序每次拖动会漏一小块。FALSE 时仍归调用方。
+            if f_release.as_bool() {
+                ReleaseStgMedium(m as *mut STGMEDIUM);
             }
             Ok(())
         }
@@ -248,7 +255,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefers_copy() {
+    fn prefers_move() {
         let data: IDataObject = FileDrop {
             paths: vec![r"G:\q\x.jpg".to_string()],
             performed: Default::default(),
@@ -261,7 +268,7 @@ mod tests {
         };
         unsafe {
             let p = GlobalLock(m.u.hGlobal) as *const u32;
-            assert_eq!(*p, DROPEFFECT_COPY.0);
+            assert_eq!(*p, DROPEFFECT_MOVE.0);
             let _ = GlobalUnlock(m.u.hGlobal);
         }
     }

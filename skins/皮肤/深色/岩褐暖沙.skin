@@ -1,0 +1,32 @@
+﻿# G 岩褐：中暗调，岩褐/铜色，有暗房味但不压照片。
+# 与圆角卡片同一套几何和字号，只换配色；字体/渐变可在“皮肤设置”里再调。
+name=岩褐暖沙
+style=cards_rich
+order=10
+default=0
+
+base=0x625b51
+surface=0x5b544b
+canvas=0x575047
+ink=0xefe8dd
+dim=0xc7bdb0
+accent=0xc39266
+border=0x847b6f
+mark=0xf0d0aa
+
+chrome=0x5b544b
+chrome_hi=0x6b645a
+pane=0x665f55
+pane_head=0x5e574e
+grid=0x70685d
+line=0x847b6f
+line_soft=0x746c61
+off=0xa59a8b
+inv=0x2a1c10
+hov=0x70675b
+prs=0x786f63
+sel=0x8a6245
+sel_ink=0xf8e8d4
+acc_soft=0x7d614b
+flash=0x7d5f45
+focus=0xc39266

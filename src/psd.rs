@@ -77,7 +77,9 @@ pub fn decode(path: &str) -> Option<(u32, u32, Vec<u8>)> {
     if comp > 1 {
         return None;
     }
-    pos += 3;
+    // 压缩字段是 2 字节，不是 3：多算的那 1 字节会让"恰好压满 EOF 的
+    // 未压缩档"被这个越界检查拒掉。
+    pos += 2;
 
     let sample = depth / 8;
     let row = width * sample;
@@ -104,6 +106,12 @@ pub fn decode(path: &str) -> Option<(u32, u32, Vec<u8>)> {
                 } else {
                     u16b(&table, (c * height + y) * 2)
                 };
+                // 行字节上限 = 一行原样 + 每段最多 1 字节记号（PackBits 的理论最坏值）。
+                // 坏档/构造档声称一行几 GB 时不能照单 resize，分配失败整个进程直接 abort。
+                let cap = row + row / 128 + 2;
+                if n > cap {
+                    return None;
+                }
                 packed.resize(n, 0);
                 f.read_exact(&mut packed).ok()?;
                 let dst = &mut planes[c][y * row..][..row];
@@ -126,10 +134,14 @@ pub fn decode(path: &str) -> Option<(u32, u32, Vec<u8>)> {
                 px[d] = planes[2][o];
                 px[d + 3] = if channels >= 4 { planes[3][o] } else { 255 };
             } else {
+                // PSD 规范：CMYK 通道在文件里是反相存的（255 = 无墨，白纸四个通道都是 255）。
+                // 先按字节反相得墨量，再走同一套"墨量相加压到 255"的换算：
+                //   out = 255 - min(255, (255-c) + (255-k)) = (c + k) - 255，负数截 0。
+                // 自检：白纸 (255,255) → 255；纯黑 K(0) → 0；50% 灰 K(128) → 128；全青 (0,255) → (0,255,255)。
                 let k = planes[3][o] as u16;
-                px[d + 2] = 255 - (planes[0][o] as u16 + k).min(255) as u8;
-                px[d + 1] = 255 - (planes[1][o] as u16 + k).min(255) as u8;
-                px[d] = 255 - (planes[2][o] as u16 + k).min(255) as u8;
+                px[d + 2] = (planes[0][o] as u16 + k).saturating_sub(255) as u8;
+                px[d + 1] = (planes[1][o] as u16 + k).saturating_sub(255) as u8;
+                px[d] = (planes[2][o] as u16 + k).saturating_sub(255) as u8;
                 px[d + 3] = if channels >= 5 { planes[4][o] } else { 255 };
             }
         }

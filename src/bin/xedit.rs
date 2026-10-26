@@ -81,10 +81,8 @@ const D_SAVE: usize = 730;
 const D_DISCARD: usize = 731;
 const D_STAY: usize = 732;
 const D_KEEP: usize = 740;
-const D_FILTER: usize = 741;
 const D_FW: usize = 742;
 const D_FH: usize = 743;
-const RESIZE_FILTERS: [&str; 4] = ["Lanczos", "Bicubic", "Bilinear", "Nearest"];
 
 struct Mi {
     label: &'static str,
@@ -132,7 +130,7 @@ const ADJUST_MENU: &[Mi] = &[
     mi("旋转 180°", "", M_ROT180),
     mi("水平翻转（左右）", "", M_FLIPH),
     mi("垂直翻转（上下）", "", M_FLIPV),
-    mi("裁剪(C)", "Enter 应用", M_CROP),
+    mi("裁剪(C)", "Enter/双击 应用", M_CROP),
 ];
 const TB_ROT_MENU: &[Mi] = &[
     mi("向左旋转 90°", "", M_ROT270),
@@ -335,7 +333,6 @@ struct Ed {
     status: String,
     notify: Option<isize>,
     dirty: bool,
-    hover: usize,
 }
 
 fn ed() -> &'static Mutex<Ed> {
@@ -384,13 +381,26 @@ fn ed() -> &'static Mutex<Ed> {
             status: String::new(),
             notify: None,
             dirty: false,
-            hover: 0,
         })
     })
 }
 
 fn pw(s: &str) -> &'static [u16] {
-    Box::leak(s.encode_utf16().chain([0]).collect::<Vec<u16>>().into_boxed_slice())
+    // 字体名就那几样：按值缓存住。原来每次 Box::leak 一份，跨 DPI 显示器
+    // 拖几个来回就攒几份永远不还的内存。
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, &'static [u16]>>> =
+        std::sync::OnceLock::new();
+    let mut m = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(v) = m.get(s) {
+        return *v;
+    }
+    let leaked: &'static [u16] =
+        Box::leak(s.encode_utf16().chain([0]).collect::<Vec<u16>>().into_boxed_slice());
+    m.insert(s.to_string(), leaked);
+    leaked
 }
 
 fn stem(path: &Path) -> String {
@@ -413,25 +423,11 @@ unsafe fn frame(hdc: HDC, r: &RECT, c: u32) {
     let _ = DeleteObject(HGDIOBJ(b.0));
 }
 
-unsafe fn vgrad(hdc: HDC, r: &RECT, top: u32, bot: u32) {
-    let h = (r.bottom - r.top).max(1);
-    for i in 0..h {
-        let t = i as f64 / h as f64;
-        let c = theme::mix(top, bot, t);
-        let line = RECT { left: r.left, top: r.top + i, right: r.right, bottom: r.top + i + 1 };
-        fill(hdc, &line, c);
-    }
-}
-
 // ── 下面这组条带工艺与主窗口同一套：尺寸令牌、底色、蚀刻边、悬停态全部照搬，
 //    编辑器不再自成一套比例。
 
 fn bands(th: &Theme) -> bool {
     th.style != theme::Style::Plain
-}
-
-fn cards(th: &Theme) -> bool {
-    th.style.is_cards()
 }
 
 /// 三套完整版式的判据全部走 theme::Style，和主窗口问的是同一句：
@@ -442,6 +438,10 @@ fn fine(th: &Theme) -> bool {
 
 fn draft(th: &Theme) -> bool {
     th.style.is_draft()
+}
+
+fn quiet(th: &Theme) -> bool {
+    th.style.is_quiet()
 }
 
 /// 圆角裁剪。GDI 的裁剪区没有栈：先把当前那份取出来存着，画完再放回去。
@@ -473,7 +473,13 @@ unsafe fn unround(hdc: HDC, keep: Option<HRGN>) {
 
 /// 圆角描边一圈。GDI 描不了半透明，颜色由调用方按底下那层换算好。
 unsafe fn rring(hdc: HDC, r: &RECT, rad: i32, c: u32) {
-    let pen = CreatePen(PS_SOLID, 1, cref(c));
+    rring_w(hdc, r, rad, c, 1);
+}
+
+/// 圆角框带笔宽。GDI 的笔压在路径正中，要让它整条落在 r 里面，
+/// 传进来的 r 得先往里缩 w / 2。
+unsafe fn rring_w(hdc: HDC, r: &RECT, rad: i32, c: u32, w: i32) {
+    let pen = CreatePen(PS_SOLID, w, cref(c));
     let op = SelectObject(hdc, HGDIOBJ(pen.0));
     let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, rad * 2, rad * 2);
@@ -488,47 +494,6 @@ unsafe fn hline(hdc: HDC, x0: i32, x1: i32, y: i32, c: u32) {
 
 unsafe fn vline(hdc: HDC, x: i32, y0: i32, y1: i32, c: u32) {
     fill(hdc, &RECT { left: x, top: y0, right: x + 1, bottom: y1.max(y0 + 1) }, c);
-}
-
-unsafe fn hgrad(hdc: HDC, r: &RECT, a: u32, b: u32) {
-    let w = (r.right - r.left).max(1);
-    let st = 4;
-    let mut x = r.left;
-    while x < r.right {
-        let x2 = (x + st).min(r.right);
-        let t = ((x + x2) / 2 - r.left) as f64 / (w - 1).max(1) as f64;
-        fill(hdc, &RECT { left: x, top: r.top, right: x2, bottom: r.bottom }, theme::mix(a, b, t));
-        x = x2;
-    }
-}
-
-fn vtx(x: i32, y: i32, c: u32) -> TRIVERTEX {
-    TRIVERTEX {
-        x,
-        y,
-        Red: (((c >> 16) & 0xff) as u16) << 8,
-        Green: (((c >> 8) & 0xff) as u16) << 8,
-        Blue: ((c & 0xff) as u16) << 8,
-        Alpha: 0,
-    }
-}
-
-unsafe fn edge(hdc: HDC, y: i32, x0: i32, x1: i32, from: u32, to: u32, kick: f64) {
-    if x1 - x0 < 2 {
-        fill(hdc, &RECT { left: x0, top: y, right: x1, bottom: y + 1 }, to);
-        return;
-    }
-    let mid = x0 + ((x1 - x0) as f64 * kick).round() as i32;
-    if mid <= x0 {
-        fill(hdc, &RECT { left: x0, top: y, right: x1, bottom: y + 1 }, to);
-        return;
-    }
-    let vx = [vtx(x0, y, from), vtx(mid.min(x1), y, to)];
-    let gr = GRADIENT_RECT { UpperLeft: 0, LowerRight: 1 };
-    let _ = GradientFill(hdc, &vx, &gr as *const _ as *const _, 1, GRADIENT_FILL_RECT_H);
-    if mid < x1 {
-        fill(hdc, &RECT { left: mid, top: y, right: x1, bottom: y + 1 }, to);
-    }
 }
 
 unsafe fn veil(hdc: HDC, r: &RECT, c: u32, alpha: u8) {
@@ -570,33 +535,22 @@ unsafe fn veil(hdc: HDC, r: &RECT, c: u32, alpha: u8) {
 
 unsafe fn shell(hdc: HDC, g: &RECT, th: &Theme, base: u32, lit: bool, border_top: bool) {
     let s = th.skin;
-    if lit && cards(th) {
-        hgrad(hdc, g, th.grad.tool_a(&s), th.grad.tool_b(&s));
-    } else {
-        fill(hdc, g, base);
-    }
+    fill(hdc, g, if lit { theme::mix(base, s.chrome_hi, 0.10) } else { base });
     let bc = if bands(th) { s.line_soft } else { s.line };
     if border_top {
         hline(hdc, g.left, g.right, g.top, bc);
-        if cards(th) {
-            edge(hdc, g.top, g.left, g.right, base, s.line_soft, 0.46);
-            edge(hdc, g.bottom - 1, g.left, g.right, base, theme::mix(base, s.canvas, 0.78), 0.55);
-        }
     } else {
         hline(hdc, g.left, g.right, g.bottom - 1, bc);
-        if cards(th) {
-            edge(hdc, g.top, g.left, g.right, base, s.line_soft, 0.46);
-            edge(hdc, g.bottom - 2, g.left, g.right, base, theme::mix(base, s.canvas, 0.78), 0.55);
-        }
     }
 }
 
-unsafe fn soft_shadow(hdc: HDC, r: &RECT, down: i32) {
-    for i in 0..6 {
-        let d = i * 2;
-        let q = RECT { left: r.left - d, top: r.top + down - d, right: r.right + d, bottom: r.bottom + down + d };
-        veil(hdc, &q, 0x000000, (26 - i * 4).max(4) as u8);
-    }
+/// 弹层投影，跟主窗口同一套：同尺寸灰纱往右下让 6 像素、AlphaBlend 50%。
+const SHADOW_GRAY: u32 = 0x009E9E9E;
+
+unsafe fn drop_shadow(hdc: HDC, r: &RECT, k: f64) {
+    let off = (4.0 * k) as i32 + 1;
+    let q = RECT { left: r.left + off, top: r.top + off, right: r.right + off, bottom: r.bottom + off };
+    veil(hdc, &q, SHADOW_GRAY, 128);
 }
 
 unsafe fn xmark(hdc: HDC, cx: i32, cy: i32, d: i32, col: u32) {
@@ -668,24 +622,6 @@ unsafe fn line(hdc: HDC, c: u32, w: i32, x0: i32, y0: i32, x1: i32, y1: i32) {
     let old = SelectObject(hdc, HGDIOBJ(p.0));
     let _ = MoveToEx(hdc, x0, y0, None);
     let _ = LineTo(hdc, x1, y1);
-    SelectObject(hdc, old);
-    let _ = DeleteObject(HGDIOBJ(p.0));
-}
-
-unsafe fn outline(hdc: HDC, c: u32, w: i32, r: &RECT) {
-    let p = CreatePen(PS_SOLID, w, cref(c));
-    let old = SelectObject(hdc, HGDIOBJ(p.0));
-    let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-    SelectObject(hdc, old);
-    let _ = DeleteObject(HGDIOBJ(p.0));
-}
-
-unsafe fn circle(hdc: HDC, c: u32, w: i32, x: i32, y: i32, rad: i32) {
-    let p = CreatePen(PS_SOLID, w, cref(c));
-    let old = SelectObject(hdc, HGDIOBJ(p.0));
-    let _ = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let _ = Ellipse(hdc, x - rad, y - rad, x + rad, y + rad);
     SelectObject(hdc, old);
     let _ = DeleteObject(HGDIOBJ(p.0));
 }
@@ -1162,14 +1098,6 @@ fn pop_geom(g: &Ed, l: &Lay, idx: usize) -> Vec<(usize, RECT)> {
     out
 }
 
-unsafe fn pop_rect_of(g: &Ed, l: &Lay, idx: usize) -> RECT {
-    let rows = pop_geom(g, l, idx);
-    if rows.is_empty() {
-        return RECT { left: 0, top: 0, right: 0, bottom: 0 };
-    }
-    RECT { left: rows[0].1.left, top: rows[0].1.top, right: rows[0].1.right, bottom: rows[rows.len() - 1].1.bottom }
-}
-
 fn tb_pop_geom(g: &Ed, l: &Lay, id: usize) -> Vec<(usize, RECT)> {
     let k = g.scale;
     let th = &g.th;
@@ -1244,7 +1172,7 @@ unsafe fn dlg_rect_for(g: &Ed, l: &Lay, kind: PK) -> RECT {
     let h = if kind == PK::Exit {
         (168.0 * k) as i32
     } else if kind == PK::Resize {
-        (250.0 * k) as i32
+        (218.0 * k) as i32
     } else {
         (118.0 * k + n as f64 * 38.0 * k) as i32
     };
@@ -1327,7 +1255,7 @@ fn render_param(base: &RgbaImage, d: &Dlg) -> (Option<RgbaImage>, String) {
             if w as u64 * h as u64 > 200_000_000 {
                 return (None, "目标尺寸过大，没有执行".to_string());
             }
-            let img = edit::resize_filter(base, w, h, v[2].max(0.0) as usize);
+            let img = edit::resize(base, w, h);
             (Some(img), format!("已调整为 {w} × {h}"))
         }
         PK::Rotate => {
@@ -1426,6 +1354,12 @@ unsafe fn update_title(g: &Ed) {
 }
 
 unsafe fn load_file(g: &mut Ed, path: &Path) -> Result<(), String> {
+    // 换文件前把开着的参数框整个丢掉（不还原）：dlg_base 还指着上一张图，
+    // 留着的话 Esc 一还原就把旧图挂在新路径上，再一保存就是张冠李戴。
+    g.dlg = None;
+    g.dlg_base = None;
+    g.dlg_drag = None;
+    g.row_drag = None;
     let img = encode::decode(&path.to_string_lossy(), false)?;
     g.orig = img.clone();
     g.img = img;
@@ -1566,6 +1500,12 @@ unsafe fn open_path(hwnd: HWND, p: &Path) {
 
 unsafe fn request_exit(hwnd: HWND) {
     let mut g = ed().lock().unwrap();
+    // 参数框还开着就先收掉（预览作废、回到打开框前那张），再问要不要保存。
+    // 不然关闭询问这一页会把没提交的预览定格成工作图，取消后撤销链直接跳档。
+    if g.dlg.is_some() {
+        close_dlg(&mut g);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
     if g.dirty {
         open_param(hwnd, &mut g, PK::Exit);
         return;
@@ -1602,7 +1542,8 @@ unsafe fn do_command(hwnd: HWND, id: usize) {
                 g.redo.push(cur);
                 g.img = prev;
                 refresh_dib(&mut g);
-                g.dirty = true;
+                // 撤回到和原图一模一样就不算脏了，关闭时不再问"保存更改"。
+                g.dirty = g.orig != g.img;
             } else {
                 g.status = "没有可撤销的操作".to_string();
             }
@@ -1613,7 +1554,7 @@ unsafe fn do_command(hwnd: HWND, id: usize) {
                 g.undo.push(cur);
                 g.img = next;
                 refresh_dib(&mut g);
-                g.dirty = true;
+                g.dirty = g.orig != g.img;
             } else {
                 g.status = "没有可重做的操作".to_string();
             }
@@ -1625,6 +1566,9 @@ unsafe fn do_command(hwnd: HWND, id: usize) {
                 push_undo(&mut g);
                 let o = g.orig.clone();
                 set_img(&mut g, o);
+                // 还原后就是盘上那张：不置脏，标题不带星号。
+                g.dirty = false;
+                update_title(&g);
             }
         }
         M_FIT => {
@@ -1702,7 +1646,7 @@ unsafe fn do_command(hwnd: HWND, id: usize) {
                 g.crop_mode = !g.crop_mode;
                 g.crop = None;
                 g.status = if g.crop_mode {
-                    "拖动框选要保留的区域，Enter 应用，Esc 取消".to_string()
+                    "拖动框选要保留的区域，Enter 或双击应用，Esc 取消".to_string()
                 } else {
                     String::new()
                 };
@@ -1762,16 +1706,12 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     let k = g.scale;
     fill(hdc, &rc, s.win);
 
-    // 标题栏：底色、渐变、底缘那条线、按钮几何、四套版式的层次，全部取自 theme::Strip，
-    // 和主窗口那一条是同一份算法算出来的，不再这里另定一套。
+    // 标题栏：底色、底缘那条线、按钮几何、四套版式的层次，全部取自 theme::Strip，
+    // 和主窗口那一条是同一份算法算出来的，不再这里另定一套。整条铺纯色，不做渐变。
     let st = theme::Strip::top(&th);
     let bar = st.bar;
     let g0 = &l.title;
-    if st.grad {
-        vgrad(hdc, g0, st.bar, st.bar_lo);
-    } else {
-        fill(hdc, g0, st.bar);
-    }
+    fill(hdc, g0, st.bar);
     hline(hdc, g0.left, g0.right, g0.bottom - 1, st.edge);
     if st.ruler {
         // 制图台：左下压一道短尺，和主窗口标题栏同一个记号
@@ -1874,8 +1814,8 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
 
-    // 菜单条：读字的一行，底色比上下都暗一档
-    let mbase = theme::mix(s.chrome, s.canvas, 0.26);
+    // 菜单条：读字的一行，底色是独立的 menu 槽，和浏览窗跟着同一套皮肤走
+    let mbase = s.menu;
     shell(hdc, &l.menu, &th, mbase, false, false);
     g.mb_rows.clear();
     let pad = (8.0 * k).round() as i32;
@@ -1922,7 +1862,9 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             let y1 = l.bar.bottom - (4.0 * k) as i32;
             let m = (3.0 * k).round() as i32;
             vline(hdc, tx + m, y0, y1, s.line_soft);
-            if !bands(&th) {
+            if fine(&th) {
+                vline(hdc, tx + m + 1, y0, y1, theme::mix(s.chrome_hi, s.canvas, 0.22));
+            } else if !bands(&th) {
                 vline(hdc, tx + m + 1, y0, y1, s.chrome_hi);
             }
             tx += m * 2 + 2;
@@ -1933,28 +1875,86 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         let r = RECT { left: tx, top: l.bar.top + 2, right: tx + w, bottom: l.bar.bottom - 2 };
         let hot = over(&r, g.pt.0, g.pt.1);
         let on = t.id == M_CROP && g.crop_mode;
+        // 悬停底色和主窗口 paint_bar 同一档换算：精细/制图/静谧各有掺法，平阶直接用悬停色。
+        // 裁切激活那一下仍铺浅主题色，只是往里再叠档位的框。
         let bgc = if on {
             s.acc_soft
         } else if hot {
-            s.hov
+            if draft(&th) {
+                theme::mix(s.chrome_hi, s.hov, 0.72)
+            } else if quiet(&th) {
+                theme::mix(s.chrome, s.hov, 0.42)
+            } else if fine(&th) {
+                theme::mix(s.chrome, s.hov, 0.55)
+            } else {
+                s.hov
+            }
         } else {
             s.chrome
         };
         let ink = if bands(&th) && !(on || hot) { s.ink_dim } else { s.ink };
-        // 图标比文字再收一档：线条和字重不是一个量级，同色会显得图标更粗
-        let iic = if bands(&th) && !(on || hot) { theme::mix(ink, bgc, 0.08) } else { ink };
-        fill(hdc, &r, bgc);
-        if hot && !bands(&th) {
-            frame(hdc, &r, s.line_soft);
+        // 图标比文字再收一档：线条和字重不是一个量级，同色会显得图标更粗；
+        // 制图台悬停那下往主色偏半格，和主窗口同一句。
+        let iic = if draft(&th) && hot {
+            theme::mix(s.acc, ink, 0.20)
+        } else if bands(&th) && !(on || hot) {
+            theme::mix(ink, bgc, 0.08)
+        } else {
+            ink
+        };
+        // 外框按版式分档，和主窗口 paint_bar 同一套：制图台方角主色框加底缘索引线，
+        // 精细档圆角加两像素环，静谧档小圆角细环，平阶只描一条浅线。
+        if draft(&th) {
+            if hot || on {
+                fill(hdc, &r, bgc);
+                frame(hdc, &r, s.acc);
+                fill(
+                    hdc,
+                    &RECT { left: r.left + 3, top: r.bottom - 2, right: r.right - 3, bottom: r.bottom },
+                    s.acc,
+                );
+            }
+        } else if fine(&th) {
+            if hot || on {
+                let rad = (6.0 * k).round() as i32;
+                let keep = round_clip(hdc, &r, rad);
+                fill(hdc, &r, bgc);
+                unround(hdc, keep);
+                // 两像素的框往里缩一像素再描，整条线落在按钮格内。
+                let rr = RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 };
+                rring_w(hdc, &rr, rad, theme::mix(s.line_soft, s.acc, 0.34), 2);
+            }
+        } else if quiet(&th) {
+            if hot || on {
+                let rad = (4.0 * k).round() as i32;
+                let keep = round_clip(hdc, &r, rad);
+                fill(hdc, &r, bgc);
+                unround(hdc, keep);
+                rring(hdc, &r, rad, theme::mix(s.line_soft, s.acc, 0.22));
+            }
+        } else {
+            fill(hdc, &r, bgc);
+            if hot && !bands(&th) {
+                frame(hdc, &r, s.line_soft);
+            }
         }
+        // 图标顶上、文字贴底，空档两边各让 3/8，中间剩的间隙是全空档的 1/4；
+        // 整组在按钮里保持居中——和主窗口 below 排法同一份几何。
+        let free = (r.bottom - r.top - lab_h - isz).max(0);
+        let d = free / 8 * 3;
         let ir = RECT {
             left: r.left + (r.right - r.left - isz) / 2,
-            top: r.top,
+            top: r.top + d,
             right: r.left + (r.right - r.left + isz) / 2,
-            bottom: r.top + isz,
+            bottom: r.top + d + isz,
         };
         icon(hdc, t.icon, &ir, bgc, iic);
-        let lr = RECT { left: r.left + 1, top: r.bottom - lab_h, right: r.right - 1, bottom: r.bottom };
+        let lr = RECT {
+            left: r.left + 1,
+            top: r.bottom - lab_h - d - (2.0 * k).round() as i32,
+            right: r.right - 1,
+            bottom: r.bottom - d - (2.0 * k).round() as i32,
+        };
         txt(hdc, &lr, t.label, ink, g.font_sm, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         if hot {
             g.hint = t.label.to_string();
@@ -1964,6 +1964,10 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     }
     if !bands(&th) {
         hline(hdc, l.bar.left, l.bar.right, l.bar.bottom - 1, s.line);
+    }
+    if draft(&th) {
+        // 图框双线：工具栏底缘之上再压一道细线，和主窗口、标题栏那道对上。
+        hline(hdc, l.bar.left, l.bar.right, l.bar.bottom - 4, theme::mix(s.chrome, s.line_soft, 0.50));
     }
 
     // 画布
@@ -2013,8 +2017,8 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     // 裁切框
     if let Some((x0, y0, x1, y1)) = g.crop {
         let r = RECT { left: x0.min(x1), top: y0.min(y1), right: x0.max(x1), bottom: y0.max(y1) };
-        // 框外压暗
-        let sh = theme::mix(s.canvas, 0x000000, 0.55);
+        // 框外压暗：原图还在，只是蒙暗一层，跟框内一比就分得出来
+        let sh = theme::mix(s.canvas, 0x000000, 0.80);
         let parts = [
             RECT { left: l.canvas.left, top: l.canvas.top, right: l.canvas.right, bottom: r.top },
             RECT { left: l.canvas.left, top: r.bottom, right: l.canvas.right, bottom: l.canvas.bottom },
@@ -2023,7 +2027,7 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
         ];
         for p in parts {
             if p.right > p.left && p.bottom > p.top {
-                fill(hdc, &p, sh);
+                veil(hdc, &p, sh, 105);
             }
         }
         let p = CreatePen(PS_SOLID, 2, cref(s.acc));
@@ -2041,12 +2045,12 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     }
     let _ = RestoreDC(hdc, dc);
 
-    // 状态栏：装饰档跟主窗口一样走外壳工艺；极简档仍保留竖向渐变，
-    // 但高度、内边距、字号（等宽数字）与主窗口一致。
+    // 状态栏：装饰档跟主窗口一样走外壳工艺；极简档铺一块纯色，
+    // 高度、内边距、字号（等宽数字）与主窗口一致。
     if bands(&th) {
         shell(hdc, &l.status, &th, s.chrome, false, true);
     } else {
-        vgrad(hdc, &l.status, s.chrome_hi, s.chrome);
+        fill(hdc, &l.status, s.chrome);
         hline(hdc, l.status.left, l.status.right, l.status.top, s.line_soft);
     }
     let z = zoom_at(&g, l.canvas) * 100.0;
@@ -2067,12 +2071,8 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
                 right: rows[0].1.right,
                 bottom: rows[rows.len() - 1].1.bottom + pad2,
             };
-            if bands(&th) {
-                soft_shadow(hdc, &pr, pad2);
-            } else {
-                fill(hdc, &RECT { left: pr.left + pad2, top: pr.top + pad2, right: pr.right + pad2, bottom: pr.bottom + pad2 }, theme::mix(s.win, 0x000000, 0.55));
-            }
-            fill(hdc, &pr, s.chrome_hi);
+            drop_shadow(hdc, &pr, k);
+            fill(hdc, &pr, s.popup);
             frame(hdc, &pr, s.line);
             for (id, r) in &rows {
                 let hot = over(r, g.pt.0, g.pt.1);
@@ -2108,12 +2108,8 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
                 right: rows[0].1.right,
                 bottom: rows[rows.len() - 1].1.bottom + pad2,
             };
-            if bands(&th) {
-                soft_shadow(hdc, &pr, pad2);
-            } else {
-                fill(hdc, &RECT { left: pr.left + pad2, top: pr.top + pad2, right: pr.right + pad2, bottom: pr.bottom + pad2 }, theme::mix(s.win, 0x000000, 0.55));
-            }
-            fill(hdc, &pr, s.chrome_hi);
+            drop_shadow(hdc, &pr, k);
+            fill(hdc, &pr, s.popup);
             frame(hdc, &pr, s.line);
             for (rid, r) in &rows {
                 let hot = over(r, g.pt.0, g.pt.1);
@@ -2131,14 +2127,14 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
     // 参数对话框
     g.dlg_rows.clear();
     if let Some((kind, dr, vals, focus, buf, keep)) = g.dlg.as_ref().map(|d| (d.kind, d.rect, d.vals, d.focus, d.buf.clone(), d.keep)) {
-        fill(hdc, &RECT { left: dr.left + 4, top: dr.top + 4, right: dr.right + 4, bottom: dr.bottom + 4 }, theme::mix(s.win, 0x000000, 0.6));
+        drop_shadow(hdc, &dr, k);
         fill(hdc, &dr, s.chrome_hi);
         frame(hdc, &dr, s.line);
         // 浮层的标题条：底色仍是中性那两档，取色规则和 ✕ 那颗的画法走 theme::Strip，
         // 和主窗口标题栏右上角那颗同一套（以前这里是硬编码的一枚红底白叉）。
         let st = theme::Strip::float(&th);
         let tb = RECT { left: dr.left, top: dr.top, right: dr.right, bottom: dr.top + st.h };
-        vgrad(hdc, &tb, st.bar, st.bar_lo);
+        fill(hdc, &tb, st.bar);
         hline(hdc, tb.left, tb.right, tb.bottom - 1, st.edge);
         let txr = RECT { left: dr.left + (12.0 * k) as i32, top: tb.top, right: tb.right - (st.bw + st.pad + (6.0 * k) as i32), bottom: tb.bottom };
         txt(hdc, &txr, kind.title(), st.ink, g.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
@@ -2200,14 +2196,6 @@ unsafe fn paint(hdc: HDC, hwnd: HWND) {
             }
             txt(hdc, &RECT { left: cb.right + (8.0 * k) as i32, top: y, right: dr.right - (18.0 * k) as i32, bottom: y + (26.0 * k) as i32 }, "保持纵横比(M)", s.ink, g.font_sm, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             g.dlg_rows.push((D_KEEP, RECT { left: cb.left - (4.0 * k) as i32, top: y, right: dr.left + (140.0 * k) as i32, bottom: y + (26.0 * k) as i32 }));
-            y += (32.0 * k) as i32;
-            txt(hdc, &RECT { left: dr.left + (18.0 * k) as i32, top: y, right: dr.left + (128.0 * k) as i32, bottom: y + (26.0 * k) as i32 }, "取样过滤器(F)", s.ink, g.font_sm, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            let fr = RECT { left: dr.left + (134.0 * k) as i32, top: y, right: dr.left + (134.0 * k) as i32 + field_w, bottom: y + (26.0 * k) as i32 };
-            fill(hdc, &fr, s.canvas);
-            frame(hdc, &fr, s.line);
-            let fi = (vals[2].max(0.0) as usize).min(RESIZE_FILTERS.len() - 1);
-            txt(hdc, &fr, &format!("{}  ▾", RESIZE_FILTERS[fi]), s.ink, g.font_sm, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-            g.dlg_rows.push((D_FILTER, fr));
             let by = dr.bottom - (40.0 * k) as i32;
             let bw = (74.0 * k) as i32;
             dlg_btn(hdc, &mut g, s, RECT { left: dr.right - (16.0 * k) as i32 - bw * 2 - (8.0 * k) as i32, top: by, right: dr.right - (16.0 * k) as i32 - bw - (8.0 * k) as i32, bottom: by + (26.0 * k) as i32 }, D_OK, "确定", true);
@@ -2273,16 +2261,6 @@ unsafe fn dlg_btn(hdc: HDC, g: &mut Ed, s: theme::Skin, r: RECT, id: usize, labe
     frame(hdc, &r, if primary { s.acc } else { s.line });
     txt(hdc, &r, label, if primary { s.ink_inv } else { s.ink }, g.font, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     g.dlg_rows.push((id, r));
-}
-
-impl Ed {
-    fn slow_hint(&self) -> String {
-        if self.crop_mode {
-            "框选后 Enter 应用，Esc 取消".to_string()
-        } else {
-            String::new()
-        }
-    }
 }
 
 unsafe fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
@@ -2418,8 +2396,9 @@ unsafe fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
     let l = lay(client(hwnd), &g.th);
     if over(&l.canvas, x, y) {
         if g.crop_mode {
+            // 只记起点，先不动已有的框：双击确认的前一下也走这里，
+            // 当场抹成零点的话后面那下双击就再也找不到框了。
             g.crop_seed = Some((x, y));
-            g.crop = Some((x, y, x, y));
         } else {
             g.drag_pan = Some((x, y, g.pan.0, g.pan.1));
             SetCapture(hwnd);
@@ -2511,12 +2490,6 @@ unsafe fn handle_dlg(hwnd: HWND, g: &mut Ed, id: usize) {
                 d.focus = usize::MAX;
             }
         }
-        D_FILTER => {
-            if let Some(d) = g.dlg.as_mut() {
-                d.vals[2] = ((d.vals[2].max(0.0) as usize + 1) % RESIZE_FILTERS.len()) as f64;
-                d.focus = usize::MAX;
-            }
-        }
         _ => {}
     }
     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2587,11 +2560,33 @@ unsafe fn on_mouse_up(hwnd: HWND, x: i32, y: i32) {
         }
     }
     if let Some((sx, sy)) = g.crop_seed.take() {
-        let r = (sx, sy, x, y);
-        g.crop = Some(r);
-        g.status = "按 Enter 应用裁切，Esc 取消".to_string();
-        let _ = InvalidateRect(Some(hwnd), None, false);
+        // 拖出尺寸才算新的一框；没动的这一下（双击的前一半）保留原框
+        if (x - sx).abs() > 2 || (y - sy).abs() > 2 {
+            g.crop = Some((sx, sy, x, y));
+            g.status = "按 Enter 或双击框内应用裁切，Esc 取消".to_string();
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
+}
+
+/// 双击框内 = 应用裁切；框外或没框时跟普通按下一样，重新起一框。
+unsafe fn on_mouse_double(hwnd: HWND, x: i32, y: i32) {
+    let mut g = ed().lock().unwrap();
+    let l = lay(client(hwnd), &g.th);
+    let inside = g.crop.map(|(x0, y0, x1, y1)| {
+        over(
+            &RECT { left: x0.min(x1), top: y0.min(y1), right: x0.max(x1), bottom: y0.max(y1) },
+            x,
+            y,
+        )
+    });
+    if g.crop_mode && over(&l.canvas, x, y) && inside == Some(true) {
+        apply_crop(&mut g);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        return;
+    }
+    drop(g);
+    on_mouse_down(hwnd, x, y);
 }
 
 unsafe fn on_char(hwnd: HWND, ch: u32) {
@@ -2638,6 +2633,12 @@ unsafe fn on_char(hwnd: HWND, ch: u32) {
 }
 
 unsafe fn on_key(hwnd: HWND, vk: u32, ctrl: bool, shift: bool) {
+    // 参数框开着时只认 Esc/Enter：这时 Ctrl+O 会换文件而 dlg_base 还指着旧图，
+    // Esc 一还原就把旧图挂在新路径上；Ctrl+S 会把没提交的预览态写盘。
+    let dlg_open = ed().lock().unwrap().dlg.is_some();
+    if dlg_open && !matches!(vk, 0x1B | 0x0D) {
+        return;
+    }
     match (vk, ctrl, shift) {
         (0x53, true, false) => do_command(hwnd, M_SAVE),
         (0x53, true, true) => do_command(hwnd, M_SAVEAS),
@@ -2665,6 +2666,10 @@ unsafe fn on_key(hwnd: HWND, vk: u32, ctrl: bool, shift: bool) {
         }
         (0x0D, _, _) => {
             let mut g = ed().lock().unwrap();
+            // 参数框开着时 Enter 不往下落：裁切状态是另一套，别隔着对话框应用裁切。
+            if g.dlg.is_some() {
+                return;
+            }
             let has = g.crop.is_some();
             if has {
                 apply_crop(&mut g);
@@ -2796,6 +2801,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mut g = ed().lock().unwrap();
             g.scale = k;
             g.th = Theme::new_with(&g.skin, &g.density, k, &g.look);
+            // 重建前先把旧的四支字体还回去：GDI 句柄有一万的上限，多屏来回拖会攒。
+            for h in [g.font, g.font_sm, g.font_b, g.font_num] {
+                if !h.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(h.0));
+                }
+            }
             let face = g.th.face.clone();
             g.font = mk_font(g.th.font, false, &face);
             g.font_sm = mk_font(g.th.font_sm, false, &face);
@@ -2855,6 +2866,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let x = (lp.0 & 0xffff) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
             on_mouse_up(hwnd, x, y);
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let x = (lp.0 & 0xffff) as i16 as i32;
+            let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+            on_mouse_double(hwnd, x, y);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {

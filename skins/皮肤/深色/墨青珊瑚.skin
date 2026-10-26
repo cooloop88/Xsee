@@ -1,0 +1,36 @@
+# 圆角卡片·精修：从「圆角卡片」复制出来的细作版，默认主题和其余主题都不动。
+# 卡片骨相同：上沿提亮、下沿压暗、细内圈、文件名分隔线；选中只上淡色印、
+# 文件名加粗并加短 2px 下划线，文件夹不加图标井、不勾选，图片仍保留勾选。
+# 本文件由「圆角卡片」复制而来：卡片骨架相同，只多一层细作处理。
+# 默认主题仍是「圆角卡片」，这一份不影响它。
+name=墨青珊瑚
+style=cards_fine
+order=12
+default=0
+
+# 八个基色：派生规则的输入
+base=0x23272c
+surface=0x2b3036
+canvas=0x1a1d21
+ink=0xdfe4ea
+dim=0x98a2ad
+accent=0x5fa8cf
+border=0x454c55
+mark=0xd4635a
+
+# 下面这些槽位显式覆盖了派生结果，就是设计稿里逐槽定过的值
+chrome=0x2b3036
+chrome_hi=0x343a41
+pane=0x1f2327
+pane_head=0x2f353c
+grid=0x2a2f35
+line=0x454c55
+line_soft=0x3a4048
+off=0x5f6871
+inv=0x12151a
+hov=0x39414a
+prs=0x48525d
+sel=0x3d6a86
+sel_ink=0xeef6fb
+acc_soft=0x2c4453
+flash=0x2c4453

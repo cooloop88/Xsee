@@ -1,0 +1,32 @@
+# 松花黛蓝：颜色取自参考图像素，黛蓝 #485162（72,81,98），松花色 #C0DD35（192,221,53）。
+# 深色底 → 正文用浅白；骨架按黛蓝同色相等比明暗派生，绿色只给标题栏、选中、文件夹图标和标记。
+name=松花黛蓝
+style=cards_rich
+order=33
+default=0
+
+base=0x485162
+surface=0x525b6d
+canvas=0x3b4351
+ink=0xfbfbfd
+dim=0xcdd2db
+accent=0xc0dd35
+border=0x3a424f
+mark=0xb2d02f
+
+chrome=0x525b6d
+chrome_hi=0x5b6579
+pane=0x424a58
+pane_head=0x4d5666
+grid=0x4a5464
+line=0x3a424f
+line_soft=0x444d5b
+off=0x8a93a2
+inv=0x0a0d06
+hov=0x606b63
+prs=0x6c7a5b
+sel=0x465420
+sel_ink=0xfbfdf4
+acc_soft=0x5c6a57
+flash=0x5c6a57
+focus=0xc3de4e

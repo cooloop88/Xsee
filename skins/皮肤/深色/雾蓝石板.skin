@@ -1,0 +1,32 @@
+﻿# H 雾蓝：中暗调，雾蓝/板岩，冷但不黑。
+# 与圆角卡片同一套几何和字号，只换配色；字体/渐变可在“皮肤设置”里再调。
+name=雾蓝石板
+style=cards_rich
+order=11
+default=0
+
+base=0x505a62
+surface=0x4a545c
+canvas=0x454f57
+ink=0xe9eef3
+dim=0xc0c9d1
+accent=0x86a9c4
+border=0x77828a
+mark=0xcfe6f7
+
+chrome=0x4a545c
+chrome_hi=0x59636b
+pane=0x545e66
+pane_head=0x4b555d
+grid=0x5e6871
+line=0x77828a
+line_soft=0x657079
+off=0x9aa4ad
+inv=0x0e1a22
+hov=0x5b6872
+prs=0x657078
+sel=0x3d5b73
+sel_ink=0xe1effb
+acc_soft=0x3d586d
+flash=0x3e586d
+focus=0x86a9c4

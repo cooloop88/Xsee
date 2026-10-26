@@ -1,4 +1,4 @@
-# 皮肤设置窗写出：22 个槽位全写死，读回来就是当时看到的那张脸。
+# 皮肤设置窗写出：24 个槽位全写死，读回来就是当时看到的那张脸。
 name=影棚暖白
 style=precision
 order=4
@@ -6,6 +6,8 @@ default=1
 base=0xe1dcd2
 chrome=0xefebe5
 chrome_hi=0xf7f4ef
+menu=0xf0ece6
+popup=0xf7f4ef
 canvas=0xf2efe9
 pane=0xfbf9f5
 pane_head=0xefece6

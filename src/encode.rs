@@ -1,11 +1,19 @@
 //! 格式转换：WIC/image 解全尺寸，image/jpeg-encoder/tiff 编码。
 //! 先写同目录的 .part 再改名，中途失败不会留下半截目标文件。
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use image::{DynamicImage, ExtendedColorType, ImageFormat, RgbaImage};
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 pub const FORMATS: &[(&str, &str, &str)] = &[
     ("JPEG", "jpg", "JFIF 联合图像专家组"),
@@ -103,8 +111,10 @@ pub struct Xform {
     pub rotate: u16,
     pub flip_h: bool,
     pub flip_v: bool,
-    /// 0 关；1–100 是 unsharp 强度
+    /// 0 关；1–30 是编辑窗口那个锐化的强度 ×10（等于 0.1–3.0）
     pub sharpen: u8,
+    /// 编辑窗口那个锐化的半径 ×2（0–10，步长 0.5）。强度为 0 时不看
+    pub sharpen_r: u8,
 }
 
 impl Default for Xform {
@@ -118,6 +128,7 @@ impl Default for Xform {
             flip_h: false,
             flip_v: false,
             sharpen: 0,
+            sharpen_r: 3,
         }
     }
 }
@@ -221,7 +232,10 @@ pub fn decode(path: &str, for_preview: bool) -> Result<RgbaImage, String> {
     let wic_first = lower.ends_with(".psd")
         || lower.ends_with(".psb")
         || lower.ends_with(".heic")
-        || lower.ends_with(".webp");
+        || lower.ends_with(".webp")
+        || lower.ends_with(".wdp")
+        || lower.ends_with(".hdp")
+        || lower.ends_with(".jxr");
     if is_jpg {
         if let Some(rgba) = decode_jpeg(path) {
             return orient_rgba(path, rgba);
@@ -253,15 +267,59 @@ fn bgra_to_rgba(w: u32, h: u32, px: Vec<u8>) -> RgbaImage {
     RgbaImage::from_raw(w, h, out).unwrap_or_else(|| RgbaImage::new(w.max(1), h.max(1)))
 }
 
+/// 一批转换共用的目标名登记表：worker 并行挑空号时，"盘上还没有"和"同批的
+/// 另一个 worker 已经挑走"是两回事。不登记的话两个 worker 能同时选中同一个
+/// `a (2).jpg`，各写各的 part 再先后替换，一份输出被顶掉，计数还对不上。
+static RESERVED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 一批开始时清空上一批的登记。两条批量入口都有"上一批没跑完不开新的"这把
+/// 闸，同一时刻只有一批在挑名，一份登记表就够。
+pub fn begin_batch() {
+    if let Ok(mut r) = RESERVED.lock() {
+        r.clear();
+    }
+}
+
+fn reserve(p: &Path) {
+    if let Ok(mut r) = RESERVED.lock() {
+        r.insert(p.to_path_buf());
+    }
+}
+
+fn unreserve(p: &Path) {
+    if let Ok(mut r) = RESERVED.lock() {
+        r.remove(p);
+    }
+}
+
+fn is_reserved(p: &Path) -> bool {
+    RESERVED.lock().map(|r| r.contains(p)).unwrap_or(false)
+}
+
+/// 把一批源文件路径归一成查重用的键集合：分隔符统一、去尾部斜杠、小写。
+/// 一次建好给整批用，worker 里只做 O(1) 的查表。
+pub fn batch_set(paths: &[String]) -> HashSet<String> {
+    paths.iter().map(|s| path_key(s)).collect()
+}
+
+fn path_key(s: &str) -> String {
+    s.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+}
+
 /// 把一个文件转成目标格式。返回输出路径和字节数；撞名跳过时返回 Skipped。
+/// `batch` 是这一批全部源文件的键集合（`batch_set` 建好）：目标名撞上同批
+/// 另一张时让到空号，「取代/跳过」说的是盘上已有的旧文件，不该吃掉这批里
+/// 另一张的输出名（a.jpg、a.png 一起转成 JPEG，两张只出一份输出，看着就是
+/// 丢了一张）。
 pub fn convert_file(
     src: &str,
     out_dir: &str,
     fmt: usize,
     opt: &Opt,
     policy: Collision,
+    batch: &HashSet<String>,
 ) -> Result<Outcome, String> {
-    convert_file_x(src, out_dir, None, fmt, opt, policy, None, None)
+    convert_file_x(src, out_dir, None, fmt, opt, policy, None, None, batch)
 }
 
 /// 带缩放/旋转/翻转/锐化/水印和改名的一版。`rename` 是已经展开好的目标主名，
@@ -275,6 +333,7 @@ pub fn convert_file_x(
     policy: Collision,
     xf: Option<&Xform>,
     wm: Option<&Watermark>,
+    batch: &HashSet<String>,
 ) -> Result<Outcome, String> {
     let (_, ext, _) = *FORMATS.get(fmt).ok_or("未知格式")?;
     let stem = rename
@@ -283,27 +342,26 @@ pub fn convert_file_x(
         .or_else(|| Path::new(src).file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
         .ok_or("文件名不合法")?;
     let stem = stem.as_str();
-    let out = target_path(src, out_dir, stem, ext, policy)?;
-    if out.is_none() {
+    let out = target_path(src, out_dir, stem, ext, policy, batch)?;
+    let Some(out) = out else {
         return Ok(Outcome::Skipped);
-    }
-    let out = out.unwrap();
-    let mut img = decode(src, true)?;
-    let part = Path::new(out_dir).join(format!(".{}.{}.part", stem, std::process::id()));
-    // 并行转换时同一目录可能有两张同名不同扩展名的源文件，part 名再带一次随机后缀
-    let part = if part.exists() {
-        Path::new(out_dir).join(format!(
-            ".{}.{}.{}.part",
-            stem,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ))
-    } else {
-        part
     };
+    let mut img = match decode(src, true) {
+        Ok(v) => v,
+        Err(e) => {
+            unreserve(&out);
+            return Err(e);
+        }
+    };
+    // part 名带进程内自增号：两个 worker 同时转同主名的源图（a.jpg、a.png）时，
+    // 靠"存在才补后缀"会撞在同一个名字上并发互写，产出半个文件。自增号进程内唯一。
+    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+    let part = Path::new(out_dir).join(format!(
+        ".{}.{}.{}.part",
+        stem,
+        std::process::id(),
+        PART_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     // 动过像素就别再抄源文件的 EXIF：方向已经归到像素里了，缩放过尺寸也对不上。
     let exif_src = match xf {
         Some(x) if !x.is_noop() => None,
@@ -315,20 +373,37 @@ pub fn convert_file_x(
     if let Some(w) = wm {
         draw_watermark(&mut img, w);
     }
-    let r = encode_to(&img, &part, fmt, opt, exif_src);
-    if let Err(e) = r {
+    if let Err(e) = encode_to(&img, &part, fmt, opt, exif_src) {
         let _ = std::fs::remove_file(&part);
+        unreserve(&out);
         return Err(e);
     }
-    if out.exists() {
-        let _ = std::fs::remove_file(&out);
+    let r = replace_part(&part, &out);
+    if let Err(e) = r {
+        unreserve(&out);
+        return Err(e);
     }
-    if let Err(e) = std::fs::rename(&part, &out) {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("改名失败：{e}"));
-    }
+    // 成了就先不松这个名字：松了以后，同一批里另一张同名的（不同文件夹来的）错峰轮到它时，
+    // 盘上已有文件、批次查重又只认"目标在源清单里"，第二张就直接盖上来——报两张、盘上一张。
+    // 登记表整批有效，下一批 begin_batch 统一清。
     let n = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     Ok(Outcome::Done(out.display().to_string(), n))
+}
+
+/// .part 原子替换成目标：目标存在时由系统一次替换，不再"先删再改"——
+/// 删成功、改名失败中间那段空窗里原文件就没了，杀毒/备份软件短暂锁住新文件
+/// 恰好能造出这一段。失败时保留 .part 供手工找回，不替用户删。
+fn replace_part(part: &Path, dst: &Path) -> Result<(), String> {
+    let pf: Vec<u16> = part.as_os_str().encode_wide().chain([0]).collect();
+    let pt: Vec<u16> = dst.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(pf.as_ptr()),
+            PCWSTR(pt.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(|e| format!("保存失败：{e}"))
+    }
 }
 
 // ---- 图像变换：先转正（旋转/翻转），再按目标框缩放，最后锐化 ----
@@ -403,7 +478,8 @@ fn apply_xform(img: RgbaImage, xf: &Xform) -> RgbaImage {
         }
     };
     if xf.sharpen > 0 {
-        im = sharpen(&im, xf.sharpen);
+        // 和编辑窗口那扇「过滤 → 锐化」同一个函数：三遍方框近似高斯 + 原图减模糊回加。
+        crate::edit::sharpen(&mut im, xf.sharpen_r as f32 / 2.0, xf.sharpen as f32 / 10.0);
     }
     im
 }
@@ -419,35 +495,6 @@ fn resize_to(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
         image::imageops::FilterType::CatmullRom
     };
     image::imageops::resize(img, w, h, f)
-}
-
-/// 3×3 高斯模糊做反锐化掩模。只动 RGB，alpha 原样留着。
-fn sharpen(img: &RgbaImage, amount: u8) -> RgbaImage {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let src = img.as_raw();
-    let mut out = src.clone();
-    if w < 3 || h < 3 {
-        return img.clone();
-    }
-    let k = amount.min(100) as f32 / 100.0 * 1.2;
-    let at = |x: usize, y: usize, c: usize| src[(y * w + x) * 4 + c] as f32;
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let i = (y * w + x) * 4;
-            for c in 0..3 {
-                let c0 = at(x, y, c);
-                let blur = (4.0 * c0
-                    + 2.0 * (at(x, y - 1, c) + at(x, y + 1, c) + at(x - 1, y, c) + at(x + 1, y, c))
-                    + at(x - 1, y - 1, c)
-                    + at(x + 1, y - 1, c)
-                    + at(x - 1, y + 1, c)
-                    + at(x + 1, y + 1, c))
-                    / 16.0;
-                out[i + c] = (c0 + (c0 - blur) * k).clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-    RgbaImage::from_raw(img.width(), img.height(), out).unwrap_or_else(|| img.clone())
 }
 
 /// 用 GDI 把文字画进一张 32 位 DIB，再按黑色底的亮度当覆盖率叠回 RGBA。
@@ -573,35 +620,75 @@ fn draw_watermark(img: &mut RgbaImage, wm: &Watermark) {
 }
 
 /// 目标路径：撞名时按策略跳过 / 覆盖 / 自动加序号。
-/// 源文件和目标是同一个文件（例如 jpg 转 jpg 原地）不算撞名，照常写。
 fn target_path(
     src: &str,
     out_dir: &str,
     stem: &str,
     ext: &str,
     policy: Collision,
+    batch: &HashSet<String>,
 ) -> Result<Option<PathBuf>, String> {
     let first = Path::new(out_dir).join(format!("{stem}.{ext}"));
-    if !first.exists() || same_file(src, &first) {
+    // 目标就是源文件自己（同格式转到同一个文件夹）。这一档以前不分策略一律"照常写"，
+    // 于是选了编号也还是原地盖掉自己：人看不见多出文件，只当这批没转成。
+    // 三档各按自己的说法走：取代=原地重编，编号=另起一个新名，跳过=这张不动。
+    if same_file(src, &first) {
+        return match policy {
+            Collision::Overwrite => Ok(Some(first)),
+            Collision::Rename => pick_free_slot(out_dir, stem, ext),
+            Collision::Skip => Ok(None),
+        };
+    }
+    // 目标名是同批另一张源文件（a.jpg、a.png 一起转成 JPEG 这类），或者已被本批另一张
+    // 占下（不同文件夹来的同名图转进同一个文件夹）：无论选了哪一档都让到空号。
+    // 不让的话取代档两张并成一张，跳过档平白跳一张。
+    if first.exists()
+        && (batch.contains(&path_key(&first.display().to_string())) || is_reserved(&first))
+    {
+        return pick_free_slot(out_dir, stem, ext);
+    }
+    if !first.exists() {
+        // 另一个 worker 可能刚挑走这个名字、文件还没落盘：登记表说了算。
+        if is_reserved(&first) {
+            return pick_free_slot(out_dir, stem, ext);
+        }
+        reserve(&first);
         return Ok(Some(first));
     }
     match policy {
         Collision::Overwrite => Ok(Some(first)),
         Collision::Skip => Ok(None),
-        Collision::Rename => {
-            for i in 2..=9999 {
-                let p = Path::new(out_dir).join(format!("{stem} ({i}).{ext}"));
-                if !p.exists() {
-                    return Ok(Some(p));
-                }
-            }
-            Err("同名文件太多，找不到空号".to_string())
-        }
+        Collision::Rename => pick_free_slot(out_dir, stem, ext),
     }
 }
 
+/// 从 `主名 (2)` 起找第一个没人占的空号并登记。查"存在"之外还要查登记表，
+/// 两个 worker 同一瞬间都能看到"盘上还没有"，登记表补上这个洞。
+fn pick_free_slot(out_dir: &str, stem: &str, ext: &str) -> Result<Option<PathBuf>, String> {
+    for i in 2..=9999 {
+        let p = Path::new(out_dir).join(format!("{stem} ({i}).{ext}"));
+        if !p.exists() && !is_reserved(&p) {
+            reserve(&p);
+            return Ok(Some(p));
+        }
+    }
+    Err("同名文件太多，找不到空号".to_string())
+}
+
 fn same_file(a: &str, b: &Path) -> bool {
-    a.eq_ignore_ascii_case(&b.display().to_string())
+    paths_eq(a, &b.display().to_string())
+}
+
+/// 路径等价：字面不同（末尾斜杠、分隔符写法、大小写）再落到系统问一遍真实身份。
+/// 字面比较在"输出目录带着尾反斜杠"这类写法上会漏判同地，原地转换就认不出自己。
+pub fn paths_eq(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// 编辑窗口保存用：按扩展名选格式，先写 .part 再替换原文件。
@@ -631,13 +718,7 @@ pub fn save_rgba(img: &RgbaImage, path: &str) -> Result<(), String> {
         std::process::id()
     ));
     encode_to(img, &part, fmt, &opt, Some(path))?;
-    if Path::new(path).exists() {
-        let _ = std::fs::remove_file(path);
-    }
-    std::fs::rename(&part, path).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        format!("保存失败：{e}")
-    })
+    replace_part(&part, Path::new(path))
 }
 
 /// 直接编码一块 RGBA 到指定路径。force_src 用来取源文件的 EXIF。

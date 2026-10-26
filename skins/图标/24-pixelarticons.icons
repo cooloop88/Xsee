@@ -1,0 +1,49 @@
+# Xsee 图标库（版式）。name= 菜单里显示的名字，key= appearance.tsv 里 layout= 存的键。
+# [0]..[9] 十枚固定顺序（上一/下一/上一层/查找/编辑/移到/复制到/删除/属性/外观），
+# g= 这枚的网格边长，p= 一笔：路径|fill|even|alpha|笔宽|dx|dy；整枚缺块就用内置图形顶上。
+name=Pixelarticons
+key=pixelarticons
+
+[0]
+g=24
+p=M 20 11 V 13 H 4 V 11 z M 8 13 V 15 H 6 V 13 z M 10 15 V 17 H 8 V 15 z M 12 17 V 19 H 10 V 17 z M 8 11 V 9 H 6 V 11 z|1|0|1|0|0|0
+p=M 10 15 V 7 H 8 V 15 z M 12 17 V 5 H 10 V 17 z|1|0|1|0|0|0
+
+[1]
+g=24
+p=M 4 11 V 13 H 20 V 11 z M 16 13 V 15 H 18 V 13 z M 14 15 V 17 H 16 V 15 z M 12 17 V 19 H 14 V 17 z M 16 11 V 9 H 18 V 11 z|1|0|1|0|0|0
+p=M 14 15 V 7 H 16 V 15 z M 12 17 V 5 H 14 V 17 z|1|0|1|0|0|0
+
+[2]
+g=24
+p=M 4 4 H 20 V 2 H 4 z M 11 22 H 13 V 6 H 11 z M 13 10 H 15 V 8 H 13 z M 15 12 H 17 V 10 H 15 z M 17 14 H 19 V 12 H 17 z M 9 10 H 11 V 8 H 9 z M 7 12 H 9 V 10 H 7 z M 5 14 H 7 V 12 H 5 z|1|0|1|0|0|0
+
+[3]
+g=24
+p=M 22 22 H 20 V 20 H 22 z M 20 20 H 18 V 18 H 20 z M 14 18 H 6 V 16 H 14 z M 18 18 H 16 V 16 H 18 z M 6 16 H 4 V 14 H 6 z M 16 16 H 14 V 14 H 16 z M 4 14 H 2 V 6 H 4 z M 18 14 H 16 V 6 H 18 z M 6 6 H 4 V 4 H 6 z M 16 6 H 14 V 4 H 16 z M 14 4 H 6 V 2 H 14 z|1|0|1|0|0|0
+
+[4]
+g=24
+p=M 4 16 H 6 V 18 H 8 V 20 H 10 V 22 H 2 V 14 H 4 z M 12 20 H 10 V 18 H 12 z M 14 18 H 12 V 16 H 14 z M 10 16 H 8 V 14 H 10 z M 16 16 H 14 V 14 H 16 z M 6 14 H 4 V 12 H 6 z M 12 14 H 10 V 12 H 12 z M 18 14 H 16 V 12 H 18 z M 8 12 H 6 V 10 H 8 z M 14 12 H 12 V 10 H 14 z M 20 12 H 18 V 10 H 20 z M 10 10 H 8 V 8 H 10 z M 18 10 H 16 V 8 H 18 z M 22 10 H 20 V 8 H 22 z M 12 8 H 10 V 6 H 12 z M 16 8 H 14 V 6 H 16 z M 20 8 H 18 V 6 H 20 z M 14 6 H 12 V 4 H 14 z M 18 6 H 16 V 4 H 18 z M 16 4 H 14 V 2 H 16 z|1|0|1|0|0|0
+
+[5]
+g=24
+p=M 13 2 H 15 V 4 H 17 V 6 H 13 V 11 H 18 V 7 H 20 V 9 H 22 V 11 H 24 V 13 H 22 V 15 H 20 V 17 H 18 V 13 H 13 V 18 H 17 V 20 H 15 V 22 H 13 V 24 H 11 V 22 H 9 V 20 H 7 V 18 H 11 V 13 H 6 V 17 H 4 V 15 H 2 V 13 H 0 V 11 H 2 V 9 H 4 V 7 H 6 V 11 H 11 V 6 H 7 V 4 H 9 V 2 H 11 V 0 H 13 z|1|0|1|0|0|0
+
+[6]
+g=24
+p=M 8 6 H 20 V 8 H 8 z M 4 2 H 16 V 4 H 4 z M 6 8 H 8 V 20 H 6 z M 2 4 H 4 V 16 H 2 z M 8 20 H 20 V 22 H 8 z M 20 8 H 22 V 20 H 20 z M 16 4 H 18 V 6 H 16 z M 4 16 H 6 V 18 H 4 z|1|0|1|0|0|0
+
+[7]
+g=24
+p=M 18 22 H 6 V 20 H 18 z M 9 6 H 15 V 4 H 17 V 6 H 22 V 8 H 20 V 20 H 18 V 8 H 6 V 20 H 4 V 8 H 2 V 6 H 7 V 4 H 9 z M 15 4 H 9 V 2 H 15 z|1|0|1|0|0|0
+
+[8]
+g=24
+p=M 4 2 H 20 V 4 H 4 z M 4 20 H 20 V 22 H 4 z M 2 4 H 4 V 20 H 2 z M 20 4 H 22 V 20 H 20 z M 11 9 H 13 V 7 H 11 z M 11 17 H 13 V 11 H 11 z|1|0|1|0|0|0
+
+[9]
+g=24
+p=M 7 2 H 17 V 4 H 7 z M 5 4 H 7 V 14 H 5 z M 17 2 H 19 V 14 H 17 z|1|0|1|0|0|0
+p=M 13 2 H 15 V 8 H 13 z M 9 2 H 11 V 6 H 9 z M 5 10 H 19 V 12 H 5 z M 7 14 H 17 V 16 H 7 z M 9 16 H 11 V 20 H 9 z M 13 16 H 15 V 20 H 13 z M 9 20 H 15 V 22 H 9 z|1|0|1|0|0|0
+

@@ -5,7 +5,7 @@
 /// 缩略图走 pool 的可见优先队列：只排看得见的那一屏加往后一页，滚过就弃算。
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,7 +18,7 @@ use xsee_host::{
     pool::Pool,
     refwin,
     scan,
-    sim, Rgba,
+    sim, sysicon, Rgba,
     theme::{self, mix, Style, Theme, cref},
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -37,7 +37,10 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
     RegCloseKey, RegCreateKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
-use windows::Win32::Storage::FileSystem::{FileTimeToLocalFileTime, GetLogicalDrives};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    FileTimeToLocalFileTime, GetLogicalDrives,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON, MK_SHIFT};
 use windows::Win32::System::Threading::{
@@ -51,10 +54,8 @@ use windows::Win32::UI::Controls::Dialogs::{
     OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Shell::{
-    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DefSubclassProc, FO_COPY, FO_MOVE,
-    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT,
-    SHBrowseForFolderW, SHFileOperationW, SHFILEOPSTRUCTW, SHGetPathFromIDListW,
-    SetWindowSubclass,
+    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DefSubclassProc, SHBrowseForFolderW,
+    SHGetPathFromIDListW, SetWindowSubclass,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
@@ -87,6 +88,9 @@ const FLASH_MS: Duration = Duration::from_millis(220);
 const FLASH_ALPHA: u8 = 72;
 /// 正在从本窗口往外拖东西。松手没落到文件夹上时，这一趟就地结束，什么都不做。
 static SELF_DRAG: AtomicBool = AtomicBool::new(false);
+/// 小键盘排序键按下时先立一个旗，紧跟其后的 WM_CHAR 直接吞掉：不吞的话那个数字
+/// 会被“打字跳到同名条目”接走，列表刚排完又跳到别处。
+static CHAR_SWALLOW: AtomicBool = AtomicBool::new(false);
 
 const M_OPEN: usize = 101;
 const M_EXPL: usize = 102;
@@ -95,6 +99,8 @@ const M_QUIT: usize = 104;
 const M_BACK: usize = 105;
 const M_FWD: usize = 106;
 const M_UP: usize = 107;
+/// 树右键：只重扫右键那一行的子节点（格子的「刷新」是 M_RESCAN，管当前目录）。
+const M_TREE_REFRESH: usize = 108;
 const M_FIND: usize = 109;
 const M_ALL: usize = 111;
 const M_NONE: usize = 112;
@@ -119,7 +125,7 @@ const M_ABOUT: usize = 161;
 const M_SKIN: usize = 1500;
 const M_DENS: usize = 220;
 /// 外观菜单里的版式选择：每套开源图标库占一个号，从 M_LAYOUT + 1 起
-/// （顺序同 glyphs::SETS）。整段放在 1000：400 那一段全被对话框按钮占着
+/// （顺序同 glyphs::all()）。整段放在 1000：400 那一段全被对话框按钮占着
 /// （D_OK=400、D_CANCEL=401、D_BROWSE=402…），版式点下去会被当成按了对话框的按钮。
 const M_LAYOUT: usize = 1000;
 /// 路径栏上的视图组按钮，从 M_VGRID 起四个；缩略图高度用一对 −/+ 调。
@@ -177,7 +183,9 @@ const M_BAR_PATH: usize = 308;
 const M_BAR_STATUS: usize = 309;
 const M_DBBACKUP: usize = 310;
 const M_DBIMPORT: usize = 311;
-const M_DBMAINT: usize = 312;
+/// 分类数据库自己的入口；缩略图数据库另有一个，两页彻底分开互不掺和。
+const M_CATDB: usize = 312;
+const M_THUMBDB: usize = 321;
 /// 中间列表的过滤开关。分类时把已经分过的、非图片和文件夹先藏掉，眼前只剩没干的活。
 const M_FILT_ALL: usize = 313;
 const M_FILT_DIRS: usize = 314;
@@ -188,18 +196,21 @@ const M_FINDSIM: usize = 317;
 /// 右侧栏的批量转换页。和整理页共用一栏宽，同开时靠页签切换。
 const M_CONV_PANEL: usize = 318;
 const M_CONV_PANEL_CLOSE: usize = 319;
-const M_CONV_TAB_ORG: usize = 321;
-const M_CONV_TAB: usize = 322;
 /// 格子右键：把这张图摆进参考图画布（画布没开就先开一扇）。
 const M_REF: usize = 331;
 /// 工具菜单里的文件关联：勾要登记的格式，把 Xsee 写进 HKCU 的候选列表。
 const M_ASSOC: usize = 332;
+/// 右键菜单：把落点的路径按纯文本放进剪贴板（快捷键之外另给一个入口）。
+const M_COPYPATH: usize = 333;
 
 /// 批量转换面板上的控件 id（800 起，避开对话框那一段 400–789）。
 const C_FMT: usize = 800; // 800..805 依次是五种目标格式
 const C_QUAL: usize = 810;
 const C_BROWSE_OUT: usize = 811;
-const C_OW: usize = 813; // 813..816 覆盖 / 跳过 / 编号
+const C_OW: usize = 813; // 813..816 三格，摆的顺序见 OW_SLOTS
+/// 面板「同名文件」三格的文字和存值。编号挪到头一格，存值仍按对话框那套
+/// 0 取代 / 1 跳过 / 2 重命名 / 3 询问——面板只改显示顺序，两边共用同一个号。
+const OW_SLOTS: [(&str, u8); 3] = [("编号", 2), ("跳过", 1), ("覆盖", 0)];
 const C_FIT: usize = 820; // 820..825 原样 / 适应 / 填充 / 拉伸 / 缩小
 const C_ROT: usize = 826; // 826..830 0 / 90 / 180 / 270
 const C_FLIP_H: usize = 831;
@@ -222,6 +233,8 @@ const C_UP: usize = 850;
 const C_RESET: usize = 851;
 /// 转换后改名那个勾选。放在 850 之后的空档，别和 C_START=844 撞。
 const C_RN_ON: usize = 852;
+/// 锐化半径（编辑窗口那页的第一个参数）。
+const C_SHARP_R: usize = 853;
 
 /// 面板上五个原生输入框的控件 id，WM_COMMAND 靠它认出是哪一格。
 const E_TW: usize = 900;
@@ -261,15 +274,17 @@ const D_RN_START_UP: usize = 521;
 const D_RN_CASE: usize = 522;
 const D_RN_HELP: usize = 526;
 /// 文件关联页：扩展名勾选从 D_ASSOC 起连续排，一格一个号。
-const D_ASSOC: usize = 450;
-const ASSOC_MAX: usize = 32;
+/// 1060 段是版式（1001..1048）和皮肤（1500..）之间的空档，别挪回 450——
+/// 那边紧挨着格式设置页的 D_OPT_*，扩展名一多就会撞号。
+const D_ASSOC: usize = 1060;
+const ASSOC_MAX: usize = 96;
 /// 应用勾选 / 打开系统默认应用设置。
-const D_ASSOC_APPLY: usize = 484;
-const D_ASSOC_DEFAULTS: usize = 485;
-/// 启动复查的开关。号排在扩展名那一段（450..450+32）之后，别撞进那一档。
-const D_ASSOC_CHECK: usize = 486;
+const D_ASSOC_APPLY: usize = 1160;
+const D_ASSOC_DEFAULTS: usize = 1161;
+/// 启动复查的开关。
+const D_ASSOC_CHECK: usize = 1162;
 
-/// 皮肤设置窗：四个页签 + 字体/字号 + 22 个配色槽 + 9 处渐变 + 皮肤目录。
+/// 皮肤设置窗：三个页签 + 字体/字号 + 配色槽 + 皮肤目录。
 const D_SKIN_TAB: usize = 600;
 const D_FACE: usize = 610;
 /// 目录页：路径框/“选择文件夹…”共用一号，“用默认目录”单独一号。
@@ -281,9 +296,23 @@ const D_THUMB_FIX: usize = 641;
 const D_THUMB_ALL: usize = 642;
 /// 维护页上换数据库位置那一下。
 const D_DB_MOVE: usize = 643;
-/// 22 个配色槽占连续编号；放在 800 段，避开维护页的 640..643。
+/// 维护页上清指纹库：把原图已不在盘上的条目从全部档位里摘掉（从以图搜图页挪过来的）。
+const D_DB_PRUNE: usize = 644;
+/// 维护页的扫描文件夹：名单增删、开扫（所选/全部）、停止，行按 `D_SCAN_ROW + 可见行号`。
+const D_SCAN_ADD: usize = 645;
+const D_SCAN_DEL: usize = 646;
+const D_SCAN_RUN: usize = 647;
+const D_SCAN_ALL: usize = 648;
+const D_SCAN_STOP: usize = 649;
+const D_SCAN_ROW: usize = 652;
+/// 扫描名单一次画五行，再多滚（滚轮认 paint 登记的那块 scan_list）。
+const SCAN_VIS: usize = 5;
+/// 扫描名单的规则编辑：按钮在维护页，对话框压在维护页上（dlg_hold 那套）。
+const D_SCAN_RULES: usize = 658;
+/// 规则对话框里的「保存并清理已入账」。
+const D_RULE_SAVE: usize = 659;
+/// 配色页每个颜色占连续编号；放在 800 段，避开维护页的 640..652。
 const D_COLOR: usize = 800;
-const D_GRAD: usize = 660;
 const D_RESET_LOOK: usize = 690;
 /// 皮肤设置窗右下角那排：改动实时叠到界面上，点确定才问要不要留在皮肤文件里。
 const D_LOOK_OK: usize = 700;
@@ -314,15 +343,7 @@ const D_SIM_GO: usize = 721;
 const D_SIM_ROW: usize = 722;
 /// 结果表一次最多画这么多行，再多就滚。命中 240 张，行号不会超过 id 区间。
 const SIM_ROWS: usize = 24;
-const D_SIM_FILL: usize = 750;
-const D_SIM_STOP: usize = 751;
-const D_SIM_PRUNE: usize = 752;
 const D_SIM_AUTO: usize = 753;
-/// 建指纹来源那两个单选。
-const D_SIM_SRC: usize = 754;
-const D_SIM_DIR: usize = 756;
-/// "找到之后"那一组：留在这张表里 / 装进主窗口的视图。
-const D_SIM_KEEP: usize = 757;
 /// 浮层自己那条标题条：按住它能把这一页拖走。所有对话框共用这一个号。
 const D_TITLEBAR: usize = 759;
 
@@ -331,9 +352,7 @@ const WM_SEARCH_DONE: u32 = WM_APP + 4;
 const WM_CONV_DONE: u32 = WM_APP + 5;
 const WM_DB_DONE: u32 = WM_APP + 6;
 const WM_SIM_DONE: u32 = WM_APP + 8;
-/// 补齐/清理指纹库回来了：带一句要显示的话。
-const WM_SIM_LIB: u32 = WM_APP + 9;
-/// 那两张预览解好了，只负责重画一下。
+/// 那两张预览解好了，只负责重画一下；相似页的库统计算完也借它刷一帧。
 const WM_SIM_PV: u32 = WM_APP + 10;
 
 const PAGE_N: usize = 120;
@@ -873,8 +892,8 @@ const WALLPAPER: &[MenuItem] = &[
 ];
 
 const FILE_MENU: &[MenuItem] = &[
-    mi("新建文件夹", "Ctrl+N", M_NEWDIR),
-    mi("新建窗口(W)", "Ctrl+W", M_NEWWIN),
+    mi("新建文件夹", "Ctrl+Shift+N", M_NEWDIR),
+    mi("新建窗口(W)", "Ctrl+N", M_NEWWIN),
     msep(),
     mi("打开(O)...", "Enter", M_OPEN),
     mi("预览", "Ctrl+Shift+V", M_VIEWER),
@@ -898,7 +917,7 @@ const EDIT_MENU: &[MenuItem] = &[
 ];
 const VIEW_MENU: &[MenuItem] = &[
     msub("浏览器窗格(B)", VIEW_PANES),
-    mick("整理面板(R)", "Ctrl+Shift+O", M_ORG, true),
+    mick("图片分类(R)", "Ctrl+Shift+O", M_ORG, true),
     mick("批量图片转换(B)", "Ctrl+B", M_CONV_PANEL, false),
     msub("主工具栏(O)", MAIN_TOOLBAR),
     mick("路径栏(A)", "", M_BAR_PATH, true),
@@ -931,7 +950,8 @@ const FILTER_MENU: &[MenuItem] = &[
 /// 导入=整份覆盖（确认框里写明白，不是合并），维护页管统计/检查/缩略图/位置。
 const DB_MENU: &[MenuItem] = &[
     mi("立即查找(F)", "Ctrl+F", M_FIND),
-    mi("数据库维护...", "", M_DBMAINT),
+    mi("分类数据库...", "", M_CATDB),
+    mi("缩略图数据库...", "", M_THUMBDB),
     mi("重建页面缩略图", "F5", M_RESCAN),
     msep(),
     mi("导出数据库备份...", "", M_DBBACKUP),
@@ -974,6 +994,8 @@ const CAT_CTX: &[MenuItem] = &[
     mi("编辑名称(&R)", "", M_CAT_RENAME),
 ];
 const CTX_MENU: &[MenuItem] = &[
+    mi("打开(&O)", "Enter", M_OPEN),
+    msep(),
     msub("查看(&V)", THUMB_VIEWS),
     msub("排列图标(&I)", CTX_ARRANGE),
     msub("过滤(&F)", FILTER_MENU),
@@ -987,29 +1009,35 @@ const CTX_MENU: &[MenuItem] = &[
     mi("重命名(&R)", "F2", M_RENAME),
     mi("批量重命名(&N)...", "", M_BATCH),
     msep(),
-    mi("画布模式", "", M_REF),
-    mi("找相似图片(&S)", "", M_FINDSIM),
+    mi("参考图画布模式", "", M_REF),
+    mi("以图搜图(&S)", "", M_FINDSIM),
     mi("编辑图像(&E)...", "", M_EDITOR),
     msep(),
     mi("格式转换(&E)...", "Ctrl+E", M_CONV),
     msep(),
     mi("选取全部文件(&L)", "Ctrl+A", M_ALL),
     mi("新建文件夹", "", M_NEWDIR),
+    msep(),
+    mi("复制路径(&C)", "", M_COPYPATH),
+    mi("刷新(&F)", "F5", M_RESCAN),
     mi("属性(&P)", "", M_PROP),
 ];
 
 /// 目录树右键：只做文件夹本身的操作。查看/排列/过滤属于中间列表，
 /// 画布/找相似/编辑/格式转换/批量改名属于图片文件，都不在这张菜单上。
 const TREE_CTX: &[MenuItem] = &[
-    mi("新建文件夹(&N)", "Ctrl+N", M_NEWDIR),
+    mi("新建文件夹(&N)", "Ctrl+Shift+N", M_NEWDIR),
     mi("粘贴(&P)", "Ctrl+V", M_PASTE),
     msep(),
     mi("剪切(&T)", "Ctrl+X", M_CUT),
     mi("复制(&C)", "Ctrl+C", M_COPYF),
     mi("删除(&D)", "Del", M_DEL),
     mi("重命名(&R)", "F2", M_RENAME),
+    mi("复制路径(&C)", "", M_COPYPATH),
     mi("属性(&P)", "", M_PROP),
     mi("转到文件", "", M_EXPL),
+    msep(),
+    mi("刷新(&F)", "", M_TREE_REFRESH),
 ];
 
 /// 目录树右键那张菜单里哪些条目该画灰：盘符、主目录不能剪、删、改名；
@@ -1025,6 +1053,35 @@ fn tree_ctx_off(a: &App, id: usize) -> bool {
     }
 }
 
+/// 这次文件操作落在哪儿：(是不是树落点, 树上的路径)。右键那一行最优先，
+/// 其次是键盘焦点所在的树行。焦点在树上但那一行没有文件落点（“此电脑”）时
+/// 返回 (true, None)——不许回落去动格子选区，那正是“树上按 Del 删别处文件”的老毛病。
+fn tree_target() -> (bool, Option<String>) {
+    let g = app().lock().unwrap();
+    if g.ctx_dir.is_some() {
+        return (true, g.ctx_dir.clone());
+    }
+    if !g.tree_kb {
+        return (false, None);
+    }
+    (true, g.tree_focus_dir())
+}
+
+/// 中间列表右键：图片专用的那几条只有落点真是一张图时才亮；文件夹、非图片文件
+/// 一律画灰，点了也不执行。绘制和点击共用这一条，跟 tree_ctx_off 同一个道理。
+/// 空白处不动图片项——那几条按格子里的选区走，选区还在就该能用。
+/// 顶栏和工具栏那些菜单也用同一个绘制函数，靠 ctx_at 把范围圈在右键弹层里。
+fn grid_ctx_off(a: &App, id: usize) -> bool {
+    if a.ctx_at.is_none() || a.ctx_tree {
+        return false;
+    }
+    if id == M_OPEN {
+        return a.ctx_blank;
+    }
+    let image_only = matches!(id, M_REF | M_FINDSIM | M_EDITOR | M_CONV | M_BATCH);
+    image_only && !a.ctx_blank && a.ctx_img.is_none()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Grid,
@@ -1038,6 +1095,11 @@ enum Mode {
 const THUMB_H_MIN: i32 = 100;
 const THUMB_H_MAX: i32 = 150;
 const THUMB_H_STEP: i32 = 5;
+/// 内存里最多留多少缩略图像素（原尺寸那份 + 按显示尺寸缩好的那份）。
+/// 按字节算不按张数算：默认缩略图档一张约 60 KB，256 MB 足够一两千张的目录
+/// 整个常驻，滚回之前看过的地方不用再从缓存里读一遍。目录更大、缩略图调得更大
+/// 或者一张特别占地方时才退回"只留视区附近"。
+const THUMB_MEM_MAX: usize = 256 * 1024 * 1024;
 /// 图标档那枚格式牌/文件夹图标在屏幕上的边长，物理像素。
 const SMALL_ICON: i32 = 60;
 
@@ -1065,10 +1127,14 @@ enum DlgKind {
     BatchRename,
     NewCat,
     RenameCat,
-    /// 皮肤设置：字体、字号、22 个配色槽、9 处渐变。
+    /// 皮肤设置：字体、字号、配色槽（文字色在字体页按版块调）。
     Skin,
-    /// 数据库维护：统计 + 检查清理，合在一页。
-    DbMaint,
+    /// 分类数据库：类别/归类/入库时间的统计和检查，独立一页。
+    CatDb,
+    /// 缩略图数据库：缓存、重建、清指纹、扫描文件夹，独立一页（以图搜图的账在这里）。
+    ThumbDb,
+    /// 扫描名单某一项的排除规则编辑：两个输入框 + 保存清理。压在缩略图数据库页上。
+    ScanRule,
     /// 以图搜图：指纹库管理 + 检索条件 + 结果表 + 双预览，一整页。
     SimSearch,
     /// 文件关联：勾要登记的格式，写 HKCU 的候选列表。
@@ -1139,6 +1205,13 @@ struct Img {
     fit: Option<Fit>,
 }
 
+impl Img {
+    /// 这一张实际占的内存：解码出来的那份，加上按显示尺寸缩好的那份。
+    fn bytes(&self) -> usize {
+        self.px.len() + self.fit.as_ref().map(|f| f.px.len()).unwrap_or(0)
+    }
+}
+
 /// 以图搜图结果表的一行。差几位、大小、改期在结果回来那一下一次取好，
 /// 绘制时每帧只读内存，不再碰盘。
 #[derive(Clone)]
@@ -1156,7 +1229,7 @@ struct App {
     /// 版式：None = 内置的圆角仪表，Some = 某套开源图标库的 key。
     layout: Option<String>,
     density: String,
-    /// 当前皮肤的个人覆盖：字体、字号、槽位颜色、渐变。按皮肤名分文件存。
+    /// 当前皮肤的个人覆盖：字体、字号、槽位颜色。按皮肤名分文件存。
     look: theme::Look,
     scale: f64,
     mode: Mode,
@@ -1218,7 +1291,6 @@ struct App {
     tree: Vec<Node>,
     tsel: String,
     home: String,
-    tree_focus: bool,
     /// 这一次换目录别动树的滚动位置：树里点出来的导航要让那一行待在原地。
     tree_noscroll: bool,
     /// 按住树滚动条滑块拖动时记的（指针与滑块顶的差、槽顶、滑块可行程、滚动上限）。
@@ -1267,6 +1339,8 @@ struct App {
     drag: Option<(i32, i32, i32)>,
     /// 在格子上按下的位置和条目；移动超过系统拖拽阈值就转成拖文件。
     drag_seed: Option<(i32, i32, usize)>,
+    /// 树行拖起来的起点：按下时记下面包路径，拖过系统阈值就真的把这一个文件夹拖出去。
+    tree_seed: Option<(i32, i32, String)>,
     /// 正在往外拖时，指针底下那个能收文件的文件夹；画出来给人当落点提示。
     drop_hl: Option<Hl>,
     btns: Vec<(usize, RECT)>,
@@ -1291,6 +1365,13 @@ struct App {
     /// 这次右键是不是冲着目录树某个文件夹来的：树上右键时记那行的路径，
     /// 复制/粘贴/新建/删除四条命令按文件夹本体算。弹层一关就清掉。
     ctx_dir: Option<String>,
+    /// 这次右键落在中间列表哪张图上：以图搜图从右键进来时直接拿它当查询图，
+    /// 不经过全局选区——从右键到点菜单项之间选区被谁动了都不碍事。
+    /// 弹层一关就清掉，跟 ctx_dir 同一个寿命。
+    ctx_img: Option<String>,
+    /// 这次中间列表右键落在空白处：没有可打开的东西，“打开”跟着画灰，
+    /// 图片专用那几条也不对着别处的选区亮着。和 ctx_img 同一个寿命。
+    ctx_blank: bool,
     /// 这次右键弹的是树那张菜单还是中间列表那张。两张菜单的条目不同，
     /// 绘制、悬停、点击都要按同一个开关取，不然点到的行和看到的那行会错位。
     ctx_tree: bool,
@@ -1359,6 +1440,8 @@ struct App {
     conv_scroll: i32,
     conv_max_scroll: i32,
     conv_drag: Option<(i32, i32, i32, i32)>,
+    /// 按住滑条一路拖：记的是哪一条（控件号）和轨道的左右两端，拖动与单击共用同一条换算。
+    conv_sdrag: Option<(usize, i32, i32)>,
     /// 面板上五个原生输入框：目标宽、目标高、输出目录、水印文字、改名模板
     conv_edits: [HWND; E_N],
     conv_edit_rects: [RECT; E_N],
@@ -1369,7 +1452,10 @@ struct App {
     conv_rot: u16,
     conv_fliph: bool,
     conv_flipv: bool,
+    /// 强度 ×10，0 关。上限 30 = 编辑窗口那页的 3.0
     conv_sharp: u8,
+    /// 半径 ×2，上限 20 = 编辑窗口那页的 10.0；默认 3 = 1.5，和那页开框的默认值一致
+    conv_sharp_r: u8,
     conv_wm: bool,
     conv_wm_pos: u8,
     conv_wm_size: u8,
@@ -1399,6 +1485,9 @@ struct App {
     /// 正按住浮层标题条拖它：记的是按下那一下离浮层左上角差多少，松手就清。
     dlg_drag: Option<(i32, i32)>,
     dlg_edit: Option<HWND>,
+    /// 规则对话框的两个输入框（排除文件夹关键字、排除文件格式）。
+    /// 只有 ScanRule 那层开着才有柄，关闭随 close_dlg 一起销毁。
+    rule_edits: [HWND; 2],
     /// 文件关联页的草稿：每个扩展名勾没勾，点「应用」才写注册表。
     assoc: Vec<(String, bool)>,
     /// 关联页底部那行结果。写失败的项目也在这儿列出来，不弹框。
@@ -1424,6 +1513,10 @@ struct App {
     /// 每种目标格式各存一份设置；切换格式不会把别的格式的选项冲掉。
     conv_opts: Vec<encode::Opt>,
     conv_out: String,
+    /// 输出文件夹还是"跟着当前文件夹走"的默认态。用户自己填过路径（编辑框输入、
+    /// 浏览按钮、对话框里改过）就落定为 false，之后不再跟手。
+    /// 不跟手的话，开面板之后换过文件夹，转换就悄悄落进上一个文件夹。
+    conv_out_auto: bool,
     /// 0 取代 / 1 跳过 / 2 重命名 / 3 询问（批量里等同跳过）
     conv_overwrite: u8,
     conv_del: bool,
@@ -1437,8 +1530,27 @@ struct App {
     db_import_src: Option<PathBuf>,
     /// 维护页上最近一次检查的结果；空表示还没查过。
     db_maint: String,
+    /// 缩略图数据库页上最近一次「移除无效索引」的结果，和检查各走各的页。
+    db_prune: String,
     /// 维护页上最近一次缩略图动作的结果。和检查结果各记各的，不互相盖掉。
     db_thumb: String,
+    /// 维护页上最近一次扫描文件夹的结果。三样各记各的。
+    db_scan: String,
+    /// 扫描文件夹的名单，落盘在缓存目录 scan.tsv。每行一个根：路径 + 上次扫完
+    /// 的秒数 + 排除规则（文件夹关键字、文件格式），规则随名单一起存、一起用。
+    scan_dirs: Vec<ScanRoot>,
+    scan_sel: usize,
+    /// 名单画在哪一块，滚轮只认它；paint 时登记，滚轮照 sim_list 同一个办法读。
+    scan_list: RECT,
+    scan_scroll: usize,
+    /// 扫描进行中的计数，心跳和结果框都从这几个现读。
+    scan_busy: bool,
+    scan_total: usize,
+    scan_done: Arc<AtomicUsize>,
+    scan_added: Arc<AtomicUsize>,
+    scan_skip: Arc<AtomicUsize>,
+    scan_err: Arc<AtomicUsize>,
+    scan_stop: Arc<AtomicBool>,
     /// 中间列表的三个过滤开关。只在浏览文件夹时生效；是"暂时藏起来"，不是设定，
     /// 所以不落盘，重启全显示。
     filt_dirs: bool,
@@ -1475,11 +1587,8 @@ struct App {
     sim_flip: bool,
     /// 查找之前先拿缩略图缓存把这一档的指纹补齐。
     sim_auto: bool,
-    /// 建库名单口径：假=这一阵看过的（缩略图缓存里那批），真=指定文件夹里看过的。
-    sim_folder: bool,
-    sim_dir: String,
-    /// 结果留在表里，还是顺手装进主窗口当一屏。
-    sim_to_view: bool,
+    /// 头一页说明看过没有。只弹一次，落注册表跟着进程走。
+    sim_intro: bool,
     sim_hits: Vec<SimHit>,
     sim_sel: usize,
     sim_scroll: i32,
@@ -1487,21 +1596,10 @@ struct App {
     sim_list: RECT,
     sim_ms: u128,
     sim_lib_msg: String,
-    sim_fill_busy: bool,
-    sim_speed: f64,
-    /// 补齐从哪一刻起算，心跳拿它现除一个速度出来。
-    sim_t0: Option<Instant>,
-    /// 补齐速度的峰值，面积条拿它当满量程，不然快慢看不出差别。
-    sim_peak: f64,
     sim_stop: Arc<AtomicBool>,
     /// 底下那两块预览：查询图，和表里选中的那张。
     sim_src_img: Option<Img>,
     sim_hit_img: Option<Img>,
-    /// 库里"共多少条 / 多少条原图已不在"的缓存。paint 每帧都要这两个数，
-    /// 直接算等于每帧把全库每条路径 exists 一遍；拖动浮层时一帧一次，卡得没法动。
-    sim_stat: (usize, usize),
-    sim_stat_bx: (u32, u32),
-    sim_stat_ok: bool,
     /// 查询图的原图尺寸，只在换图时取一次（每帧开一次文件头同样拖慢拖动）。
     sim_qinfo_path: String,
     sim_qinfo: String,
@@ -1509,7 +1607,7 @@ struct App {
 }
 
 /// 数据库位置可以换：默认跟着主文件同级的 data；主文件装在系统目录写不动时退回
-/// 缓存目录；他在数据库维护页换过位置就认注册表里那条 db_dir。
+/// 缓存目录；他在分类数据库页换过位置就认注册表里那条 db_dir。
 static DATA_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn data_dir() -> PathBuf {
@@ -1730,6 +1828,96 @@ fn save_conv_cfg(opts: &[encode::Opt]) {
     let _ = std::fs::write(conv_cfg_file(), s);
 }
 
+/// 扫描名单的一行：根路径、上次扫完的时间、这条根自己的排除规则。
+/// 规则三处生效：扫描走查剪枝、浏览顺手记指纹、补齐指纹——出处见 scan::excluded。
+#[derive(Clone)]
+struct ScanRoot {
+    path: String,
+    last: u64,
+    /// 排除文件夹关键字（模糊：文件夹名包含即命中，不分大小写）。
+    dirs: Vec<String>,
+    /// 排除文件格式（后缀精确，不带点）。
+    exts: Vec<String>,
+}
+
+/// 扫描文件夹的名单跟着缩略图库走，所以放缓存目录（convert.tsv 同一个先例）。
+/// 一行一个文件夹：`上次扫完的秒数 \t 完整路径 \t 排除文件夹关键字 \t 排除格式`，
+/// 关键字/格式内部用逗号分隔。后两列是后来加的，旧行没有就当没有规则。
+fn scan_cfg_file() -> PathBuf {
+    cache::dir().join("scan.tsv")
+}
+
+/// 逗号分隔的一串词拆成表，去空去重（存小写，匹配时两边都小写）。
+fn rule_words(s: Option<&str>) -> Vec<String> {
+    let mut v: Vec<String> = s
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_ascii_lowercase())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// 把现行名单换算成指纹关口的规则（scan::set_rules）。名单加载、规则保存、
+/// 名单增删之后都要同步一次。
+fn sync_scan_rules(dirs: &[ScanRoot]) {
+    let rules = dirs
+        .iter()
+        .map(|r| scan::ExclRule::new(&r.path, &r.dirs, &r.exts))
+        .collect();
+    scan::set_rules(rules);
+}
+
+fn load_scan_cfg() -> Vec<ScanRoot> {
+    let mut v: Vec<ScanRoot> = Vec::new();
+    if let Ok(s) = std::fs::read_to_string(scan_cfg_file()) {
+        for line in s.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let mut f = line.splitn(4, '\t');
+            let (Some(t), Some(p)) = (f.next(), f.next()) else {
+                continue;
+            };
+            if p.is_empty() {
+                continue;
+            }
+            let (dirs, exts) = (rule_words(f.next()), rule_words(f.next()));
+            // 同一个文件夹大小写不同的两行只留后写的，时间取新的那个。
+            if let Some(old) = v.iter_mut().find(|o| o.path.eq_ignore_ascii_case(p)) {
+                old.last = old.last.max(t.parse::<u64>().unwrap_or(0));
+                continue;
+            }
+            v.push(ScanRoot {
+                path: p.to_string(),
+                last: t.parse::<u64>().unwrap_or(0),
+                dirs,
+                exts,
+            });
+        }
+    }
+    // 名单进了内存就把规则同步给指纹关口，启动即生效。
+    sync_scan_rules(&v);
+    v
+}
+
+fn save_scan_cfg(dirs: &[ScanRoot]) {
+    let mut s = String::new();
+    for r in dirs {
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            r.last,
+            r.path,
+            r.dirs.join(","),
+            r.exts.join(",")
+        ));
+    }
+    let _ = std::fs::write(scan_cfg_file(), s);
+}
+
 // ── 界面摆位：调一次记一次 ─────────────────────────────────────
 /// 界面上能调的那几十个数控在一条注册表键下，一个数一条 DWORD。
 /// 只记"界面摆成什么样"，不记"这一次在看什么"（树展开到哪、滚到哪）。
@@ -1772,10 +1960,13 @@ fn ui_vals() -> &'static HashMap<String, u32> {
                     Some(data.as_mut_ptr()),
                     Some(&mut cb),
                 );
-                if e.0 != 0 {
+                // 259 = ERROR_NO_MORE_ITEMS，到尾巴了才收工。字符串值（last_dir、
+                // skin）塞不进 4 字节，枚举会回 ERROR_MORE_DATA——那条跳过往下走，
+                // 不能 break，否则字母序排在它后面的那串 DWORD 全读不到。
+                if e.0 == 259 {
                     break;
                 }
-                if kind != REG_DWORD.0 || cb != 4 {
+                if e.0 != 0 || kind != REG_DWORD.0 || cb != 4 {
                     continue;
                 }
                 out.insert(String::from_utf16_lossy(&name[..cch as usize]), u32::from_ne_bytes(data));
@@ -1908,6 +2099,7 @@ fn ui_items(a: &App) -> Vec<(&'static str, u32)> {
         ("tb_below", b(a.tb_below)),
         ("org_open", b(a.org_open)),
         ("conv_open", b(a.conv_open)),
+        ("sim_intro", b(a.sim_intro)),
         ("dock_tab", a.dock_tab as u32),
         ("density", DENS.iter().position(|d| *d == a.density).unwrap_or(1) as u32),
         ("left_w", px(a.left_w)),
@@ -2020,6 +2212,10 @@ fn cat_clip_empty() -> bool {
 
 /// 后台搬运线程把成功的 (旧路径, 新路径) 放这里，界面线程落完分类再取走。
 static MOVED_IMGS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// 落文件夹那趟失败的第一句原因，随 WM_DROP_DONE 一起给界面线程读。
+static DROP_ERR: Mutex<String> = Mutex::new(String::new());
+/// 落文件夹那趟动过的目录（目标 + 各个源的上层），界面线程拿它们重扫树。
+static DROP_DIRS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// 把搬过家的图片路径同步进分类库；返回保存失败时的提示。
 fn sync_cat_paths(g: &mut App, pairs: &[(String, String)]) -> Option<String> {
@@ -2090,7 +2286,6 @@ fn app() -> &'static Mutex<App> {
             tree: Vec::new(),
             tsel: String::new(),
             home: user_home().unwrap_or_else(|| "C:\\".into()),
-            tree_focus: false,
             tree_noscroll: false,
             tree_drag: None,
             grid_drag: None,
@@ -2131,6 +2326,7 @@ fn app() -> &'static Mutex<App> {
             hit0: 0,
             drag: None,
             drag_seed: None,
+            tree_seed: None,
             drop_hl: None,
             btns: Vec::new(),
             menus: Vec::new(),
@@ -2148,6 +2344,8 @@ fn app() -> &'static Mutex<App> {
             ctx_sub: None,
             ctx_sub_rect: RECT::default(),
             ctx_dir: None,
+            ctx_img: None,
+            ctx_blank: true,
             ctx_tree: false,
             ctx_sub_rows: Vec::new(),
             ctx_cat: None,
@@ -2197,6 +2395,7 @@ fn app() -> &'static Mutex<App> {
             conv_scroll: 0,
             conv_max_scroll: 0,
             conv_drag: None,
+            conv_sdrag: None,
             conv_edits: [HWND::default(); E_N],
             conv_edit_rects: [RECT::default(); E_N],
             conv_tw: String::new(),
@@ -2207,6 +2406,7 @@ fn app() -> &'static Mutex<App> {
             conv_fliph: false,
             conv_flipv: false,
             conv_sharp: 0,
+            conv_sharp_r: 3,
             conv_wm: false,
             conv_wm_pos: 3,
             conv_wm_size: 4,
@@ -2230,6 +2430,7 @@ fn app() -> &'static Mutex<App> {
             dlg_rows: Vec::new(),
             dlg_drag: None,
             dlg_edit: None,
+            rule_edits: [HWND::default(); 2],
             assoc: Vec::new(),
             assoc_msg: String::new(),
             assoc_check: assoc::check_on(),
@@ -2244,7 +2445,8 @@ fn app() -> &'static Mutex<App> {
             conv_fmt: 0,
             conv_opts: load_conv_cfg(),
             conv_out: String::new(),
-            conv_overwrite: 0,
+            conv_out_auto: true,
+            conv_overwrite: 2,
             conv_del: false,
             rn_tpl: "*".into(),
             rn_start: 1,
@@ -2252,7 +2454,20 @@ fn app() -> &'static Mutex<App> {
             db_busy: false,
             db_import_src: None,
             db_maint: String::new(),
+            db_prune: String::new(),
             db_thumb: String::new(),
+            db_scan: String::new(),
+            scan_dirs: load_scan_cfg(),
+            scan_sel: 0,
+            scan_list: RECT::default(),
+            scan_scroll: 0,
+            scan_busy: false,
+            scan_total: 0,
+            scan_done: Arc::new(AtomicUsize::new(0)),
+            scan_added: Arc::new(AtomicUsize::new(0)),
+            scan_skip: Arc::new(AtomicUsize::new(0)),
+            scan_err: Arc::new(AtomicUsize::new(0)),
+            scan_stop: Arc::new(AtomicBool::new(false)),
             filt_dirs: false,
             filt_nonimg: false,
             filt_cat: false,
@@ -2275,25 +2490,16 @@ fn app() -> &'static Mutex<App> {
             sim_rot: false,
             sim_flip: false,
             sim_auto: true,
-            sim_folder: false,
-            sim_dir: String::new(),
-            sim_to_view: false,
+            sim_intro: ui_flag("sim_intro", false),
             sim_hits: Vec::new(),
             sim_sel: 0,
             sim_scroll: 0,
             sim_list: RECT::default(),
             sim_ms: 0,
             sim_lib_msg: String::new(),
-            sim_fill_busy: false,
-            sim_speed: 0.0,
-            sim_t0: None,
-            sim_peak: 0.0,
             sim_stop: Arc::new(AtomicBool::new(false)),
             sim_src_img: None,
             sim_hit_img: None,
-            sim_stat: (0, 0),
-            sim_stat_bx: (0, 0),
-            sim_stat_ok: false,
             sim_qinfo_path: String::new(),
             sim_qinfo: String::new(),
             brush_edit: HBRUSH::default(),
@@ -2331,6 +2537,15 @@ fn type_label(ext: &str) -> String {
         "heic" => Some("HEIC 图像"),
         "psd" | "psb" => Some("Photoshop 图像"),
         "ico" => Some("图标"),
+        "avif" => Some("AVIF 图像"),
+        "tga" => Some("Targa 图像"),
+        "dds" => Some("DDS 纹理"),
+        "qoi" => Some("QOI 图像"),
+        "exr" => Some("OpenEXR 图像"),
+        "hdr" => Some("HDR 图像"),
+        "ff" => Some("Farbfeld 图像"),
+        "pbm" | "pgm" | "ppm" | "pnm" | "pam" => Some("Netpbm 图像"),
+        "wdp" | "hdp" | "jxr" => Some("JPEG XR 图像"),
         _ => None,
     };
     match named {
@@ -2379,6 +2594,14 @@ fn local(epoch: u64) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
     )
+}
+
+/// 文件系统给的时间 -> 本地 "2026-10-19 14:22"。取不到（卷不支持、时间为空）就返回空串。
+fn fmt_sys_time(t: std::io::Result<std::time::SystemTime>) -> String {
+    t.ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| local(d.as_secs()))
+        .unwrap_or_default()
 }
 
 /// 结果表"所在文件夹"那一列：只留最后一级目录名，整条路径在窄列里全是省略号。
@@ -2644,6 +2867,17 @@ impl App {
         pt != "此电脑"
             && !pt.eq_ignore_ascii_case(self.home.trim_end_matches('\\'))
             && pt.len() > 3
+    }
+
+    /// 键盘焦点在树上时，文件命令（F2/Del/复制/剪切/属性/转到文件）认的是这一行。
+    /// 盘根保留结尾反斜杠，其余摘掉，和右键落点同一个口径。
+    /// “此电脑”没有文件层面的落点，返回 None——调用方按“什么都不做”处理。
+    fn tree_focus_dir(&self) -> Option<String> {
+        if !self.tree_kb || self.tsel == "此电脑" {
+            return None;
+        }
+        let p = self.tsel.as_str();
+        Some(if p.len() > 3 { p.trim_end_matches('\\').to_string() } else { p.to_string() })
     }
 
     fn band_pick(&self, g: RECT, x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<usize> {
@@ -2962,6 +3196,9 @@ impl App {
         self.apply_filters();
         self.note_seen();
         self.restart_size();
+        // 目录枚举回来永远是按名的顺序。不补这一刀，刷新或换目录会把人选的
+        // 排列方式打回按名，而菜单上的勾还停在原来那一档。
+        self.apply_sort();
         self.sel = if self.entries.is_empty() {
             usize::MAX
         } else {
@@ -3074,9 +3311,18 @@ impl App {
             next.push(self.entries[r.0].clone());
         }
         self.entries = next;
+        // 本来就没选中（sel=MAX，类别视图的口径）排序后也保持没选中：
+        // 落成 0 会凭空把第一张变成光标项，批量操作会误伤这张从没点过的图。
+        let was_none = sel_path.is_none() && self.sel == usize::MAX;
         self.sel = sel_path
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
-            .unwrap_or_else(|| if self.entries.is_empty() { usize::MAX } else { 0 });
+            .unwrap_or_else(|| {
+                if was_none || self.entries.is_empty() {
+                    usize::MAX
+                } else {
+                    0
+                }
+            });
         self.anchor = anchor_path
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
             .unwrap_or(self.sel);
@@ -3175,6 +3421,22 @@ impl App {
             };
         }
         self.zf = zf;
+        // 刚删掉的旧字体还被原生输入框攥着，句柄已悬空：把各自的对应新字体
+        // 重新发一遍，不然换肤/改字号后输入框回退系统字体，直到控件重建。
+        unsafe {
+            for ed in self.conv_edits {
+                if !ed.0.is_null() {
+                    let _ = SendMessageW(ed, WM_SETFONT, Some(WPARAM(self.zf[theme::Z_ORG].f.0 as usize)), Some(LPARAM(1)));
+                }
+            }
+            if let Some(ed) = self.dlg_edit {
+                let _ = SendMessageW(ed, WM_SETFONT, Some(WPARAM(self.zf[theme::Z_DLG].f.0 as usize)), Some(LPARAM(1)));
+            }
+            if let Some(ed) = self.ren_edit {
+                // 改名框创建时拿的是当时的 g.font——一帧画完停在对话框那一块上，取同一支。
+                let _ = SendMessageW(ed, WM_SETFONT, Some(WPARAM(zf[theme::Z_DLG].f.0 as usize)), Some(LPARAM(1)));
+            }
+        }
         self.zone(theme::Z_DLG);
         let brush = CreateSolidBrush(cref(self.th.skin.canvas));
         if !self.brush_edit.0.is_null() {
@@ -3196,17 +3458,25 @@ impl App {
         self.font_path = self.zf[theme::Z_PATH].f;
     }
 
-    /// 把看得见的顶到队头，再往后多排一页。只排没排过的。
+    /// 把看得见的顶到队头，再往滚动方向多排两屏。只排没排过的。
     fn queue_visible(&mut self, g: RECT) {
         let (first, last) = self.range(g);
-        let ahead = ((last - first) * 2).max(24);
-        let to = (last + ahead).min(self.entries.len());
+        let span = last.saturating_sub(first).max(1);
+        // 惯性还在跑也要排：条带帧只补新露出来的那一格，缩略图不在内存里就只剩空白。
+        // 以前速度不为零就整段不排，滚停前扫过的格子只能等停稳后重画。滚动中按滚动
+        // 方向往前排两屏（滚轮往下就排下面、往上就排上面），停稳后同样补两屏；留两屏
+        // 是因为一屏的提前量在滚得快时经常还没解完就进屏了。详细资料档这一趟要开文件
+        // 读头，滚动中仍旧不排，免得慢盘 IO 拖住帧。
+        let moving = self.scroll_vel != 0.0;
+        let ahead = (span * 2).max(24);
         let mut fresh = Vec::new();
-        // 惯性还在跑就先别排新活：这一档每 16 毫秒重排一次队，刚排上的转眼又滚
-        // 出视野；详细资料档虽然这一趟只读文件头，网络盘上几十次 IO 一样会拖住
-        // 滚动帧。等速度归零那一帧再一次补齐。
-        if self.scroll_vel == 0.0 {
-            for i in first..to {
+        if !(moving && self.mode == Mode::Detail) {
+            let (from, to) = if self.scroll_vel < 0.0 {
+                (first.saturating_sub(ahead), last)
+            } else {
+                (first, (last + ahead).min(self.entries.len()))
+            };
+            for i in from..to {
                 if !self.entries[i].is_image || self.thumbs.contains_key(&i) || self.queued.contains(&i) {
                     continue;
                 }
@@ -3302,15 +3572,54 @@ impl App {
         true
     }
 
-    /// 离开视区太远的缩略图丢掉，内存按屏算不按目录算。
+    /// 按内存预算留缩略图：放得下就整个目录都留，放不下才裁。
+    /// 以前按"超过 600 张"硬砍，一千多张的目录滚到下半段，上半段就被丢掉，
+    /// 再滚回去只能从缓存重读，滚动过程中就是一片空白格。
     fn prune(&mut self) {
-        if self.thumbs.len() <= 600 {
+        if self.thumbs.is_empty() {
+            return;
+        }
+        let used: usize = self.thumbs.values().map(Img::bytes).sum();
+        if used <= THUMB_MEM_MAX {
             return;
         }
         let (a, b) = self.vis;
-        let lo = a.saturating_sub(500);
-        let hi = b + 500;
-        self.thumbs.retain(|i, _| *i >= lo && *i < hi);
+        let span = b.saturating_sub(a).max(1);
+        // 先把离屏一屏以外"按显示尺寸缩好的那份"放掉：再画到会重缩，留着只是白占。
+        // 这一条只在超预算时才做——普通目录来回滚，附近那几屏的成品仍然原样留着。
+        let near_lo = a.saturating_sub(span);
+        let near_hi = b + span;
+        for (i, im) in self.thumbs.iter_mut() {
+            if *i < near_lo || *i >= near_hi {
+                im.fit = None;
+            }
+        }
+        let used: usize = self.thumbs.values().map(Img::bytes).sum();
+        if used <= THUMB_MEM_MAX {
+            return;
+        }
+        // 还超预算就把视区里的先全留，再从两侧由近到远往里收，收到预算为止。
+        // 上万张的目录因此能留几千张的工作集，而不是固定前后 500 张。
+        let mut all: Vec<(usize, Img)> = self.thumbs.drain().collect();
+        all.sort_unstable_by_key(|(i, _)| {
+            if *i < a {
+                a - *i
+            } else if *i >= b {
+                *i - b + 1
+            } else {
+                0
+            }
+        });
+        let mut used = 0usize;
+        for (i, im) in all {
+            let n = im.bytes();
+            let in_vis = i >= a && i < b;
+            if used + n > THUMB_MEM_MAX && !in_vis {
+                continue;
+            }
+            used += n;
+            self.thumbs.insert(i, im);
+        }
         let keep: HashSet<usize> = self.thumbs.keys().copied().collect();
         self.dims.retain(|i, _| keep.contains(i));
         self.bpps.retain(|i, _| keep.contains(i));
@@ -3339,7 +3648,8 @@ impl App {
             if a != usize::MAX {
                 let (a, b) = (a.min(to), a.max(to));
                 // 范围里连文件夹一起选，和资源管理器一样：按 Shift 点两下就是屏幕上这一段全部。
-                let add: Vec<String> = (a..=b)
+                // b 夹到表尾：锚点理论上已随视图重置，这里再兜一道底。
+                let add: Vec<String> = (a..=b.min(n - 1))
                     .filter(|&j| self.pickable(j))
                     .map(|j| self.entries[j].path.clone())
                     .collect();
@@ -3441,6 +3751,9 @@ impl App {
         } else {
             0
         };
+        // 锚点必须跟着重置：它还是上一个目录的下标，列表换短之后
+        // Shift 点选/Shift 方向键拿它当 entries 的下标会越界 panic。
+        self.anchor = self.sel;
         self.marked.clear();
         self.hover = usize::MAX;
         self.scroll_set(0);
@@ -4406,7 +4719,9 @@ const IK_FILE: u8 = 2;
 /// 图片的格式牌从这一档起排：`IK_FMT + 格式表下标`。详细档用带 X 的版式。
 const IK_FMT: u8 = 16;
 /// 列表档的格式牌另起一档：同一张图在列表里只有格式名，不能和详细档共用缓存。
-const IK_FMT_LIST: u8 = 32;
+/// 起点必须让开 `IK_FMT + FMTS::len()` 整段——格式牌一多，两段就会撞号，
+/// 缓存里取到的是另一种牌（曾经 32 起步，FF/PNM/JXR/SVG 在图标档显示成 JPG/PNG/PSD/GIF）。
+const IK_FMT_LIST: u8 = 64;
 
 thread_local! {
     static IK_TILES: std::cell::RefCell<std::collections::HashMap<(u8, i32, u32, u32), (HBITMAP, u32)>> =
@@ -4697,37 +5012,6 @@ unsafe fn vline(hdc: HDC, x: i32, y0: i32, y1: i32, c: u32) {
     fill(hdc, &r, c);
 }
 
-/// 工具栏：16 键里去掉"在线服务"，顺序、分组、灰显照设计稿。
-/// 图标在上名字在下，on 态留 2px 底部强调线。
-unsafe fn vgrad(hdc: HDC, r: &RECT, top: u32, bottom: u32) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
-    vgrad_into(hdc, r, top, bottom);
-    deep_add(6, t);
-}
-
-/// 卡片渐变单独记名：卡片底每格两条渐变、72 格一起算面积是整帧最大的一块像素填充，
-/// 上一版它有 3.4 毫秒没对上名字。
-unsafe fn vgrad_into(hdc: HDC, r: &RECT, top: u32, bottom: u32) {
-    let h = (r.bottom - r.top).max(1);
-    if r.right <= r.left || h <= 2 || top == bottom {
-        fill(hdc, &RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + h }, top);
-        return;
-    }
-    // 一次三角插值，不逐行建画刷：逐行的话一屏卡片要起落近万次画刷，实测占掉滚轮帧的三成。
-    // 顶边两点同色、底边两点同色，两个三角形算出来都是纯竖向线性，对角线上不会露缝。
-    let vx = [
-        vtx(r.left, r.top, top),
-        vtx(r.right, r.top, top),
-        vtx(r.right, r.bottom, bottom),
-        vtx(r.left, r.bottom, bottom),
-    ];
-    let tris = [
-        GRADIENT_TRIANGLE { Vertex1: 0, Vertex2: 1, Vertex3: 2 },
-        GRADIENT_TRIANGLE { Vertex1: 0, Vertex2: 2, Vertex3: 3 },
-    ];
-    let _ = GradientFill(hdc, &vx, tris.as_ptr() as *const _, 2, GRADIENT_FILL_TRIANGLE);
-}
-
 // 贴图专用的常驻内存 DC。现建现销一个 DC 实测 8~10 微秒，一屏卡片要贴两百多次，
 // 光建销就吃掉两毫秒半 —— 比省下来的插值还贵。这里只放自家缓存的位图，
 // 选来选去碰不到别人的对象；要删位图前先把那张 1x1 垫图选回去，
@@ -4769,28 +5053,6 @@ unsafe fn blit_cached(hdc: HDC, x: i32, y: i32, w: i32, h: i32, bmp: HBITMAP) ->
     let Some(mem) = scratch(hdc) else { return false };
     SelectObject(mem, HGDIOBJ(bmp.0));
     BitBlt(hdc, x, y, w, h, Some(mem), 0, 0, SRCCOPY).is_ok()
-}
-
-/// 同宽同高同色的一对端点，渐变算出来就是同一张图。
-/// 卡片底一屏要画 144 条这种渐变，端点其实只有那么几档（普通/悬停/标记/选中），
-/// 所以每档每帧只插值一次存成小位图，其余格子 1:1 贴过去 —— 像素一模一样，
-/// 省的全是重复插值。位图在每次重画网格前释放，换肤换版式不会留下陈的那张。
-struct Tile {
-    k: (i32, i32, u32, u32),
-    bmp: HBITMAP,
-}
-
-thread_local! { static TILES: std::cell::RefCell<Vec<Tile>> = const { std::cell::RefCell::new(Vec::new()) }; }
-
-unsafe fn tiles_reset() {
-    scratch_drop();
-    TILES.with(|c| {
-        let mut v = c.borrow_mut();
-        for t in v.iter() {
-            let _ = DeleteObject(HGDIOBJ(t.bmp.0));
-        }
-        v.clear();
-    });
 }
 
 /// 尺寸行底下那块的纯色；NO_BK 表示底下不是纯色（极简档的字坐在柔光地面上），那种不存。
@@ -5060,43 +5322,6 @@ unsafe fn band_paint(hdc: HDC, b: &Band) {
     deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
 }
 
-/// 走贴图的卡片渐变。测量口径跟 vgrad 同一档（seg_grad），这样换法前后能直接比。
-unsafe fn vgrad_tile(hdc: HDC, r: &RECT, top: u32, bottom: u32) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
-    let w = r.right - r.left;
-    let h = (r.bottom - r.top).max(1);
-    let k = (w, h, top, bottom);
-    let hit = TILES.with(|c| c.borrow().iter().find(|x| x.k == k).map(|x| x.bmp));
-    let bmp = match hit {
-        Some(b) => b,
-        None => {
-            // 建那张图：尺寸跟目标格一样，画法和直接画走同一条路径。
-            let built = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
-            if built.is_invalid() {
-                vgrad_into(hdc, r, top, bottom);
-                deep_add(6, t);
-                return;
-            }
-            let mem = CreateCompatibleDC(Some(hdc));
-            let old = SelectObject(mem, HGDIOBJ(built.0));
-            vgrad_into(
-                mem,
-                &RECT { left: 0, top: 0, right: w, bottom: r.bottom - r.top },
-                top,
-                bottom,
-            );
-            SelectObject(mem, old);
-            let _ = DeleteDC(mem);
-            TILES.with(|c| c.borrow_mut().push(Tile { k, bmp: built }));
-            built
-        }
-    };
-    if !blit_cached(hdc, r.left, r.top, w, h, bmp) {
-        vgrad_into(hdc, r, top, bottom);
-    }
-    deep_add(6, t);
-}
-
 /// 装饰档判据。三档共用一套配色，绘制代码只问这两句，不在每个函数里各 match 一遍。
 /// 判据本身在 theme::Style 上，编辑器那扇问的是同一句，两边不会走出两个答案。
 fn bands(s: &Theme) -> bool {
@@ -5139,253 +5364,59 @@ fn card_rad(s: &Theme) -> i32 {
 /// 工具栏分组：相邻动作收进一个框。Find/Edit 共用一组。
 const TB_GROUPS: &[(usize, usize)] = &[(0, 3), (3, 5), (5, 6), (6, 9), (9, 10)];
 
-/// 横向渐变。步长 4px：整窗每次悬停都重画一遍，逐像素太贵，
-/// 4px 一档在这种低对比的两槽之间看不出阶梯。
-unsafe fn hgrad(hdc: HDC, r: &RECT, a: u32, b: u32) {
-    let w = (r.right - r.left).max(1);
-    let st = 4;
-    let mut x = r.left;
-    while x < r.right {
-        let x2 = (x + st).min(r.right);
-        let t = ((x + x2) / 2 - r.left) as f64 / (w - 1).max(1) as f64;
-        fill(hdc, &RECT { left: x, top: r.top, right: x2, bottom: r.bottom }, mix(a, b, t));
-        x = x2;
-    }
-}
-
-fn vtx(x: i32, y: i32, c: u32) -> TRIVERTEX {
-    TRIVERTEX {
-        x,
-        y,
-        Red: (((c >> 16) & 0xff) as u16) << 8,
-        Green: (((c >> 8) & 0xff) as u16) << 8,
-        Blue: ((c & 0xff) as u16) << 8,
-        Alpha: 0,
-    }
-}
-
-/// 一条 1px 的受光/压暗边：从底色渐变到目标色，走到 kick 那一格就一路平。
-/// CSS 里这是"透明渐变到某色"，GDI 描不了透明，只能按底色换算成实色。
-unsafe fn edge(hdc: HDC, y: i32, x0: i32, x1: i32, from: u32, to: u32, kick: f64) {
-    if x1 - x0 < 2 {
-        fill(hdc, &RECT { left: x0, top: y, right: x1, bottom: y + 1 }, to);
-        return;
-    }
-    let mid = x0 + ((x1 - x0) as f64 * kick).round() as i32;
-    if mid <= x0 {
-        fill(hdc, &RECT { left: x0, top: y, right: x1, bottom: y + 1 }, to);
-        return;
-    }
-    let vx = [vtx(x0, y, from), vtx(mid.min(x1), y, to)];
-    let gr = GRADIENT_RECT { UpperLeft: 0, LowerRight: 1 };
-    let _ = GradientFill(hdc, &vx, &gr as *const _ as *const _, 1, GRADIENT_FILL_RECT_H);
-    if mid < x1 {
-        fill(hdc, &RECT { left: mid, top: y, right: x1, bottom: y + 1 }, to);
-    }
-}
-
-/// 外壳条带（标题 / 菜单 / 工具 / 路径 / 状态）共用的一道工艺，只改颜色和边线，不动高度：
-///   现状：底色铺平 + 一道 line 边
-///   平阶：边收到 line_soft（深蓝上 line 太亮，条与条之间会连成格子）
-///   卡片：再补顶缘一道左淡右亮的受光边、底缘一道压暗边；lit 的那条整幅横向抬亮
+/// 外壳条带（标题 / 菜单 / 工具 / 路径 / 状态）共用一道工艺，只改颜色和边线，不动高度：
+/// 底色铺平，工具栏那条亮一档，其余按传入的 base；边线统一用 line_soft。
 unsafe fn shell(hdc: HDC, g: &RECT, s: &Theme, base: u32, lit: bool, border_top: bool) {
-    if fine(s) {
-        // 精密仪器：一层很轻的竖向渐变，亮面只抬一点，底边压一点。
-        let top = mix(base, s.skin.chrome_hi, if lit { 0.34 } else { 0.17 });
-        let bot = mix(base, s.skin.canvas, if lit { 0.10 } else { 0.19 });
-        vgrad(hdc, g, top, bot);
-    } else if quiet(s) {
-        // 静谧玻璃：几乎不抬色，只让光从上方慢慢散掉。
-        let top = mix(base, s.skin.chrome_hi, if lit { 0.16 } else { 0.08 });
-        let bot = mix(base, s.skin.canvas, if lit { 0.07 } else { 0.13 });
-        vgrad(hdc, g, top, bot);
-    } else if draft(s) {
-        // 制图台：实色底板，靠结构线和主色标记分层，不靠大渐变。
-        fill(hdc, g, if lit { mix(base, s.skin.chrome_hi, 0.10) } else { base });
-    } else if lit && cards(s) {
-        hgrad(hdc, g, s.grad.tool_a(&s.skin), s.grad.tool_b(&s.skin));
-    } else {
-        fill(hdc, g, base);
-    }
+    fill(hdc, g, if lit { mix(base, s.skin.chrome_hi, 0.10) } else { base });
     let bc = if bands(s) { s.skin.line_soft } else { s.skin.line };
     if border_top {
         hline(hdc, g.left, g.right, g.top, bc);
-        if cards(s) {
-            edge(hdc, g.top, g.left, g.right, base, s.skin.line_soft, 0.46);
-            edge(hdc, g.bottom - 1, g.left, g.right, base, mix(base, s.skin.canvas, 0.78), 0.55);
-        }
     } else {
         hline(hdc, g.left, g.right, g.bottom - 1, bc);
-        if cards(s) {
-            edge(hdc, g.top, g.left, g.right, base, s.skin.line_soft, 0.46);
-            edge(hdc, g.bottom - 2, g.left, g.right, base, mix(base, s.skin.canvas, 0.78), 0.55);
-        }
     }
 }
 
-/// 卡片档内容区的对角柔光：128° 那条轴上三段停色（0 / 44% / 100%）。
-/// GradientFill 一次三角插值出图，逐行 FillRect 的话整窗重画要多花一个量级。
+/// 内容区地面：整块纯色，不再铺对角柔光。
 unsafe fn ground(hdc: HDC, r: &RECT, s: &Theme) {
-    if quiet(s) {
-        // 静谧玻璃：内容区不是“卡片海”，而是一整块薄雾玻璃。
-        vgrad(hdc, r, mix(s.skin.canvas, s.skin.pane, 0.34), s.skin.canvas);
-        let top = RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + (12.0 * s.scale) as i32 };
-        veil(hdc, &top, s.skin.chrome_hi, 8);
-        return;
-    }
-    if draft(s) {
-        // 制图台：浅网格纸。每 24px 一条细线，每四条加一条主格线。
-        fill(hdc, r, mix(s.skin.canvas, s.skin.pane, 0.18));
-        let cell = (24.0 * s.scale).round().max(12.0) as i32;
-        let fine_line = mix(s.skin.canvas, s.skin.line_soft, 0.28);
-        let main_line = mix(s.skin.canvas, s.skin.line_soft, 0.48);
-        let mut x = r.left + cell;
-        let mut n = 1;
-        while x < r.right {
-            vline(hdc, x, r.top, r.bottom, if n % 4 == 0 { main_line } else { fine_line });
-            x += cell;
-            n += 1;
-        }
-        let mut y = r.top + cell;
-        n = 1;
-        while y < r.bottom {
-            hline(hdc, r.left, r.right, y, if n % 4 == 0 { main_line } else { fine_line });
-            y += cell;
-            n += 1;
-        }
-        return;
-    }
-    let hi = s.grad.ground_hi(&s.skin);
-    let lo = s.grad.ground_lo(&s.skin);
-    let at = |t: f64| {
-        if t <= 0.44 {
-            mix(hi, s.skin.canvas, t / 0.44)
-        } else {
-            mix(s.skin.canvas, lo, (t - 0.44) / 0.56)
-        }
-    };
-    // 轴 (sin128°, -cos128°) 投到盒子上：右端占 0.56，下端占 0.44
-    let vx = [
-        vtx(r.left, r.top, at(0.0)),
-        vtx(r.right, r.top, at(0.56)),
-        vtx(r.right, r.bottom, at(1.0)),
-        vtx(r.left, r.bottom, at(0.44)),
-    ];
-    let tris = [
-        GRADIENT_TRIANGLE { Vertex1: 0, Vertex2: 1, Vertex3: 2 },
-        GRADIENT_TRIANGLE { Vertex1: 0, Vertex2: 2, Vertex3: 3 },
-    ];
-    let _ = GradientFill(hdc, &vx, tris.as_ptr() as *const _, 2, GRADIENT_FILL_TRIANGLE);
-}
-
-/// 地面层钉在窗口上：滚动时那一大片对角柔光一个像素都没变，每帧从头插值一遍是白干。
-/// 按尺寸加三个停色存一张图，窗口尺寸或配色一变，这张图的钥匙就对不上、自己作废重建，
-/// 所以换肤、换版式、拖窗口都不会看见陈的那张。静谧玻璃和制图台那两种地面仍直接画。
-struct Ground {
-    k: (i32, i32, u32, u32, u32),
-    bmp: HBITMAP,
-}
-
-thread_local! {
-    static GROUND: std::cell::RefCell<Option<Ground>> = const { std::cell::RefCell::new(None) };
-}
-
-/// 地面按整块尺寸缓存成一张图取回来贴。静谧玻璃和制图台那两种是当场画的，缓存不了，返回 None。
-unsafe fn ground_bmp(hdc: HDC, r: &RECT, s: &Theme) -> Option<HBITMAP> {
-    if quiet(s) || draft(s) {
-        return None;
-    }
-    let w = r.right - r.left;
-    let h = r.bottom - r.top;
-    let k = (
-        w,
-        h,
-        s.grad.ground_hi(&s.skin),
-        s.skin.canvas,
-        s.grad.ground_lo(&s.skin),
-    );
-    let had = GROUND.with(|c| match c.borrow().as_ref() {
-        Some(g) if g.k == k => Some(g.bmp),
-        _ => None,
-    });
-    if let Some(b) = had {
-        return Some(b);
-    }
-    let built = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
-    if built.is_invalid() {
-        return None;
-    }
-    let mem = CreateCompatibleDC(Some(hdc));
-    let old = SelectObject(mem, HGDIOBJ(built.0));
-    ground(mem, &RECT { left: 0, top: 0, right: w, bottom: h }, s);
-    SelectObject(mem, old);
-    let _ = DeleteDC(mem);
-    scratch_drop();
-    GROUND.with(|c| {
-        let mut g = c.borrow_mut();
-        if let Some(o) = g.replace(Ground { k, bmp: built }) {
-            let _ = DeleteObject(HGDIOBJ(o.bmp.0));
-        }
-    });
-    Some(built)
+    fill(hdc, r, s.skin.canvas);
 }
 
 unsafe fn ground_cached(hdc: HDC, r: &RECT, s: &Theme) {
-    let (w, h) = (r.right - r.left, r.bottom - r.top);
-    match ground_bmp(hdc, r, s) {
-        Some(b) if blit_cached(hdc, r.left, r.top, w, h, b) => {}
-        _ => ground(hdc, r, s),
-    }
+    ground(hdc, r, s);
 }
 
-/// 从地面那张缓存图里取出对应这一块，原样贴回屏上同一个位置（1:1，源坐标按相对整块地面的偏移取）。
-unsafe fn ground_part(hdc: HDC, base: &RECT, r: &RECT, bmp: HBITMAP) -> bool {
-    let (l, t) = (r.left.max(base.left), r.top.max(base.top));
-    let (rt, b) = (r.right.min(base.right), r.bottom.min(base.bottom));
-    if rt <= l || b <= t {
-        return true;
+/// 把一块矩形裁进内容区后铺地面色。
+unsafe fn ground_fill(hdc: HDC, g: &RECT, r: &RECT, c: u32) {
+    let (l, t) = (r.left.max(g.left), r.top.max(g.top));
+    let (rt, b) = (r.right.min(g.right), r.bottom.min(g.bottom));
+    if rt > l && b > t {
+        fill(hdc, &RECT { left: l, top: t, right: rt, bottom: b }, c);
     }
-    let Some(mem) = scratch(hdc) else { return false };
-    SelectObject(mem, HGDIOBJ(bmp.0));
-    BitBlt(hdc, l, t, rt - l, b - t, Some(mem), l - base.left, t - base.top, SRCCOPY).is_ok()
 }
 
 /// 条带帧的地面。整屏卡片是从上一帧搬过来的，卡片本身钉在内容上、搬得对；
-/// 只有卡片缝里那一层地面钉在窗口上，跟着搬就挪了位。所以只补缝里那几条：
-/// 缝的位置按当前列位、行缝算（跟整块重画时同一套算法），源从地面缓存图里
-/// 按同一个偏移取，贴回去的每个像素都和整块重画一模一样。
+/// 只有卡片缝里那一层地面钉在窗口上，跟着搬就挪了位。所以只补缝里那几条，
+/// 地面是一整块纯色，直接按缝的位置铺回去。
 unsafe fn ground_gaps(hdc: HDC, a: &App, g: &RECT, s: &Theme) -> bool {
     if !cards(s) {
         return false;
     }
-    let Some(bmp) = ground_bmp(hdc, g, s) else {
-        return false;
-    };
+    let c = s.skin.canvas;
     let (cw, ch) = a.cell();
     let pitch = a.row_h().max(1);
     let cols = a.cols_n(g.right - g.left).max(1) as i32;
     let x0 = a.grid_x0(*g);
     let edge = (3.0 * s.scale).round() as i32;
-    let mut ok = ground_part(
-        hdc,
-        g,
-        &RECT { left: g.left, top: g.top, right: x0 + edge, bottom: g.bottom },
-        bmp,
-    );
-    for c in 1..cols {
-        let x = x0 + c * cw;
-        ok &= ground_part(
-            hdc,
-            g,
-            &RECT { left: x - edge, top: g.top, right: x + edge, bottom: g.bottom },
-            bmp,
-        );
+    ground_fill(hdc, g, &RECT { left: g.left, top: g.top, right: x0 + edge, bottom: g.bottom }, c);
+    for ccol in 1..cols {
+        let x = x0 + ccol * cw;
+        ground_fill(hdc, g, &RECT { left: x - edge, top: g.top, right: x + edge, bottom: g.bottom }, c);
     }
-    ok &= ground_part(
+    ground_fill(
         hdc,
         g,
         &RECT { left: x0 + cols * cw - edge, top: g.top, right: g.right, bottom: g.bottom },
-        bmp,
+        c,
     );
     // 行与行之间那一条缝（第一行顶上垫的那几像素也从这里一起补上，所以从上一行算起）
     let top = (a.scroll / pitch).max(0);
@@ -5393,20 +5424,15 @@ unsafe fn ground_gaps(hdc: HDC, a: &App, g: &RECT, s: &Theme) -> bool {
     for ri in top.saturating_sub(1)..(top + lines) {
         let dy = ri as i64 * pitch as i64 - a.scroll as i64;
         let y = g.top + a.grid_pad() + dy as i32;
-        ok &= ground_part(
-            hdc,
-            g,
-            &RECT { left: g.left, top: y + ch, right: g.right, bottom: y + pitch },
-            bmp,
-        );
+        ground_fill(hdc, g, &RECT { left: g.left, top: y + ch, right: g.right, bottom: y + pitch }, c);
     }
     if top == 0 {
         // 第一行顶上垫的那几像素：列表刚滚开时它露着地面，上面那个循环从“上一行”起，
         // 头一行没有上一行，这一块得单独补。
         let y0 = g.top + a.grid_pad() - a.scroll;
-        ok &= ground_part(hdc, g, &RECT { left: g.left, top: g.top, right: g.right, bottom: y0 }, bmp);
+        ground_fill(hdc, g, &RECT { left: g.left, top: g.top, right: g.right, bottom: y0 }, c);
     }
-    ok
+    true
 }
 
 /// 圆角裁剪。GDI 的裁剪区没有栈：先把当前那份取出来存着，画完再放回去，
@@ -5567,9 +5593,6 @@ fn sel_as_bar(base: &Theme) -> Theme {
     } else {
         t.skin.ink_inv
     };
-    // 树行选中那道横向渐变也钉到同一档：默认端点是往窗底稀释的，稀释完就淡成原来那层发粉的样子。
-    t.grad.tree_sel_a = Some(bg);
-    t.grad.tree_sel_b = Some(bg);
     t
 }
 
@@ -5593,14 +5616,10 @@ fn zone_now_ink(i: usize, dk: &theme::Skin, over: Option<u32>) -> u32 {
 unsafe fn paint_title(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
     a.zone(theme::Z_MENU);
     let k = s.scale;
-    // 取色、渐变、底缘那条线、按钮几何全部出自 theme::Strip，四扇窗共用一套。
+    // 取色、底缘那条线、按钮几何全部出自 theme::Strip，四扇窗共用一套。
     let st = theme::Strip::top(s);
     let g = RECT { left: rc.left, top: rc.top, right: rc.right, bottom: rc.top + st.h };
-    if st.grad {
-        vgrad(hdc, &g, st.bar, st.bar_lo);
-    } else {
-        fill(hdc, &g, st.bar);
-    }
+    fill(hdc, &g, st.bar);
     hline(hdc, g.left, g.right, g.bottom - 1, st.edge);
     if st.ruler {
         // 制图台：标题栏左下压一道短尺，和窗格头的主色索引线同一个记号。
@@ -5716,7 +5735,16 @@ unsafe fn paint_title(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
     // 画布那一扇的标题条跟着这扇走：换了皮肤、缩放了，它下一次推面就是新的一套。
-    xsee_host::refwin::set_strip(st);
+    xsee_host::refwin::set_strip(
+        st,
+        xsee_host::refwin::Face {
+            bg: s.skin.chrome_hi,
+            line: s.skin.line,
+            ink: s.skin.ink,
+            dim: s.skin.ink_dim,
+            hov: s.skin.hov,
+        },
+    );
 }
 
 /// 顶部菜单条。它是“读字的一行”，亮度让给标题栏和工具栏：比上下都暗一档。
@@ -5728,7 +5756,7 @@ unsafe fn paint_menu_bar(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
         right: rc.right,
         bottom: rc.top + s.title + s.menu,
     };
-    let base = mix(s.skin.chrome, s.skin.canvas, 0.26);
+    let base = s.skin.menu;
     shell(hdc, &g, s, base, false, false);
     let pad = (8.0 * s.scale).round() as i32;
     let mut x = g.left + (2.0 * s.scale).round() as i32;
@@ -5816,6 +5844,12 @@ fn menu_text_x(k: f64) -> i32 {
     ((MENU_IC_X + MENU_IC_W + 8.0) * k) as i32
 }
 
+/// 弹层一行的高度：主题行高再高 3 像素。树和面板继续用原来的行高，
+/// 只有右键菜单这一处放宽，选项之间不至于挤在一起。
+fn popup_row(s: &Theme) -> i32 {
+    s.row + (3.0 * s.scale) as i32
+}
+
 fn popup_metrics(_a: &App, s: &Theme, items: &[MenuItem]) -> (i32, i32, i32) {
     let k = s.scale;
     let mut lw = 0;
@@ -5832,7 +5866,7 @@ fn popup_metrics(_a: &App, s: &Theme, items: &[MenuItem]) -> (i32, i32, i32) {
     let w = menu_text_x(k) + lw + (14.0 * k) as i32 + kw + (16.0 * k) as i32 + (16.0 * k) as i32;
     let mut h = 0;
     for it in items {
-        h += if it.sep { (6.0 * k) as i32 } else { s.row };
+        h += if it.sep { (6.0 * k) as i32 } else { popup_row(s) };
     }
     (w.max((150.0 * k) as i32), h + (4.0 * k) as i32, kw)
 }
@@ -5881,7 +5915,7 @@ unsafe fn popup_layout(
     let mut rows = Vec::new();
     let mut cy = rect.top + (2.0 * k) as i32;
     for (i, it) in items.iter().enumerate() {
-        let rh = if it.sep { (6.0 * k) as i32 } else { s.row };
+        let rh = if it.sep { (6.0 * k) as i32 } else { popup_row(s) };
         rows.push((i, RECT { left: rect.left, top: cy, right: rect.right, bottom: cy + rh }));
         cy += rh;
     }
@@ -5898,24 +5932,17 @@ unsafe fn paint_popup(
     keep: Option<usize>,
 ) {
     let k = s.scale;
-    // 弹层不投落地影：底下压着的格子要看得清清楚楚，只留一圈 1 像素实框，
-    // 框色跟标题栏同一档（skin.acc），跟窗口那圈红对得上。
+    // 跟对话框同一套投法：同尺寸灰纱往右下让 6 像素，底下格子透得出来。
+    drop_shadow(hdc, rect, k);
+    fill(hdc, rect, s.skin.popup);
     if fine(s) {
-        vgrad(
-            hdc,
-            rect,
-            mix(s.skin.chrome_hi, s.skin.pane, 0.13),
-            mix(s.skin.chrome_hi, s.skin.canvas, 0.17),
-        );
         hline(
             hdc,
             rect.left + 1,
             rect.right - 1,
             rect.top + 1,
-            mix(s.skin.chrome_hi, s.skin.line_soft, 0.55),
+            mix(s.skin.popup, s.skin.line_soft, 0.55),
         );
-    } else {
-        fill(hdc, rect, s.skin.chrome_hi);
     }
     frame(hdc, rect, s.skin.acc);
     let pad = (8.0 * k) as i32;
@@ -5958,7 +5985,10 @@ unsafe fn paint_popup(
             _ => it.check,
         };
         // 没复制过类别时“粘贴”是灰的；判断放在这里，菜单和点击用同一口径
-        let off = it.off || (it.id == M_CAT_PASTE && cat_clip_empty()) || tree_ctx_off(a, it.id);
+        let off = it.off
+            || (it.id == M_CAT_PASTE && cat_clip_empty())
+            || tree_ctx_off(a, it.id)
+            || grid_ctx_off(a, it.id);
         // 悬停底色直接用标题栏那一档（Strip::top 的 bar=skin.acc），文字跟着
         // 换标题栏的字色：菜单里指到哪一行，跟窗口头是同一套配色。
         let tst = theme::Strip::top(s);
@@ -5997,7 +6027,7 @@ unsafe fn paint_popup(
         // 勾和图标共用左边那一列：勾上的行画勾，图标让位。
         if let Some(g) = g.filter(|_| !checked) {
             let isz = (MENU_IC_W * k).round() as i32;
-            let ibg = if hot { tst.bar } else { s.skin.chrome_hi };
+            let ibg = if hot { tst.bar } else { s.skin.popup };
             draw_glyph(
                 hdc,
                 g,
@@ -6214,12 +6244,7 @@ unsafe fn paint_bar(hdc: HDC, a: &mut App, s: &Theme) {
                 } else {
                     (5.0 * s.scale).round() as i32
                 };
-                let keep = round_clip(hdc, &gr, rad);
-                // 制图台只留框线，不铺一块色；圆角仪表那档才把组框当胶囊底。
-                if !draft(s) {
-                    fill(hdc, &gr, mix(s.skin.chrome, s.skin.canvas, 0.50));
-                }
-                unround(hdc, keep);
+                // 组框只留一圈框线，不铺底板：工具栏底色从头到尾都是 chrome 原色。
                 rring(
                     hdc,
                     &gr,
@@ -6705,12 +6730,7 @@ unsafe fn zbtn(
 unsafe fn pane_head(hdc: HDC, g: &RECT, title: &str, id: usize, a: &mut App, s: &Theme) {
     let head = RECT { left: g.left, top: g.top, right: g.right, bottom: g.top + s.pane_head_h };
     if fine(s) {
-        vgrad(
-            hdc,
-            &head,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.20),
-            mix(s.skin.pane_head, s.skin.pane, 0.24),
-        );
+        fill(hdc, &head, s.skin.pane_head);
         hline(
             hdc,
             head.left,
@@ -6719,12 +6739,7 @@ unsafe fn pane_head(hdc: HDC, g: &RECT, title: &str, id: usize, a: &mut App, s: 
             mix(s.skin.pane_head, s.skin.chrome_hi, 0.38),
         );
     } else if quiet(s) {
-        vgrad(
-            hdc,
-            &head,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.12),
-            mix(s.skin.pane_head, s.skin.pane, 0.34),
-        );
+        fill(hdc, &head, s.skin.pane_head);
         hline(hdc, head.left, head.right, head.bottom - 1, s.skin.line_soft);
     } else if draft(s) {
         fill(hdc, &head, mix(s.skin.pane_head, s.skin.chrome, 0.32));
@@ -7057,25 +7072,7 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         return;
     }
     clip(hdc, &g);
-    if fine(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.pane, s.skin.pane_head, 0.16),
-            mix(s.skin.pane, s.skin.canvas, 0.12),
-        );
-    } else if quiet(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.pane, s.skin.pane_head, 0.10),
-            mix(s.skin.pane, s.skin.canvas, 0.22),
-        );
-    } else if draft(s) {
-        fill(hdc, &g, mix(s.skin.pane, s.skin.canvas, 0.22));
-    } else {
-        fill(hdc, &g, s.skin.pane);
-    }
+    fill(hdc, &g, if draft(s) { mix(s.skin.pane, s.skin.canvas, 0.22) } else { s.skin.pane });
     vline(
         hdc,
         g.left,
@@ -7090,12 +7087,7 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         bottom: g.top + org_title_h(s),
     };
     if fine(s) {
-        vgrad(
-            hdc,
-            &head,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.20),
-            mix(s.skin.pane_head, s.skin.pane, 0.24),
-        );
+        fill(hdc, &head, s.skin.pane_head);
         hline(
             hdc,
             head.left,
@@ -7104,12 +7096,7 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
             mix(s.skin.pane_head, s.skin.chrome_hi, 0.38),
         );
     } else if quiet(s) {
-        vgrad(
-            hdc,
-            &head,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.12),
-            mix(s.skin.pane_head, s.skin.pane, 0.34),
-        );
+        fill(hdc, &head, s.skin.pane_head);
     } else if draft(s) {
         fill(hdc, &head, mix(s.skin.pane_head, s.skin.chrome, 0.32));
         fill(
@@ -7131,11 +7118,11 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         bottom: head.bottom,
     };
     if fine(s) || quiet(s) || draft(s) {
-        txt(hdc, &tr, "整理", s.skin.ink, a.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        txt(hdc, &tr, "图片分类", s.skin.ink, a.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     } else if bands(s) {
-        txt(hdc, &tr, "整理", s.skin.ink_dim, a.font, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        txt(hdc, &tr, "图片分类", s.skin.ink_dim, a.font, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     } else {
-        txt(hdc, &tr, "整理", s.skin.ink, a.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        txt(hdc, &tr, "图片分类", s.skin.ink, a.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     }
     let xr = RECT {
         left: head.right - (22.0 * s.scale) as i32,
@@ -7217,12 +7204,7 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         bottom: g.top + org_head_h(s),
     };
     if fine(s) {
-        vgrad(
-            hdc,
-            &grp,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.18),
-            mix(s.skin.pane_head, s.skin.pane, 0.26),
-        );
+        fill(hdc, &grp, s.skin.pane_head);
         hline(
             hdc,
             grp.left,
@@ -7231,12 +7213,7 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
             mix(s.skin.pane_head, s.skin.chrome_hi, 0.34),
         );
     } else if quiet(s) {
-        vgrad(
-            hdc,
-            &grp,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.10),
-            mix(s.skin.pane_head, s.skin.pane, 0.34),
-        );
+        fill(hdc, &grp, s.skin.pane_head);
         hline(hdc, grp.left, grp.right, grp.top + 1, s.skin.line_soft);
     } else if draft(s) {
         fill(hdc, &grp, mix(s.skin.pane_head, s.skin.chrome, 0.38));
@@ -7397,21 +7374,8 @@ unsafe fn paint_org(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
             round_clip(hdc, &rowr, (1.0 * k).round() as i32)
         };
         if on {
-            // 选中整行就是标题栏那一档颜色：渐变只在同一档里往暗压一点，
-            // 不再掺窗底 —— 掺了会淡成原来那种发粉的一层。
-            let x1 = rowr.left + ((rowr.right - rowr.left) as f64 * 0.88).round() as i32;
-            let cap = theme::darken(s.skin.sel, 0.14);
-            if fine(s) || quiet(s) {
-                hgrad(
-                    hdc,
-                    &RECT { left: rowr.left, top: rowr.top, right: x1, bottom: rowr.bottom },
-                    s.skin.sel,
-                    cap,
-                );
-                fill(hdc, &RECT { left: x1, top: rowr.top, right: rowr.right, bottom: rowr.bottom }, cap);
-            } else {
-                fill(hdc, &rowr, s.skin.sel);
-            }
+            // 选中整行就是标题栏那一档颜色，整行铺纯色。
+            fill(hdc, &rowr, s.skin.sel);
         } else if hot {
             fill(hdc, &rowr, rowbg);
         }
@@ -7639,10 +7603,10 @@ unsafe fn paint_dock_tabs(hdc: HDC, a: &mut App, s: &Theme, head: &RECT, active:
     // 只给开着的页画页签：关掉的那一页不在条上留空位。
     let mut pages: Vec<(usize, usize, &str)> = Vec::new();
     if a.org_open {
-        pages.push((C_TAB_ORG, M_ORG_CLOSE, "整理"));
+        pages.push((C_TAB_ORG, M_ORG_CLOSE, "图片分类"));
     }
     if a.conv_open {
-        pages.push((C_TAB_CONV, C_CLOSE, "转换"));
+        pages.push((C_TAB_CONV, C_CLOSE, "批量转换"));
     }
     if pages.is_empty() {
         return;
@@ -7855,17 +7819,36 @@ unsafe fn conv_cap(hdc: HDC, a: &App, s: &Theme, r: RECT, label: &str, value: &s
     }
 }
 
+thread_local! {
+    /// 画帧全程攥着 app 锁，而藏一个正攥着焦点的输入框会同步触发 EN_KILLFOCUS
+    /// 回到 WM_COMMAND，那里还要拿这把锁——所以隐藏/还焦点攒到这里，帧画完放锁再补做。
+    static EDIT_OPS: std::cell::RefCell<Vec<(HWND, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 放锁后补做攒下的输入框操作。`hot` 的那颗先把焦点还给主窗。
+unsafe fn flush_edit_ops(hwnd: HWND) {
+    let ops = EDIT_OPS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for (ed, hot) in ops {
+        if hot {
+            let _ = SetFocus(Some(hwnd));
+        }
+        let _ = ShowWindow(ed, SW_HIDE);
+    }
+}
+
 /// 面板打开/关闭时原生输入框跟着进退。
 unsafe fn hide_conv_edits(a: &App) {
+    let hot_focus = GetFocus();
     for ed in a.conv_edits {
         if !ed.0.is_null() {
-            let _ = ShowWindow(ed, SW_HIDE);
+            EDIT_OPS.with(|c| c.borrow_mut().push((ed, hot_focus == ed)));
         }
     }
 }
 
 /// 把五个输入框摆到这一帧算出来的位置上；滚出可视区就藏起来。
-unsafe fn place_conv_edits(a: &mut App, body: &RECT, hwnd: HWND) {
+unsafe fn place_conv_edits(a: &mut App, body: &RECT, _hwnd: HWND) {
     let blocked = a.dlg.is_some() || a.open_menu.is_some() || a.bmenu.is_some();
     for i in 0..E_N {
         let ed = a.conv_edits[i];
@@ -7887,10 +7870,9 @@ unsafe fn place_conv_edits(a: &mut App, body: &RECT, hwnd: HWND) {
             let _ = ShowWindow(ed, SW_SHOWNOACTIVATE);
         } else {
             // 滚出可视区的那一格不能再攥着焦点，否则接着敲的字会写进看不见的框里。
-            if GetFocus() == ed {
-                let _ = SetFocus(Some(hwnd));
-            }
-            let _ = ShowWindow(ed, SW_HIDE);
+            // 藏框/还焦点会同步触发 EN_KILLFOCUS，攒下放锁后再做。
+            let hot = GetFocus() == ed;
+            EDIT_OPS.with(|c| c.borrow_mut().push((ed, hot)));
         }
     }
 }
@@ -7903,25 +7885,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         return;
     }
     clip(hdc, &g);
-    if fine(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.pane, s.skin.pane_head, 0.16),
-            mix(s.skin.pane, s.skin.canvas, 0.12),
-        );
-    } else if quiet(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.pane, s.skin.pane_head, 0.10),
-            mix(s.skin.pane, s.skin.canvas, 0.22),
-        );
-    } else if draft(s) {
-        fill(hdc, &g, mix(s.skin.pane, s.skin.canvas, 0.22));
-    } else {
-        fill(hdc, &g, s.skin.pane);
-    }
+    fill(hdc, &g, if draft(s) { mix(s.skin.pane, s.skin.canvas, 0.22) } else { s.skin.pane });
     vline(
         hdc,
         g.left,
@@ -7937,12 +7901,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         bottom: g.top + org_title_h(s),
     };
     if fine(s) {
-        vgrad(
-            hdc,
-            &head,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.20),
-            mix(s.skin.pane_head, s.skin.pane, 0.24),
-        );
+        fill(hdc, &head, s.skin.pane_head);
         hline(
             hdc,
             head.left,
@@ -7951,12 +7910,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
             mix(s.skin.pane_head, s.skin.chrome_hi, 0.38),
         );
     } else if quiet(s) {
-        vgrad(
-            hdc,
-            &head,
-            mix(s.skin.pane_head, s.skin.chrome_hi, 0.12),
-            mix(s.skin.pane_head, s.skin.pane, 0.34),
-        );
+        fill(hdc, &head, s.skin.pane_head);
     } else if draft(s) {
         fill(hdc, &head, mix(s.skin.pane_head, s.skin.chrome, 0.32));
         fill(
@@ -7998,9 +7952,12 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     let c3 = (cw - gap * 2) / 3;
     let c4 = (cw - gap * 3) / 4;
     let c2 = (cw - gap) / 2;
+    let c5 = (cw - gap * 4) / 5;
     let top0 = body.top + (6.0 * k) as i32;
     let mut y = top0 - a.conv_scroll;
     a.conv_edit_rects = [RECT::default(); E_N];
+    // 这一页从这里起推进命中表的矩形，到页脚前一段好整条挑出来裁（见下面 split_off）
+    let hit_mark = a.btns.len();
 
     // —— 输出 ——
     conv_sec(hdc, a, s, RECT { left: g.left, top: y, right: g.right, bottom: y + cap_h }, "输出");
@@ -8009,16 +7966,12 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     y += cap_h;
     let fmts = ["JPEG", "PNG", "BMP", "TIFF", "GIF"];
     for (i, name) in fmts.iter().enumerate() {
-        let col = (i % 3) as i32;
-        if i == 3 {
-            y += rh + gap;
-        }
-        let left = x0 + col * (c3 + gap);
+        let left = x0 + i as i32 * (c5 + gap);
         conv_seg(
             hdc,
             a,
             s,
-            RECT { left, top: y, right: left + c3, bottom: y + rh },
+            RECT { left, top: y, right: left + c5, bottom: y + rh },
             C_FMT + i,
             name,
             a.conv_fmt == i,
@@ -8038,7 +7991,15 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     let sr = RECT { left: x0, top: y, right: xr, bottom: y + (14.0 * k) as i32 };
     conv_slider(hdc, a, s, sr, C_QUAL, q as i32, 1, 100);
     y += sr.bottom - sr.top + gap;
-    conv_cap(hdc, a, s, RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h }, "输出目录", "");
+    // 目录单独一行标签，下面整栏给输入框，条子才看得见
+    conv_cap(
+        hdc,
+        a,
+        s,
+        RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
+        "输出目录",
+        "",
+    );
     y += cap_h;
     a.conv_edit_rects[2] = RECT {
         left: x0,
@@ -8065,7 +8026,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         "",
     );
     y += cap_h;
-    for (i, name) in ["覆盖", "跳过", "编号"].iter().enumerate() {
+    for (i, (name, val)) in OW_SLOTS.iter().enumerate() {
         let left = x0 + i as i32 * (c3 + gap);
         conv_seg(
             hdc,
@@ -8074,7 +8035,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
             RECT { left, top: y, right: left + c3, bottom: y + rh },
             C_OW + i,
             name,
-            a.conv_overwrite as usize == i,
+            a.conv_overwrite == *val,
         );
     }
     y += rh + gap;
@@ -8085,34 +8046,31 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     conv_cap(hdc, a, s, RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h }, "缩放", "");
     y += cap_h;
     for (i, name) in ["原样", "适应", "填充", "拉伸", "缩小"].iter().enumerate() {
-        let col = (i % 3) as i32;
-        if i == 3 {
-            y += rh + gap;
-        }
-        let left = x0 + col * (c3 + gap);
+        let left = x0 + i as i32 * (c5 + gap);
         conv_seg(
             hdc,
             a,
             s,
-            RECT { left, top: y, right: left + c3, bottom: y + rh },
+            RECT { left, top: y, right: left + c5, bottom: y + rh },
             C_FIT + i,
             name,
             a.conv_fit as usize == i,
         );
     }
     y += rh + gap;
+    // 尺寸这一排：标签一行，下面是 宽 × 高 + 按比例 + 允许放大
     conv_cap(
         hdc,
         a,
         s,
         RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
-        "目标尺寸",
+        "目标尺寸（宽 × 高）",
         "",
     );
     y += cap_h;
-    let we = (cw - (18.0 * k) as i32 - gap) / 2;
+    let we = (54.0 * k) as i32;
     a.conv_edit_rects[0] = RECT { left: x0, top: y, right: x0 + we, bottom: y + eh };
-    let xmul = x0 + we + (4.0 * k) as i32;
+    let xmul = x0 + we + (3.0 * k) as i32;
     txt(
         hdc,
         &RECT { left: xmul, top: y, right: xmul + (10.0 * k) as i32, bottom: y + eh },
@@ -8123,26 +8081,26 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     );
     let hx = xmul + (10.0 * k) as i32;
     a.conv_edit_rects[1] = RECT { left: hx, top: y, right: hx + we, bottom: y + eh };
+    let sy = hx + we + gap;
     conv_seg(
         hdc,
         a,
         s,
-        RECT { left: xr - (18.0 * k) as i32, top: y, right: xr, bottom: y + eh },
+        RECT { left: sy, top: y, right: sy + (56.0 * k) as i32, bottom: y + eh },
         C_SYNC,
-        "=",
+        "按比例",
         false,
     );
-    y += eh + gap;
     conv_check(
         hdc,
         a,
         s,
-        RECT { left: x0, top: y, right: x0 + cw, bottom: y + rh },
+        RECT { left: sy + (56.0 * k) as i32 + gap, top: y, right: xr, bottom: y + eh },
         C_UP,
         "允许放大",
         a.conv_up,
     );
-    y += rh + gap;
+    y += eh + gap;
     conv_cap(hdc, a, s, RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h }, "旋转", "");
     y += cap_h;
     for (i, name) in ["0°", "90°", "180°", "270°"].iter().enumerate() {
@@ -8182,22 +8140,43 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         a,
         s,
         RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
-        "锐化",
-        &format!("{}", a.conv_sharp),
+        "锐化半径",
+        &format!("{:.1}", a.conv_sharp_r as f64 / 2.0),
     );
     y += cap_h;
     let sr = RECT { left: x0, top: y, right: xr, bottom: y + (14.0 * k) as i32 };
-    conv_slider(hdc, a, s, sr, C_SHARP, a.conv_sharp as i32, 0, 100);
+    conv_slider(hdc, a, s, sr, C_SHARP_R, a.conv_sharp_r as i32, 0, 20);
+    y += sr.bottom - sr.top + gap;
+    conv_cap(
+        hdc,
+        a,
+        s,
+        RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
+        "锐化强度",
+        &format!("{:.1}", a.conv_sharp as f64 / 10.0),
+    );
+    y += cap_h;
+    let sr = RECT { left: x0, top: y, right: xr, bottom: y + (14.0 * k) as i32 };
+    conv_slider(hdc, a, s, sr, C_SHARP, a.conv_sharp as i32, 0, 30);
     y += sr.bottom - sr.top + gap;
 
     // —— 水印 ——
     conv_sec(hdc, a, s, RECT { left: g.left, top: y, right: g.right, bottom: y + cap_h }, "水印");
+    // 单位说明挂在标题条右边，不再给「字号」单独开一行标题
+    txt(
+        hdc,
+        &RECT { left: x0, top: y, right: xr, bottom: y + cap_h },
+        "字号按长边百分比",
+        s.skin.ink_dim,
+        a.font_sm,
+        DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+    );
     y += cap_h + gap;
     conv_check(
         hdc,
         a,
         s,
-        RECT { left: x0, top: y, right: x0 + cw, bottom: y + rh },
+        RECT { left: x0, top: y, right: x0 + (108.0 * k) as i32, bottom: y + rh },
         C_WM_ON,
         "加文字水印",
         a.conv_wm,
@@ -8216,7 +8195,14 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         );
     }
     y += rh + gap;
-    conv_cap(hdc, a, s, RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h }, "文字", "");
+    conv_cap(
+        hdc,
+        a,
+        s,
+        RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
+        "水印文字",
+        "",
+    );
     y += cap_h;
     a.conv_edit_rects[3] = RECT { left: x0, top: y, right: xr, bottom: y + eh };
     y += eh + gap;
@@ -8225,7 +8211,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         a,
         s,
         RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
-        "字号（长边百分比）",
+        "字号",
         &format!("{}%", a.conv_wm_size),
     );
     y += cap_h;
@@ -8253,12 +8239,20 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         RECT { left: g.left, top: y, right: g.right, bottom: y + cap_h },
         "重命名",
     );
+    txt(
+        hdc,
+        &RECT { left: x0, top: y, right: xr, bottom: y + cap_h },
+        "* 原名，# 序号",
+        s.skin.ink_dim,
+        a.font_sm,
+        DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+    );
     y += cap_h + gap;
     conv_check(
         hdc,
         a,
         s,
-        RECT { left: x0, top: y, right: x0 + cw, bottom: y + rh },
+        RECT { left: x0, top: y, right: x0 + (108.0 * k) as i32, bottom: y + rh },
         C_RN_ON,
         "转换后改名",
         a.conv_rn,
@@ -8269,7 +8263,7 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         a,
         s,
         RECT { left: x0, top: y, right: x0 + cw, bottom: y + cap_h },
-        "模板（* 原名，# 序号）",
+        "模板",
         "",
     );
     y += cap_h;
@@ -8284,19 +8278,20 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         "",
     );
     y += cap_h;
-    let nb = (rh as f64 * 0.8) as i32;
+    let nb = (rh as f64 * 0.7) as i32;
+    let nsx = x0;
     conv_seg(
         hdc,
         a,
         s,
-        RECT { left: x0, top: y, right: x0 + nb, bottom: y + rh },
+        RECT { left: nsx, top: y, right: nsx + nb, bottom: y + rh },
         C_RN_DN,
         "−",
         false,
     );
     txt(
         hdc,
-        &RECT { left: x0 + nb + 2, top: y, right: x0 + nb + (54.0 * k) as i32, bottom: y + rh },
+        &RECT { left: nsx + nb + 2, top: y, right: nsx + nb + (54.0 * k) as i32, bottom: y + rh },
         &format!("{}", a.conv_rn_start),
         s.skin.ink,
         a.font_num,
@@ -8306,7 +8301,12 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         hdc,
         a,
         s,
-        RECT { left: x0 + nb + (56.0 * k) as i32, top: y, right: x0 + nb * 2 + (56.0 * k) as i32, bottom: y + rh },
+        RECT {
+            left: nsx + nb + (56.0 * k) as i32,
+            top: y,
+            right: nsx + nb * 2 + (56.0 * k) as i32,
+            bottom: y + rh,
+        },
         C_RN_UP,
         "+",
         false,
@@ -8328,6 +8328,15 @@ unsafe fn paint_conv(_hwnd: HWND, hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
             if grab { s.skin.acc } else { mix(s.skin.chrome_hi, s.skin.acc, 0.30) },
         );
     }
+    // 滚出可视区的行只是被裁掉不发给你看，矩形还留在命中表里，而且排在页脚那两个
+    // 按钮前面——点开始/停止就先撞上一个看不见的设置，看着像按钮缺一块不能点。
+    // 只留完整落在 body 里的那些，和上面原生输入框的显隐判据同一口径。
+    let pushed = a.btns.split_off(hit_mark);
+    a.btns.extend(
+        pushed
+            .into_iter()
+            .filter(|(_, r)| r.top >= body.top && r.bottom <= body.bottom),
+    );
     unclip(hdc);
 
     // 底部固定：进度 + 开始/停止 + 重置
@@ -8563,6 +8572,7 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
                 let ed = {
                     let mut g = app().lock().unwrap();
                     g.conv_out = dir.clone();
+                    g.conv_out_auto = false;
                     g.conv_edits[2]
                 };
                 if !ed.0.is_null() {
@@ -8634,6 +8644,7 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
                 g.conv_fliph = false;
                 g.conv_flipv = false;
                 g.conv_sharp = 0;
+                g.conv_sharp_r = 3;
                 g.conv_wm = false;
                 g.conv_wm_pos = 3;
                 g.conv_wm_size = 4;
@@ -8662,8 +8673,8 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
         refresh(hwnd);
         return true;
     }
-    if id >= C_OW && id < C_OW + 3 {
-        app().lock().unwrap().conv_overwrite = (id - C_OW) as u8;
+    if id >= C_OW && id < C_OW + OW_SLOTS.len() {
+        app().lock().unwrap().conv_overwrite = OW_SLOTS[id - C_OW].1;
         refresh(hwnd);
         return true;
     }
@@ -8683,6 +8694,10 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
         return true;
     }
     // 滑条：按点到的横坐标换算，和画的时候同一个矩形。
+    if matches!(id, C_QUAL | C_SHARP | C_SHARP_R | C_WM_SIZE | C_WM_OPAC) {
+        // 记下这一条和它的轨道两端，mouse_move 接着同一处往下算，拖动和单击不会两套口径
+        app().lock().unwrap().conv_sdrag = Some((id, r.left, r.right));
+    }
     let t = ((x - r.left) as f64 / (r.right - r.left).max(1) as f64).clamp(0.0, 1.0);
     match id {
         C_QUAL => {
@@ -8697,7 +8712,12 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
             true
         }
         C_SHARP => {
-            app().lock().unwrap().conv_sharp = (t * 100.0).round() as u8;
+            app().lock().unwrap().conv_sharp = (t * 30.0).round() as u8;
+            refresh(hwnd);
+            true
+        }
+        C_SHARP_R => {
+            app().lock().unwrap().conv_sharp_r = (t * 20.0).round() as u8;
             refresh(hwnd);
             true
         }
@@ -8764,9 +8784,69 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
     }
 }
 
+/// 批量转换这一趟的经过，全落在缓存目录的 convert.log 上，一行一个事件。
+/// 界面上只留得下一行提示，"为什么没出文件"只能靠它。和 XSEE_TRACE 那套分开：
+/// 那个要预先设环境变量才开口，这个一直记，他自己点完就能看到。
+fn conv_log(s: &str) {
+    static F: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    let slot = F.get_or_init(|| {
+        Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(cache::dir().join("convert.log"))
+                .ok(),
+        )
+    });
+    let Ok(mut guard) = slot.lock() else { return };
+    let Some(f) = guard.as_mut() else { return };
+    let _ = writeln!(f, "t={} {s}", unsafe { stamp_now() });
+}
+
+/// 测试台用：把这一页当下能点的那些矩形，整份写进 XSEE_CONV_DUMP 指的文件。
+/// 驱动脚本照这份坐标投鼠标，不用猜像素。内容变了才重写（先写临时名再改名，
+/// 免得读的人撞上半截）；没设这个环境变量时一句都不写，正常用时不留痕。
+fn conv_dump_hits(a: &App, body: &RECT) {
+    let Some(p) = std::env::var_os("XSEE_CONV_DUMP") else { return };
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    let mut s = format!(
+        "# dlg={} menu={} bmenu={} tab={} conv={} org={} scroll={}/{} body={} {} {} {}\n",
+        a.dlg.is_some() as u8,
+        a.open_menu.is_some() as u8,
+        a.bmenu.is_some() as u8,
+        a.dock_tab,
+        a.conv_open as u8,
+        a.org_open as u8,
+        a.conv_scroll,
+        a.conv_max_scroll,
+        body.left,
+        body.top,
+        body.right,
+        body.bottom
+    );
+    s.push_str(
+        &a.btns
+            .iter()
+            .filter(|(id, _)| (*id >= C_FMT && *id <= C_SHARP_R))
+            .map(|(id, r)| format!("{id} {} {} {} {}\n", r.left, r.top, r.right, r.bottom))
+            .collect::<String>(),
+    );
+    {
+        let Ok(mut g) = LAST.lock() else { return };
+        if g.as_deref() == Some(s.as_str()) {
+            return;
+        }
+        *g = Some(s.clone());
+    }
+    let tmp = format!("{}.tmp", p.to_string_lossy());
+    if std::fs::write(&tmp, &s).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
 /// 面板里点开始：选中图按当前设置转一批。和对话框那条路共用同一套计数与收尾消息。
 unsafe fn start_conv_panel(hwnd: HWND) {
-    let (paths, fmt, opt, out, policy, xf, wm, rename) = {
+    let (paths, fmt, opt, out, policy, xf, wm, rename, out_auto, typed_out) = {
         let g = app().lock().unwrap();
         let paths = g.selected_images();
         if paths.is_empty() {
@@ -8774,13 +8854,22 @@ unsafe fn start_conv_panel(hwnd: HWND) {
             let mut g = app().lock().unwrap();
             g.msg = "没有选中要转换的图片".to_string();
             g.conv_msg = "没有选中图片".to_string();
+            conv_log(&format!(
+                "ev=conv拒 原因=没有选中图片 当前目录={} 视图列出的图片={}",
+                g.dir.display(),
+                g.n_images()
+            ));
             drop(g);
             refresh(hwnd);
             return;
         }
         let fmt = g.conv_fmt;
         let opt = g.conv_opts.get(fmt).cloned().unwrap_or_default();
-        let out = if g.conv_out.trim().is_empty() {
+        // 输出文件夹在默认态（用户没自己定过路径）时跟着当前文件夹走：面板开着
+        // 换过文件夹，转换就该落进现在这个，而不是开面板那一刻的那个——不然
+        // 文件悄悄落进上一个文件夹，看着就是"点了没反应"。
+        let out_auto = g.conv_out_auto || g.conv_out.trim().is_empty();
+        let out = if out_auto {
             g.dir.display().to_string()
         } else {
             g.conv_out.trim().to_string()
@@ -8790,6 +8879,7 @@ unsafe fn start_conv_panel(hwnd: HWND) {
             let mut g = app().lock().unwrap();
             g.msg = "输出文件夹不存在".to_string();
             g.conv_msg = "输出文件夹不存在".to_string();
+            conv_log(&format!("ev=conv拒 原因=输出文件夹不存在 输出={out} 跟随当前={out_auto} 当前目录={}", g.dir.display()));
             drop(g);
             refresh(hwnd);
             return;
@@ -8820,6 +8910,7 @@ unsafe fn start_conv_panel(hwnd: HWND) {
             flip_h: g.conv_fliph,
             flip_v: g.conv_flipv,
             sharpen: g.conv_sharp,
+            sharpen_r: g.conv_sharp_r,
         };
         let wm = if g.conv_wm && !g.conv_wm_text.trim().is_empty() {
             Some(encode::Watermark {
@@ -8837,18 +8928,75 @@ unsafe fn start_conv_panel(hwnd: HWND) {
         } else {
             None
         };
-        (paths, fmt, opt, out, policy, xf, wm, rename)
+        (paths, fmt, opt, out, policy, xf, wm, rename, out_auto, g.conv_out.clone())
     };
+    // 跟手态下把输出框的显示也对上当前文件夹。set_edit_text 会同步触发
+    // EN_CHANGE 把 auto 落成 false——这一笔是程序自己写的，不是用户改的，补回来。
+    if out_auto {
+        let ed = app().lock().unwrap().conv_edits[2];
+        if !ed.0.is_null() {
+            set_edit_text(ed, &out);
+            app().lock().unwrap().conv_out_auto = true;
+        }
+    }
     if CONV_RUN.swap(true, Ordering::SeqCst) {
         let mut g = app().lock().unwrap();
         g.msg = "上一批还在转换，等它跑完".to_string();
         g.conv_msg = "上一批还在转换".to_string();
+        conv_log("ev=conv拒 原因=上一批还在转换");
         drop(g);
         refresh(hwnd);
         return;
     }
+    let (ofmt, _, _) = *encode::FORMATS.get(fmt).unwrap_or(&("?", "?", "?"));
+    let pol = match policy {
+        encode::Collision::Overwrite => "取代",
+        encode::Collision::Skip => "跳过",
+        encode::Collision::Rename => "编号",
+    };
+    let fitn = match xf.fit {
+        encode::FitMode::None => "原样",
+        encode::FitMode::Contain => "适应",
+        encode::FitMode::Cover => "填充",
+        encode::FitMode::Stretch => "拉伸",
+        encode::FitMode::Fit => "缩小",
+    };
+    conv_log(&format!(
+        "ev=conv起 入口=面板 张={} 格式={ofmt} 质量={} 渐进={} 色度取样={}x{} 缩略图档={} DCF={} PNG压缩={} TIFF压缩={} \
+         输出={out} 框里填的=[{typed_out}] 跟随当前目录={out_auto} 撞名={pol} 尺寸={fitn} {}/{} 允许放大={} 旋转={} 翻转={}x{} \
+         锐化=半径{:.1}/强度{:.1} 水印={} 改名={}",
+        paths.len(),
+        opt.quality,
+        opt.progressive as u8,
+        opt.sample_h as u8,
+        opt.sample_v as u8,
+        opt.thumb,
+        opt.dcf as u8,
+        opt.png_level,
+        opt.tiff_comp,
+        xf.w,
+        xf.h,
+        xf.allow_upscale as u8,
+        xf.rotate,
+        xf.flip_h as u8,
+        xf.flip_v as u8,
+        xf.sharpen_r as f64 / 2.0,
+        xf.sharpen as f64 / 10.0,
+        wm.as_ref()
+            .map(|w| format!("开 位置{} 字号{}% 不透明{}% 字数{}", w.pos, w.size_pct, w.opacity, w.text.chars().count()))
+            .unwrap_or_else(|| "关".to_string()),
+        rename
+            .as_ref()
+            .map(|(t, n)| format!("开 模板[{t}] 起始{n}"))
+            .unwrap_or_else(|| "关".to_string()),
+    ));
+    for (i, p) in paths.iter().enumerate().take(20) {
+        conv_log(&format!("ev=conv源 {i}={p}"));
+    }
+    let t0 = Instant::now();
     app().lock().unwrap().conv_msg.clear();
     CONV_STOP.store(false, Ordering::SeqCst);
+    encode::begin_batch();
     if let Ok(mut v) = CONV_ERRS.lock() {
         v.clear();
     }
@@ -8868,6 +9016,7 @@ unsafe fn start_conv_panel(hwnd: HWND) {
     let xf = Arc::new(xf);
     let wm = Arc::new(wm);
     let rename = Arc::new(rename);
+    let batch = Arc::new(encode::batch_set(&paths));
     let next = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicUsize::new(0));
     let ok = Arc::new(AtomicUsize::new(0));
@@ -8882,6 +9031,7 @@ unsafe fn start_conv_panel(hwnd: HWND) {
         let xf = xf.clone();
         let wm = wm.clone();
         let rename = rename.clone();
+        let batch = batch.clone();
         let next = next.clone();
         let done = done.clone();
         let ok = ok.clone();
@@ -8898,7 +9048,7 @@ unsafe fn start_conv_panel(hwnd: HWND) {
                 break;
             }
             let p = &paths[i];
-            let newname = (*rename).as_ref().map(|r| rn_new_name(&r.0, r.1, i, p, 0));
+            let newname = (*rename).as_ref().map(|r| rn_stem(&r.0, r.1, i, p, 0));
             match encode::convert_file_x(
                 p,
                 &out,
@@ -8908,15 +9058,23 @@ unsafe fn start_conv_panel(hwnd: HWND) {
                 policy,
                 Some(&xf),
                 wm.as_ref().as_ref(),
+                &batch,
             ) {
-                Ok(encode::Outcome::Done(_, _)) => {
-                    ok.fetch_add(1, Ordering::SeqCst);
+                Ok(encode::Outcome::Done(op, n)) => {
+                    let k = ok.fetch_add(1, Ordering::SeqCst) + 1;
+                    // 成功的那几张也记目标路径，但只记前 200 张：几万张一批时
+                    // 这本日志不能自己变成新的负担。
+                    if k <= 200 {
+                        conv_log(&format!("ev=conv张 结果=写出 源={p} 目标={op} 字节={n}"));
+                    }
                 }
                 Ok(encode::Outcome::Skipped) => {
                     skip.fetch_add(1, Ordering::SeqCst);
+                    conv_log(&format!("ev=conv张 结果=跳过 源={p}"));
                 }
                 Err(e) => {
                     err.fetch_add(1, Ordering::SeqCst);
+                    conv_log(&format!("ev=conv张 结果=失败 源={p} 原因={e}"));
                     if let Ok(mut v) = CONV_ERRS.lock() {
                         if v.len() < 5 {
                             v.push(format!("{}：{e}", stem(p)));
@@ -8945,6 +9103,12 @@ unsafe fn start_conv_panel(hwnd: HWND) {
         if let Ok(mut l) = CONV_LAST.lock() {
             *l = (o, s, e, stopped);
         }
+        conv_log(&format!(
+            "ev=conv完 应转={} 写出={o} 跳过={s} 失败={e} 中断={} 用时={:.1}秒",
+            total,
+            stopped as u8,
+            t0.elapsed().as_secs_f64()
+        ));
         CONV_RUN.store(false, Ordering::SeqCst);
         let hwnd = HWND(hp as *mut core::ffi::c_void);
         unsafe {
@@ -9121,25 +9285,7 @@ unsafe fn paint_tree(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         return;
     }
     clip(hdc, &g);
-    if fine(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.pane, s.skin.pane_head, 0.16),
-            mix(s.skin.pane, s.skin.canvas, 0.12),
-        );
-    } else if quiet(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.pane, s.skin.pane_head, 0.10),
-            mix(s.skin.pane, s.skin.canvas, 0.22),
-        );
-    } else if draft(s) {
-        fill(hdc, &g, mix(s.skin.pane, s.skin.canvas, 0.22));
-    } else {
-        fill(hdc, &g, s.skin.pane);
-    }
+    fill(hdc, &g, if draft(s) { mix(s.skin.pane, s.skin.canvas, 0.22) } else { s.skin.pane });
     let head = RECT { left: g.left, top: g.top, right: g.right, bottom: g.top + s.pane_head_h };
     pane_head(hdc, &g, "文件夹(F)", M_PANE_TREE, a, s);
     let mut rows = Vec::new();
@@ -9148,14 +9294,7 @@ unsafe fn paint_tree(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     let top = head.bottom;
     let h = (g.bottom - top).max(0);
     let maxs = (rows.len() as i32 * rh - h).max(0);
-    if a.tree_focus {
-        if let Some(pos) = rows.iter().position(|r| r.1 == a.tsel) {
-            let vis = (h / rh).max(1);
-            a.tscroll = ((pos as i32 - vis / 2).max(0) * rh).min(maxs);
-        }
-        // 找不到就不定位，但标志一定要清掉：留着它，下一次刷新会莫名其妙跳一下
-        a.tree_focus = false;
-    }
+    // 滚动位置只有他自己动才算：程序任何时候都不替用户滚，也不"定位到当前目录"。
     a.tscroll = a.tscroll.clamp(0, maxs);
     let first = (a.tscroll / rh).max(0) as usize;
     let last = ((a.tscroll + h) / rh + 1) as usize;
@@ -9201,7 +9340,10 @@ unsafe fn paint_tree(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
     for i in first..last.min(rows.len()) {
         let (d, path, open, name) = &rows[i];
         let y = top + i as i32 * rh - a.tscroll;
-        let on = i == anchor;
+        // 同一个目录可能在树里有两行（顶层「桌面」和 C 盘链下的 Desktop），
+        // 只染先碰到的那一行，你点的那一行就只剩悬停的浅灰——是同一个目录就都染。
+        let on = i == anchor
+            || (!t.is_empty() && path.trim_end_matches('\\').eq_ignore_ascii_case(t));
         let full = RECT { left: g.left, top: y, right: g.right, bottom: y + rh };
         // 精密仪器的树行往里收 4px，行本身圆角；A/B 仍是通栏。
         let r = if fine(s) {
@@ -9235,39 +9377,19 @@ unsafe fn paint_tree(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         };
         let rowbg;
         if on || hlrow {
-            if fine(s) {
-                // 精密仪器：选中渐变保留，左缘短轨 + 上下细线。
-                let x1 = r.left + ((r.right - r.left) as f64 * 0.88).round() as i32;
-                hgrad(
-                    hdc,
-                    &RECT { left: r.left, top: r.top, right: x1, bottom: r.bottom },
-                    s.grad.tree_sel_a(&s.skin),
-                    s.grad.tree_sel_b(&s.skin),
-                );
-                fill(hdc, &RECT { left: x1, top: r.top, right: r.right, bottom: r.bottom }, s.skin.sel);
-                rowbg = s.skin.sel;
-                fill(
-                    hdc,
-                    &RECT { left: r.left, top: r.top + 2, right: r.left + 2, bottom: r.bottom - 2 },
-                    theme::darken(s.skin.acc, 0.30),
-                );
-            } else {
-                // 静谧玻璃 / 制图台：整行横向渐变，两档都在左缘压一道主色导轨。
-                let x1 = r.left + ((r.right - r.left) as f64 * 0.88).round() as i32;
-                hgrad(
-                    hdc,
-                    &RECT { left: r.left, top: r.top, right: x1, bottom: r.bottom },
-                    s.grad.tree_sel_a(&s.skin),
-                    s.grad.tree_sel_b(&s.skin),
-                );
-                fill(hdc, &RECT { left: x1, top: r.top, right: r.right, bottom: r.bottom }, s.skin.sel);
-                rowbg = s.skin.sel;
-                fill(
-                    hdc,
-                    &RECT { left: r.left, top: r.top, right: r.left + 2, bottom: r.bottom },
-                    theme::darken(s.skin.acc, 0.30),
-                );
-            }
+            // 选中整行铺纯色，左缘压一道主色导轨。
+            fill(hdc, &r, s.skin.sel);
+            rowbg = s.skin.sel;
+            fill(
+                hdc,
+                &RECT {
+                    left: r.left,
+                    top: r.top + if fine(s) { 2 } else { 0 },
+                    right: r.left + 2,
+                    bottom: r.bottom - if fine(s) { 2 } else { 0 },
+                },
+                theme::darken(s.skin.acc, 0.30),
+            );
         } else if hot {
             rowbg = if fine(s) {
                 mix(s.skin.pane, s.skin.hov, 0.52)
@@ -9532,7 +9654,6 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
     a.zone(theme::Z_GRID);
     let g = z.grid;
     clip(hdc, &g);
-    tiles_reset();
     // 条带帧成不成就看这一层地面：整片重画会把搬过来的格子一并盖掉。
     // 只补卡片缝成功才留 band；铺了整片地面就等于上一帧没了，所有格子都得重画。
     let mut band = band;
@@ -9571,6 +9692,8 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
     let mut tl_nm: Vec<GridText> = Vec::with_capacity(cap);
     let mut tl_bd: Vec<GridText> = Vec::with_capacity(cap);
     let mut tl_band: Vec<Band> = Vec::with_capacity(cap);
+    // 全表 filter 计数，一格一次就是 O(可见格 × 全目录)/帧；整帧算一次就够。
+    let n_imgs = a.n_images();
     for i in first..last {
         let is_dir = a.entries[i].is_dir;
         let name = a.disp(i);
@@ -9631,8 +9754,16 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
                         ibg,
                     ),
                 }
-            } else {
-                icon_cached(hdc, IK_FILE, ib.left + 1, iy, isz, if picked { s.skin.sel_ink } else { s.skin.ink_dim }, ibg);
+            } else if !sysicon::draw(hdc, &a.entries[i].path, ib.left + 1, iy, isz, ibg) {
+                icon_cached(
+                    hdc,
+                    IK_FILE,
+                    ib.left + 1,
+                    iy,
+                    isz,
+                    if picked { s.skin.sel_ink } else { s.skin.ink_dim },
+                    ibg,
+                );
             }
             // 列表视图：挂在类别里的图在图标右上角带一个配色标记色的小标
             if !is_dir && a.cat.as_ref().map(|c| c.any_cat(&a.entries[i].path)).unwrap_or(false) {
@@ -9757,26 +9888,9 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
             // 卡片底和盒的渐变都要裁进圆角里：不裁的话方角的那几粒像素会顶在圆环外面。
             // 只有精密仪器用圆角；静谧玻璃和制图台是方角卡片。
             let keep = round_clip(hdc, &card, card_rad(s));
-            // 文件夹格铺一整块纯色：卡面渐变会在图标周围留下一圈明暗，像没铺平。
+            // 文件夹格和文件格都铺一整块纯色，卡面不做渐变。
             let flat = is_dir;
-            if flat {
-                fill(hdc, &card, tinted(s.grad.card_mid(&s.skin)));
-            } else {
-                fill(hdc, &card, s.skin.pane);
-                let mid = cbox.top + ((cbox.bottom - cbox.top) as f64 * 0.46).round() as i32;
-                vgrad_tile(
-                    hdc,
-                    &RECT { left: cbox.left, top: cbox.top, right: cbox.right, bottom: mid },
-                    tinted(s.grad.card_hi(&s.skin)),
-                    tinted(s.grad.card_mid(&s.skin)),
-                );
-                vgrad_tile(
-                    hdc,
-                    &RECT { left: cbox.left, top: mid, right: cbox.right, bottom: cbox.bottom },
-                    tinted(s.grad.card_mid(&s.skin)),
-                    tinted(s.grad.card_lo(&s.skin)),
-                );
-            }
+            fill(hdc, &card, tinted(s.skin.chrome));
             if fine {
                 // 上下各一道 1px 内沿：上沿提亮，下沿压暗，给卡面一点层次。
                 let hi = mix(tinted(s.skin.pane), tinted(s.skin.chrome_hi), 0.58);
@@ -9788,7 +9902,7 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
             if rich {
                 // 尺寸行 + 名称带坐在同一块卡尾上；下半张不再露出地面。
                 let foot = RECT { left: card.left, top: cbox.bottom, right: card.right, bottom: card.bottom };
-                fill(hdc, &foot, if flat { tinted(s.grad.card_mid(&s.skin)) } else { tinted(s.grad.card_lo(&s.skin)) });
+                fill(hdc, &foot, if flat { tinted(s.skin.chrome) } else { tinted(s.skin.pane) });
                 // 选中和标记给一道顶缘色条，和圆环一起把卡片从背景里提出来。
                 if on || mark {
                     let rail = RECT {
@@ -9849,7 +9963,10 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
                 }
             } else {
                 let fc = if on { s.skin.sel_ink } else { s.skin.ink_dim };
-                icon(hdc, Ik::File, icon_ix, icon_iy, icon_sz, fc, icon_bg);
+                // 非图片文件用系统图标；取不到（没注册的扩展名）退回单色文件标。
+                if !sysicon::draw(hdc, &a.entries[i].path, icon_ix, icon_iy, icon_sz, icon_bg) {
+                    icon(hdc, Ik::File, icon_ix, icon_iy, icon_sz, fc, icon_bg);
+                }
             }
         } else if let Some(im) = a.thumbs.get_mut(&i) {
             let d = box_in(im.w, im.h, pic_in);
@@ -9859,16 +9976,13 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
                 frame(hdc, &d, if bands(s) { s.skin.line_soft } else { s.skin.line });
             }
         } else if cards(s) {
-            // 待生成：盒底压成平一点的渐变，进度收到底缘一条光带，不再打虚线破洞
-            if rich || fine {
-                // 卡底已经按选中/悬停色画过，别在这里把状态纱盖回普通渐变
-                wait_band(hdc, &cbox, s, s.skin.pane);
-            } else {
+            // 待生成：盒底铺平，进度收到底缘一条光带，不再打虚线破洞
+            if !(rich || fine) {
                 let keep = round_clip(hdc, &card, card_rad(s));
-                vgrad(hdc, &cbox, s.grad.card_mid(&s.skin), s.grad.card_lo(&s.skin));
+                fill(hdc, &cbox, s.skin.chrome);
                 unround(hdc, keep);
-                wait_band(hdc, &cbox, s, s.skin.pane);
             }
+            wait_band(hdc, &cbox, s, s.skin.pane);
         } else if bands(s) {
             frame(hdc, &inner, s.skin.line_soft);
             wait_band(hdc, &inner, s, s.skin.canvas);
@@ -9979,7 +10093,7 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
         let dim_bk = if listy || !plated {
             NO_BK
         } else if rich {
-            tinted(s.grad.card_lo(&s.skin))
+            tinted(s.skin.pane)
         } else {
             s.skin.pane
         };
@@ -10002,7 +10116,7 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
                 0 => format!("{w} × {h} · {ext}"),
                 b => format!("{w} × {h} · {b}"),
             }
-        } else if has_img || !a.wants_thumb() || a.got + a.err < a.n_images() {
+        } else if has_img || !a.wants_thumb() || a.got + a.err < n_imgs {
             // 还没出图的那一格什么都不写：进度已经在下面那条状态栏里报了，
             // 图上一格一个"生成中"只会把尺寸行刷成一片闪动的字。
             String::new()
@@ -10094,8 +10208,8 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
                 if fine {
                     let keep = round_clip(hdc, &card, card_rad(s));
                     if on {
-                        // 名字带直接用标题栏那一套：同一档主色渐变，标题栏和格子读成一家人。
-                        vgrad(hdc, &nm, s.skin.acc, theme::darken(s.skin.acc, 0.14));
+                        // 名字带直接用标题栏那一档主色，铺纯色。
+                        fill(hdc, &nm, s.skin.acc);
                     }
                     unround(hdc, keep);
                 }
@@ -10375,16 +10489,7 @@ unsafe fn paint_pv(hdc: HDC, a: &mut App, z: &Zones, s: &Theme) {
         return;
     }
     clip(hdc, &g);
-    if fine(s) {
-        vgrad(
-            hdc,
-            &g,
-            mix(s.skin.canvas, s.skin.pane, 0.20),
-            mix(s.skin.canvas, s.skin.win, 0.34),
-        );
-    } else {
-        fill(hdc, &g, s.skin.canvas);
-    }
+    fill(hdc, &g, s.skin.canvas);
     let k = s.scale;
     pane_head(hdc, &g, "预览", M_PANE_PV, a, s);
     let head_h = s.pane_head_h;
@@ -10752,6 +10857,23 @@ fn flat_tree(nodes: &[Node], depth: usize, out: &mut Vec<(usize, String, bool, S
     }
 }
 
+/// 树里某个文件夹的内容变了（搬进、搬出、改名）：把它那一层的子节点重扫一遍。
+/// 节点没在树里（没展开过）就找不到，也就不用管。
+fn tree_reload(nodes: &mut Vec<Node>, path: &str) {
+    let want = path.trim_end_matches('\\');
+    if want.is_empty() {
+        return;
+    }
+    for n in nodes.iter_mut() {
+        if n.path.trim_end_matches('\\').eq_ignore_ascii_case(want) {
+            n.kids = sub_dirs(&n.path);
+            n.loaded = true;
+            return;
+        }
+        tree_reload(&mut n.kids, path);
+    }
+}
+
 fn sub_dirs(path: &str) -> Vec<Node> {
     scan::list(path, false)
         .iter()
@@ -10810,7 +10932,7 @@ fn vol_name(root: &str) -> String {
     }
 }
 
-fn build_roots(home: &str) -> Vec<Node> {
+fn build_roots() -> Vec<Node> {
     let mut drives = Vec::new();
     // 一次拿盘符位掩码，别对 C..Z 逐个 Path::exists()：盘不在位掩码里就不碰它。
     // 逐个探的时候，一个断掉的映射盘/网络盘会让每次探测都等重定向器超时，
@@ -10829,11 +10951,6 @@ fn build_roots(home: &str) -> Vec<Node> {
             kids: Vec::new(),
         });
     }
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "用户".into());
-    let mut home = home.to_string();
-    if !home.ends_with('\\') {
-        home.push('\\');
-    }
     // 桌面放在第一项并直接展开，桌面上的文件夹一眼就能点到
     let mut roots = Vec::new();
     if let Some(desktop) = desktop_dir() {
@@ -10845,7 +10962,6 @@ fn build_roots(home: &str) -> Vec<Node> {
             kids: sub_dirs(&desktop),
         });
     }
-    roots.push(Node { name: user, path: home, open: false, loaded: true, kids: Vec::new() });
     roots.push(Node { name: "此电脑".into(), path: "此电脑".into(), open: true, loaded: true, kids: drives });
     roots
 }
@@ -10893,11 +11009,13 @@ fn dlg_size(kind: DlgKind, k: f64) -> Option<(i32, i32)> {
         DlgKind::NewCat => (420.0, 170.0),
         DlgKind::RenameCat => (420.0, 170.0),
         DlgKind::Skin => (780.0, 600.0),
-        DlgKind::DbMaint => (600.0, 486.0),
+        DlgKind::CatDb => (600.0, 330.0),
+        DlgKind::ThumbDb => (600.0, 640.0),
+        DlgKind::ScanRule => (560.0, 252.0),
         // 这一页装得下四块：库管理、检索条件、结果表、双预览，宽度按最长那批路径给的。
-        DlgKind::SimSearch => (1000.0, 770.0),
-        // 关联页：顶部说明两行，中间三列格式勾选，底下结果行和三个按钮。
-        DlgKind::Assoc => (620.0, 588.0),
+        DlgKind::SimSearch => (560.0, 752.0),
+        // 关联页：顶部说明、三组五列格式勾选（56 个扩展名正好排满）、底下结果行和三个按钮。
+        DlgKind::Assoc => (620.0, 620.0),
         DlgKind::Ask => return None,
     };
     Some(((w * k).round() as i32, (h * k).round() as i32))
@@ -10919,7 +11037,9 @@ fn dlg_title(kind: DlgKind, ask: &str) -> &str {
         DlgKind::NewCat => "新建类别",
         DlgKind::RenameCat => "编辑类别",
         DlgKind::Skin => "皮肤设置",
-        DlgKind::DbMaint => "数据库维护",
+        DlgKind::CatDb => "分类数据库",
+        DlgKind::ThumbDb => "缩略图数据库",
+        DlgKind::ScanRule => "扫描排除规则",
         DlgKind::SimSearch => "以图搜图",
         DlgKind::Assoc => "文件关联",
         DlgKind::Ask => ask,
@@ -10935,9 +11055,8 @@ fn dlg_edit_rect(kind: DlgKind, r: RECT, k: f64) -> Option<RECT> {
         DlgKind::RenameCat => (72.0, 28.0, 16.0),
         // 皮肤设置窗只有"另存为"那一刻要输名字：底部空出来的那一整行就是它的位置
         DlgKind::Skin => (488.0, 26.0, 16.0),
-        DlgKind::FmtOpt | DlgKind::DbMaint | DlgKind::SimSearch | DlgKind::Assoc | DlgKind::Ask => {
-            return None
-        }
+        DlgKind::FmtOpt | DlgKind::CatDb | DlgKind::ThumbDb | DlgKind::ScanRule | DlgKind::SimSearch
+        | DlgKind::Assoc | DlgKind::Ask => return None,
     };
     Some(RECT {
         left: r.left + (16.0 * k) as i32,
@@ -11062,11 +11181,11 @@ fn conv_scope_count(a: &App) -> usize {
     a.selected_files().len()
 }
 
-/// 模板里的 # 换成编号、* 换成原名；扩展名始终沿用原文件的。
-fn rn_new_name(tpl: &str, start: i32, idx: usize, old: &str, case: u8) -> String {
+/// 模板里的 # 换成编号、* 换成原名，只出**主名**、不带扩展名。
+/// 批量转换用它：目标扩展名由所选格式自己拼，这里带上源扩展名就成了 `照片.png.jpg`。
+fn rn_stem(tpl: &str, start: i32, idx: usize, old: &str, case: u8) -> String {
     let p = Path::new(old);
     let old_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
     let chars: Vec<char> = tpl.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -11100,11 +11219,16 @@ fn rn_new_name(tpl: &str, start: i32, idx: usize, old: &str, case: u8) -> String
     if name.is_empty() {
         name = old_stem.to_string();
     }
-    if !ext.is_empty() {
-        name.push('.');
-        name.push_str(ext);
-    }
     name
+}
+
+/// 模板展开成整名：主名 + 源文件自己的扩展名。批量重命名改的是整个文件名，用它。
+fn rn_new_name(tpl: &str, start: i32, idx: usize, old: &str, case: u8) -> String {
+    let stem = rn_stem(tpl, start, idx, old, case);
+    match Path::new(old).extension().and_then(|s| s.to_str()) {
+        Some(e) if !e.is_empty() => format!("{stem}.{e}"),
+        _ => stem,
+    }
 }
 
 /// 打开批量重命名时预填的模板：当前视图里第一个选中的文件名（不含扩展名）再接 ###。
@@ -11134,45 +11258,51 @@ fn rn_preview(a: &App, live_tpl: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 配色页上列出来的颜色。文字色（正文/次要/不可用/反白/选中项文字）不在这儿，
+/// 字体页能按版块逐块改字色，比这里一刀切细。
+const COLOR_SLOTS: [&str; 19] = [
+    "base",
+    "chrome",
+    "chrome_hi",
+    "menu",
+    "popup",
+    "canvas",
+    "pane",
+    "pane_head",
+    "grid",
+    "line",
+    "line_soft",
+    "hov",
+    "prs",
+    "sel",
+    "accent",
+    "acc_soft",
+    "mark",
+    "flash",
+    "focus",
+];
+
 fn slot_label(k: &str) -> &str {
     match k {
-        "base" => "窗底",
-        "chrome" => "工具栏",
-        "chrome_hi" => "抬亮面",
-        "canvas" => "画布",
-        "pane" => "面板块",
-        "pane_head" => "面板头",
-        "grid" => "格子底",
+        "base" => "窗口底色",
+        "chrome" => "工具栏、图标底色",
+        "chrome_hi" => "按钮、弹窗底色",
+        "menu" => "菜单条底色",
+        "popup" => "下拉菜单底色",
+        "canvas" => "空白处、看大图底色",
+        "pane" => "面板、文字底色",
+        "pane_head" => "面板标题条",
+        "grid" => "透明图片棋盘格",
         "line" => "边线",
-        "line_soft" => "软边线",
-        "ink" => "正文",
-        "dim" => "次文",
-        "off" => "灰显",
-        "inv" => "反色字",
-        "hov" => "悬停",
-        "prs" => "按下",
-        "sel" => "选中底",
-        "sel_ink" => "选中字",
-        "accent" => "标题栏",
-        "acc_soft" => "强调柔",
-        "mark" => "标记",
-        "flash" => "提示纱",
-        "focus" => "聚焦",
-        _ => k,
-    }
-}
-
-fn grad_label(k: &str) -> &str {
-    match k {
-        "ground_hi" => "内容柔光 · 高光",
-        "ground_lo" => "内容柔光 · 落影",
-        "card_hi" => "卡片 · 顶部",
-        "card_mid" => "卡片 · 中段",
-        "card_lo" => "卡片 · 底部",
-        "tool_a" => "工具栏 · 左端",
-        "tool_b" => "工具栏 · 右端",
-        "tree_sel_a" => "树选中行 · 左",
-        "tree_sel_b" => "树选中行 · 右",
+        "line_soft" => "浅边线",
+        "hov" => "鼠标悬停底",
+        "prs" => "鼠标按下底",
+        "sel" => "选中项底色",
+        "accent" => "标题栏、文件夹图标",
+        "acc_soft" => "浅主题色",
+        "mark" => "标记和角标",
+        "flash" => "复制剪切闪光",
+        "focus" => "聚焦边框",
         _ => k,
     }
 }
@@ -11298,6 +11428,27 @@ unsafe fn paint_dlg(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
     paint_one_dlg(hdc, a, s, rc);
 }
 
+/// 弹层投影：一块与弹层同尺寸的灰纱，整体往右下让 6 像素，AlphaBlend 50%，
+/// 底下压着的格子/图透得出来。灰而不是黑：黑压在主题底色上会读成"有黑边"。
+/// 绘制和拖动时算脏区都读 shadow_off，改一处两边一起变。
+const SHADOW_GRAY: u32 = 0x009E9E9E;
+const SHADOW_ALPHA: u8 = 128;
+
+fn shadow_off(k: f64) -> i32 {
+    (4.0 * k) as i32 + 1
+}
+
+unsafe fn drop_shadow(hdc: HDC, r: &RECT, k: f64) {
+    let off = shadow_off(k);
+    let sh = RECT {
+        left: r.left + off,
+        top: r.top + off,
+        right: r.right + off,
+        bottom: r.bottom + off,
+    };
+    veil(hdc, &sh, SHADOW_GRAY, SHADOW_ALPHA);
+}
+
 unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
     a.zone(theme::Z_DLG);
     a.dlg_btns.clear();
@@ -11315,26 +11466,16 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
         d.ask_yes,
     );
     let k = s.scale;
-    let sh = (4.0 * k) as i32;
-    // 投影分四档往外变浅。原来是一整块 mix(win,黑,0.6)：浅皮肤上算出来是 0x585854
-    // 这么一条，只从右边和下边露出来，人眼读成"窗口右边和下边有黑边"。
-    for o in (1..=sh).rev() {
-        let t = 0.6 * (1.0 - (o - 1) as f64 / sh.max(1) as f64);
-        let shadow = RECT {
-            left: rect.left + o,
-            top: rect.top + o,
-            right: rect.right + o,
-            bottom: rect.bottom + o,
-        };
-        fill(hdc, &shadow, mix(s.skin.win, 0x000000, t));
-    }
+    // 影子跟窗口同尺寸，整块往右下让开几像素：窗口盖住其余部分，右下露出一条
+    // 连续的带，不会在窗口和影子之间留缝。走 AlphaBlend，底下压着的格子透得出来。
+    drop_shadow(hdc, &rect, k);
     fill(hdc, &rect, s.skin.chrome_hi);
     frame(hdc, &rect, s.skin.line);
     // 浮层的标题条：底色仍是中性那两档，取色规则、✕ 那颗的尺寸和悬停那一层
     // 全部走 theme::Strip，和主窗口标题栏右上角那颗是同一套画法（以前这里是硬编码红）。
     let st = theme::Strip::float(s);
     let tbar = RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.top + st.h };
-    vgrad(hdc, &tbar, st.bar, st.bar_lo);
+    fill(hdc, &tbar, st.bar);
     hline(hdc, tbar.left, tbar.right, tbar.bottom - 1, st.edge);
     let tr = RECT { left: tbar.left + (12.0 * k) as i32, top: tbar.top, right: tbar.right - (st.bw + st.pad + (6.0 * k) as i32), bottom: tbar.bottom };
     txt(hdc, &tr, dlg_title(kind, &ask_title), st.ink, a.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
@@ -11612,20 +11753,16 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
         DlgKind::SimSearch => {
             // 这一页是干活用的窗：参数改了就改了，不必"确定"，点了"开始查找"才去扫指纹。
             // 所以状态全放在 App 上，读出来先 clone 成局部值，画完再登记命中区。
-            let (bw, bh) = a.tbox();
-            // 图标档不出缩略图，也就没有这一档的指纹库；标题别照样报尺寸，免得像是库坏了。
-            let want_th = a.wants_thumb();
+            // 档位用"目标档"：图标/列表这些小格档自己没有指纹，借库里账最多的一档。
+            let (bw, bh) = sim_target_tier(a).unwrap_or_else(|| a.tbox());
             let qpath = a.sim_path.clone();
-            let dir = a.sim_dir.clone();
             let libmsg = a.sim_lib_msg.clone();
             let (pct, algo) = (a.sim_pct, a.sim_algo);
-            let (rot, flip, auto, folder, to_view) = (a.sim_rot, a.sim_flip, a.sim_auto, a.sim_folder, a.sim_to_view);
-            let (busy, fbusy) = (a.sim_busy, a.sim_fill_busy);
-            let (done, total) = (a.sim_done.load(Ordering::Relaxed), a.sim_total);
-            let (speed, peak, ms) = (a.sim_speed, a.sim_peak, a.sim_ms);
+            let (rot, flip) = (a.sim_rot, a.sim_flip);
+            let busy = a.sim_busy;
+            let ms = a.sim_ms;
             let nhits = a.sim_hits.len();
             let sel = if nhits == 0 { usize::MAX } else { a.sim_sel.min(nhits - 1) };
-            let scroll = a.sim_scroll.clamp(0, nhits.saturating_sub(7) as i32) as usize;
             let (src_img, hit_img) = (a.sim_src_img.clone(), a.sim_hit_img.clone());
             let (fname, dims) = if qpath.is_empty() {
                 ("还没选图片".to_string(), String::new())
@@ -11647,15 +11784,6 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             let bits = sim::bits_of(algo);
             let allow = sim::dist_from_pct(pct, algo);
             let nvar = 1 + usize::from(rot) * 3 + usize::from(flip) * 2;
-            // 库统计同样每帧一次，但它是全库逐条 exists：缓存在 App 上，
-            // 只在库变过（补齐/清理/自动补齐）之后重算一次。
-            if !a.sim_stat_ok || a.sim_stat_bx != (bw, bh) {
-                a.sim_stat = sim::stat(bw, bh);
-                a.sim_stat_bx = (bw, bh);
-                a.sim_stat_ok = true;
-            }
-            let (inlib, dead) = a.sim_stat;
-            let (nbox, nall) = sim::stats_all();
             let f = a.font;
             let fsm = a.font_sm;
             let rr = |x0: f64, y0: f64, x1: f64, y1: f64| RECT {
@@ -11684,118 +11812,19 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 let r = rr(x0, y0, x1, y0 + 18.0);
                 txt(hdc, &r, t, c, if bold { f } else { fsm }, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             };
-            // 算法那个下拉是浮在底下两个单选上的。命中区得抢在它们之前登记，
-            // 不然点开的是浮着的第三行、改的却是被压住的那个单选。
+            // 算法那个下拉展开后浮在下面的勾选和「开始查找」上面。命中区得抢在它们
+            // 之前登记，不然点开的是浮着的第三行、改的却是被压住的那个控件。
             if combo_open {
                 for i in 0..3usize {
                     a.dlg_btns
-                        .push((D_SIM_ALGO_ITEM + i, rr(390.0, 256.0 + i as f64 * 26.0, 600.0, 282.0 + i as f64 * 26.0)));
+                        .push((D_SIM_ALGO_ITEM + i, rr(92.0, 270.0 + i as f64 * 26.0, 302.0, 296.0 + i as f64 * 26.0)));
                 }
             }
 
-            // ── 左栏：指纹库 ────────────────────────────────────────────
-            let lib_title = if want_th {
-                format!("指纹库 · 这一档 {bw}×{bh}")
-            } else {
-                "指纹库 · 图标视图不建库".to_string()
-            };
-            pane(16.0, 40.0, 302.0, 706.0, &lib_title);
-            say(24.0, 72.0, 294.0, "建指纹来源", s.skin.ink_dim, false);
-            dlg_radio(hdc, a, s, rr(24.0, 92.0, 294.0, 114.0), D_SIM_SRC, "这一阵看过的（缩略图缓存）", !folder);
-            dlg_radio(hdc, a, s, rr(24.0, 116.0, 294.0, 138.0), D_SIM_SRC + 1, "指定文件夹里看过的", folder);
-            let dr = rr(24.0, 142.0, 214.0, 168.0);
-            dashed(hdc, &dr, if folder { s.skin.line } else { s.skin.line_soft });
-            txt(
-                hdc,
-                &RECT { left: dr.left + (6.0 * k) as i32, top: dr.top, right: dr.right - (6.0 * k) as i32, bottom: dr.bottom },
-                if dir.is_empty() { "（还没选文件夹）" } else { &dir },
-                if dir.is_empty() { s.skin.ink_off } else { s.skin.ink },
-                fsm,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS,
-            );
-            dlg_button(hdc, a, s, rr(222.0, 142.0, 294.0, 168.0), D_SIM_DIR, "选文件夹", false, true);
-            dlg_button(
-                hdc,
-                a,
-                s,
-                rr(24.0, 176.0, 132.0, 204.0),
-                D_SIM_FILL,
-                if fbusy { "补齐中…" } else { "补齐指纹" },
-                false,
-                !fbusy,
-            );
-            dlg_button(hdc, a, s, rr(140.0, 176.0, 222.0, 204.0), D_SIM_STOP, "停止", false, fbusy);
-            dlg_button(hdc, a, s, rr(24.0, 212.0, 160.0, 238.0), D_SIM_PRUNE, "移除无效索引", false, !fbusy);
-            dlg_check(hdc, a, s, rr(24.0, 244.0, 294.0, 266.0), D_SIM_AUTO, "查找之前先补齐", auto);
-            let tr2 = rr(24.0, 278.0, 294.0, 286.0);
-            fill(hdc, &tr2, s.skin.canvas);
-            frame(hdc, &tr2, s.skin.line);
-            if total > 0 {
-                let f2 = (done.min(total)) as f64 / total as f64;
-                fill(
-                    hdc,
-                    &RECT { left: tr2.left + 1, top: tr2.top + 1, right: tr2.left + 1 + ((tr2.right - tr2.left - 2) as f64 * f2) as i32, bottom: tr2.bottom - 1 },
-                    s.skin.acc,
-                );
-            }
-            say(
-                24.0,
-                292.0,
-                294.0,
-                &format!("已扫 {done} / 名单 {total} 张"),
-                s.skin.ink_dim,
-                false,
-            );
-            say(24.0, 314.0, 294.0, &format!("这一档库内 {inlib} 条"), s.skin.ink, true);
-            say(
-                24.0,
-                334.0,
-                294.0,
-                &(if dead == 0 {
-                    "没有失效条目".to_string()
-                } else {
-                    format!("{dead} 条的图已经不在盘上")
-                }),
-                s.skin.ink_dim,
-                false,
-            );
-            say(24.0, 360.0, 294.0, "补齐速度", s.skin.ink_dim, false);
-            let gbar = rr(24.0, 380.0, 294.0, 408.0);
-            fill(hdc, &gbar, s.skin.canvas);
-            frame(hdc, &gbar, s.skin.line);
-            let cap = peak.max(1.0);
-            let wfill = ((gbar.right - gbar.left - 2) as f64 * (speed.min(cap) / cap)) as i32;
-            if wfill > 0 {
-                fill(
-                    hdc,
-                    &RECT { left: gbar.left + 1, top: gbar.top + 1, right: gbar.left + 1 + wfill, bottom: gbar.bottom - 1 },
-                    s.skin.acc_soft,
-                );
-            }
-            say(
-                24.0,
-                414.0,
-                294.0,
-                &format!("{:.0} 张/秒 · 峰值 {:.0}", speed, peak),
-                s.skin.ink_dim,
-                false,
-            );
-            let note = rr(24.0, 442.0, 294.0, 560.0);
-            txt(
-                hdc,
-                &note,
-                "指纹只从看过的缩略图里取，一张原图都不开，所以几千条也只是几秒。\n换一档就是另一本：盒尺寸变了，同一张图算出来的位也对不上。",
-                s.skin.ink_dim,
-                fsm,
-                DT_LEFT | DT_WORDBREAK,
-            );
-            say(24.0, 574.0, 294.0, "全部档位", s.skin.ink_dim, false);
-            say(24.0, 594.0, 294.0, &format!("{nbox} 档，共 {nall} 条"), s.skin.ink, true);
-
-            // ── 右栏上：检索条件 ────────────────────────────────────────
-            pane(314.0, 40.0, 984.0, 346.0, "检索条件");
-            say(322.0, 72.0, 700.0, "用于检索的图片", s.skin.ink_dim, false);
-            let pr = rr(322.0, 90.0, 752.0, 116.0);
+            // ── 检索条件 ────────────────────────────────────────────────
+            pane(16.0, 40.0, 536.0, 344.0, "检索条件");
+            say(24.0, 70.0, 300.0, "用于检索的图片", s.skin.ink_dim, false);
+            let pr = rr(24.0, 90.0, 384.0, 114.0);
             dashed(hdc, &pr, if qpath.is_empty() { s.skin.line_soft } else { s.skin.line });
             txt(
                 hdc,
@@ -11805,33 +11834,33 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 fsm,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS,
             );
-            dlg_button(hdc, a, s, rr(760.0, 90.0, 858.0, 116.0), D_SIM_PICK, "选择图片", false, true);
-            dlg_button(hdc, a, s, rr(864.0, 90.0, 978.0, 116.0), D_SIM_CLIP, "从剪贴板", false, true);
-            let pv = rr(322.0, 124.0, 418.0, 192.0);
+            dlg_button(hdc, a, s, rr(392.0, 90.0, 536.0, 114.0), D_SIM_PICK, "选择图片", false, true);
+            dlg_button(hdc, a, s, rr(392.0, 118.0, 536.0, 142.0), D_SIM_CLIP, "从剪贴板", false, true);
+            let pv = rr(24.0, 118.0, 120.0, 186.0);
             fill(hdc, &pv, s.skin.canvas);
             frame(hdc, &pv, s.skin.line);
             if let Some(im) = &src_img {
                 let box_ = box_in(im.w, im.h, RECT { left: pv.left + 2, top: pv.top + 2, right: pv.right - 2, bottom: pv.bottom - 2 });
                 dib(hdc, &box_, im);
             }
-            say(
-                430.0,
-                126.0,
-                978.0,
-                &format!("{}{}", fname, if dims.is_empty() { String::new() } else { format!("  ·  {dims}") }),
+            // 名字一长就顶到右边，没有省略号会被从中间截断；这里按尾部省略，
+            // 整条路径上面那一行本来就写得全。
+            let name_line =
+                format!("{}{}", fname, if dims.is_empty() { String::new() } else { format!("  ·  {dims}") });
+            txt(
+                hdc,
+                &rr(128.0, 120.0, 384.0, 138.0),
+                &name_line,
                 s.skin.ink,
-                true,
+                f,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
-            let fp_line = if want_th {
-                format!("指纹档 {bw}×{bh}  ·  比 {bits} 位")
-            } else {
-                "图标视图不建指纹库 · 按 F8 换成缩略图视图".to_string()
-            };
-            say(430.0, 148.0, 978.0, &fp_line, s.skin.ink_dim, false);
+            let fp_line = format!("指纹档 {bw}×{bh}  ·  比 {bits} 位");
+            say(128.0, 140.0, 384.0, &fp_line, s.skin.ink_dim, false);
             say(
-                430.0,
-                168.0,
-                978.0,
+                128.0,
+                160.0,
+                384.0,
                 &(if ms == 0 && nhits == 0 {
                     "还没查过".to_string()
                 } else {
@@ -11840,35 +11869,42 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 s.skin.ink_dim,
                 false,
             );
-            say(322.0, 200.0, 384.0, "相似度", s.skin.ink, true);
-            dlg_slider(hdc, a, s, rr(390.0, 200.0, 700.0, 226.0), D_SIM_SLIDER, pct as i32, 50, 100);
+            say(24.0, 192.0, 86.0, "相似度", s.skin.ink, true);
+            dlg_slider(hdc, a, s, rr(92.0, 192.0, 380.0, 218.0), D_SIM_SLIDER, pct as i32, 50, 100);
             txt(
                 hdc,
-                &rr(706.0, 200.0, 760.0, 226.0),
+                &rr(386.0, 192.0, 460.0, 218.0),
                 &format!("{pct}%"),
                 s.skin.ink,
                 f,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
-            say(766.0, 204.0, 978.0, &format!("= 允许差 {allow} 位 / 共 {bits} 位"), s.skin.ink_dim, false);
-            say(322.0, 234.0, 384.0, "算法", s.skin.ink, true);
+            say(
+                24.0,
+                222.0,
+                536.0,
+                &format!(
+                    "= 允许差 {allow} 位 / 共 {bits} 位；方向勾选要多算 {} 份指纹取最像的",
+                    nvar - 1
+                ),
+                s.skin.ink_dim,
+                false,
+            );
+            say(24.0, 246.0, 86.0, "算法", s.skin.ink, true);
             let algo_name = match algo & sim::ALGO_ALL {
                 sim::ALGO_D => "只看骨架（dHash 256 位）",
                 sim::ALGO_C => "只看内容（DCT 63 位）",
                 _ => "全部（两种都算）",
             };
-            let cr = rr(390.0, 230.0, 600.0, 256.0);
+            let cr = rr(92.0, 246.0, 302.0, 270.0);
             dlg_combo(hdc, a, s, cr, D_SIM_ALGO, algo_name);
-            dlg_check(hdc, a, s, rr(610.0, 230.0, 978.0, 254.0), D_SIM_ROT, "查找转过的（90°/180°/270°）", rot);
-            say(322.0, 262.0, 600.0, &format!("勾上要多算 {} 份指纹取最像的那个", nvar - 1), s.skin.ink_dim, false);
-            dlg_check(hdc, a, s, rr(610.0, 258.0, 978.0, 282.0), D_SIM_FLIP, "查找镜像的（左右/上下）", flip);
-            dlg_radio(hdc, a, s, rr(322.0, 300.0, 520.0, 324.0), D_SIM_KEEP, "结果留在下面这张表", !to_view);
-            dlg_radio(hdc, a, s, rr(530.0, 300.0, 800.0, 324.0), D_SIM_KEEP + 1, "顺手装进主窗口的视图", to_view);
+            dlg_check(hdc, a, s, rr(24.0, 274.0, 270.0, 296.0), D_SIM_ROT, "查找转过的（90°/180°/270°）", rot);
+            dlg_check(hdc, a, s, rr(278.0, 274.0, 536.0, 296.0), D_SIM_FLIP, "查找镜像的（左右/上下）", flip);
             dlg_button(
                 hdc,
                 a,
                 s,
-                rr(812.0, 310.0, 978.0, 340.0),
+                rr(24.0, 306.0, 536.0, 330.0),
                 D_SIM_GO,
                 if busy { "查找中…" } else { "开始查找" },
                 true,
@@ -11881,43 +11917,43 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                     (sim::ALGO_C, "只看内容（DCT 63 位）"),
                 ];
                 for (i, (v, name)) in items.iter().enumerate() {
-                    let r = rr(390.0, 256.0 + i as f64 * 26.0, 600.0, 256.0 + (i as f64 + 1.0) * 26.0);
+                    let r = rr(92.0, 270.0 + i as f64 * 26.0, 302.0, 270.0 + (i as f64 + 1.0) * 26.0);
                     fill(hdc, &r, if over(&r, a.pt.0, a.pt.1) { s.skin.hov } else { s.skin.canvas });
                     frame(hdc, &r, s.skin.line_soft);
                     txt(hdc, &RECT { left: r.left + (7.0 * k) as i32, top: r.top, right: r.right - (8.0 * k) as i32, bottom: r.bottom }, *name, if *v == algo & sim::ALGO_ALL { s.skin.acc } else { s.skin.ink }, fsm, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                 }
             }
 
-            // ── 右栏中：结果表 ──────────────────────────────────────────
+            // ── 结果表 ──────────────────────────────────────────────────
             pane(
-                314.0,
-                354.0,
-                984.0,
-                600.0,
+                16.0,
+                352.0,
+                536.0,
+                584.0,
                 &format!("搜索结果 · {nhits} 张{}", if busy { "（查找中…）" } else { "" }),
             );
-            // 六列：名称 / 所在文件夹 / 匹配度 / 差几位 / 大小 / 改期。
-            // 列头和数据行走同一套逻辑坐标，错一格整列就歪。
+            // 五列：名称 / 所在文件夹 / 匹配度 / 差几位 / 大小。窄页放不下改期，
+            // 那列信息量也最低，砍掉；行结构里 mtime 留着不显示。
             let cols = [
-                (322.0, 566.0, "名称", false),
-                (566.0, 712.0, "所在文件夹", false),
-                (712.0, 770.0, "匹配度", true),
-                (770.0, 822.0, "差位", true),
-                (822.0, 890.0, "大小", true),
-                (890.0, 966.0, "改期", true),
+                (24.0, 300.0, "名称", false),
+                (300.0, 376.0, "所在文件夹", false),
+                (376.0, 430.0, "匹配度", true),
+                (430.0, 466.0, "差位", true),
+                (466.0, 533.0, "大小", true),
             ];
-            let hr = rr(315.0, 379.0, 983.0, 400.0);
+            let hr = rr(17.0, 377.0, 533.0, 396.0);
             fill(hdc, &hr, s.skin.chrome);
             hline(hdc, hr.left, hr.right, hr.bottom - 1, s.skin.line);
             for (x0, x1, name, right) in cols {
                 let base = if right { DT_RIGHT } else { DT_LEFT };
-                txt(hdc, &rr(x0, 379.0, x1 - 4.0, 400.0), name, s.skin.ink_dim, fsm, base | DT_SINGLELINE | DT_VCENTER);
+                txt(hdc, &rr(x0, 377.0, x1 - 4.0, 396.0), name, s.skin.ink_dim, fsm, base | DT_SINGLELINE | DT_VCENTER);
             }
-            let body = rr(315.0, 400.0, 983.0, 599.0);
+            let body = rr(17.0, 396.0, 533.0, 572.0);
             a.sim_list = body;
             fill(hdc, &body, s.skin.canvas);
             let rh = (25.0 * k) as i32;
             let visible = (((body.bottom - body.top) / rh).max(1) as usize).min(SIM_ROWS);
+            let scroll = a.sim_scroll.clamp(0, nhits.saturating_sub(visible) as i32) as usize;
             for i in 0..visible {
                 let idx = scroll + i;
                 if idx >= nhits {
@@ -11926,7 +11962,7 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 let top = body.top + i as i32 * rh;
                 let row = RECT { left: body.left, top, right: body.right, bottom: top + rh };
                 let (path, dist) = (a.sim_hits[idx].path.clone(), a.sim_hits[idx].dist);
-                let (size, mtime) = (a.sim_hits[idx].size, a.sim_hits[idx].mtime);
+                let (size, _mtime) = (a.sim_hits[idx].size, a.sim_hits[idx].mtime);
                 let on = idx == sel;
                 if on {
                     fill(hdc, &row, s.skin.sel);
@@ -11951,7 +11987,6 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 txt(hdc, &cell(2), &format!("{pctrow}%"), ink, fsm, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
                 txt(hdc, &cell(3), &format!("{dist}"), dim, fsm, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
                 txt(hdc, &cell(4), &fmt_size(size), dim, fsm, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-                txt(hdc, &cell(5), &local(mtime as u64), dim, fsm, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
                 a.dlg_rows.push((D_SIM_ROW + i, row));
             }
             if nhits > visible {
@@ -11968,12 +12003,12 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 );
             }
 
-            // ── 右栏下：两张预览 ────────────────────────────────────────
-            say(322.0, 610.0, 644.0, "源图片", s.skin.ink_dim, false);
-            say(656.0, 610.0, 978.0, if sel == usize::MAX { "匹配图片" } else { "匹配图片（选中那一张）" }, s.skin.ink_dim, false);
+            // ── 两张预览 ────────────────────────────────────────────────
+            say(24.0, 590.0, 270.0, "源图片", s.skin.ink_dim, false);
+            say(278.0, 590.0, 533.0, if sel == usize::MAX { "匹配图片" } else { "匹配图片（选中那一张）" }, s.skin.ink_dim, false);
             for (r, im) in [
-                (rr(322.0, 630.0, 644.0, 702.0), &src_img),
-                (rr(656.0, 630.0, 978.0, 702.0), &hit_img),
+                (rr(24.0, 610.0, 270.0, 698.0), &src_img),
+                (rr(278.0, 610.0, 533.0, 698.0), &hit_img),
             ] {
                 fill(hdc, &r, s.skin.canvas);
                 frame(hdc, &r, s.skin.line);
@@ -11987,7 +12022,7 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             // ── 底部 ────────────────────────────────────────────────────
             txt(
                 hdc,
-                &rr(16.0, 714.0, 860.0, 738.0),
+                &rr(24.0, 704.0, 380.0, 728.0),
                 if libmsg.is_empty() {
                     "格子右键也能直接开这一页，带着选中的那张图。"
                 } else {
@@ -11997,66 +12032,88 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 fsm,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             );
-            dlg_button(hdc, a, s, rr(892.0, 712.0, 978.0, 738.0), D_CLOSE, "关闭", false, true);
+            dlg_button(hdc, a, s, rr(456.0, 704.0, 536.0, 728.0), D_CLOSE, "关闭", false, true);
         }
-        DlgKind::DbMaint => {
-            let card = RECT {
-                left: lx,
-                top: rect.top + (42.0 * k) as i32,
-                right: rect.right - (16.0 * k) as i32,
-                bottom: rect.top + (170.0 * k) as i32,
+        DlgKind::CatDb => {
+            // 分类数据库自己一页：类别/归类/入库时间的统计、库文件位置和检查。
+            // 结果框只写检查（和位置更改）的账，缩略图那一套在另一页。
+            let dlg_font = a.font;
+            let pane = |top: f64, bottom: f64, head: &str| {
+                let r = RECT {
+                    left: lx,
+                    top: rect.top + (top * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (bottom * k) as i32,
+                };
+                fill(hdc, &r, s.skin.pane);
+                frame(hdc, &r, s.skin.line_soft);
+                let hd = RECT {
+                    left: r.left + 1,
+                    top: r.top + 1,
+                    right: r.right - 1,
+                    bottom: r.top + (24.0 * k) as i32,
+                };
+                fill(hdc, &hd, s.skin.pane_head);
+                hline(hdc, hd.left, hd.right, hd.bottom, s.skin.line);
+                txt(
+                    hdc,
+                    &RECT {
+                        left: hd.left + (8.0 * k) as i32,
+                        top: hd.top,
+                        right: hd.right - (8.0 * k) as i32,
+                        bottom: hd.bottom,
+                    },
+                    head,
+                    s.skin.ink,
+                    dlg_font,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                );
             };
-            fill(hdc, &card, s.skin.pane);
-            frame(hdc, &card, s.skin.line_soft);
-            let (tn, tb) = cache::stats();
             let cat_sz = std::fs::metadata(catalog_file()).map(|m| m.len()).unwrap_or(0);
-            // 类别和归类都以自己那份自含库为准（表文件已经不再参与运行）
-            let mut stats: Vec<String> = match a.cat.as_ref() {
-                Some(cat) => vec![format!(
+
+            pane(42.0, 282.0, "分类数据库");
+            let mut cat_line = "还在读取中…".to_string();
+            if let Some(cat) = a.cat.as_ref() {
+                cat_line = format!(
                     "类别：{} 个（顶层 {}） · 归类：{} 条 · 记了入库时间：{} 张",
                     cat.n_cats(),
                     cat.roots.len(),
                     cat.n_rows(),
                     cat.n_assets()
-                )],
-                None => vec!["数据库还在读取中…".to_string()],
-            };
-            stats.push(format!("缩略图缓存：{} 条 · {}", tn, fmt_size(tb)));
-            stats.push(format!("分类库文件：{}", fmt_size(cat_sz)));
-            let rh = (26.0 * k) as i32;
-            let st = card.top + (12.0 * k) as i32;
-            for (i, line) in stats.iter().enumerate() {
-                txt(
-                    hdc,
-                    &RECT {
-                        left: card.left + (14.0 * k) as i32,
-                        top: st + i as i32 * rh,
-                        right: card.right - (14.0 * k) as i32,
-                        bottom: st + (i as i32 + 1) * rh,
-                    },
-                    line,
-                    s.skin.ink,
-                    a.font,
-                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                 );
             }
-            // 卡片最底一行给数据库位置：默认就在主文件旁边的 data，装在系统目录
-            // 写不动时这行显示的是它实际落到了哪儿，改地方也从这儿改。
+            txt(
+                hdc,
+                &RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (76.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (98.0 * k) as i32,
+                },
+                &cat_line,
+                s.skin.ink,
+                a.font,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            );
             let mv = RECT {
-                left: card.right - (14.0 * k) as i32 - (76.0 * k) as i32,
-                top: st + stats.len() as i32 * rh,
-                right: card.right - (14.0 * k) as i32,
-                bottom: st + (stats.len() as i32 + 1) * rh,
+                left: rect.right - (16.0 * k) as i32 - (88.0 * k) as i32,
+                top: rect.top + (102.0 * k) as i32,
+                right: rect.right - (16.0 * k) as i32,
+                bottom: rect.top + (126.0 * k) as i32,
             };
             txt(
                 hdc,
                 &RECT {
-                    left: card.left + (14.0 * k) as i32,
+                    left: lx + (14.0 * k) as i32,
                     top: mv.top,
                     right: mv.left - (10.0 * k) as i32,
                     bottom: mv.bottom,
                 },
-                &format!("数据库位置：{}", data_dir().display()),
+                &format!(
+                    "库文件：{} · 位置：{}",
+                    fmt_size(cat_sz),
+                    data_dir().display()
+                ),
                 s.skin.ink,
                 a.font,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
@@ -12065,14 +12122,208 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             txt(
                 hdc,
                 &RECT {
-                    left: lx,
-                    top: rect.top + (178.0 * k) as i32,
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (132.0 * k) as i32,
                     right: rect.right - (16.0 * k) as i32,
-                    bottom: rect.top + (244.0 * k) as i32,
+                    bottom: rect.top + (164.0 * k) as i32,
                 },
-                "检查会核对库里的全部资产路径。硬盘上已经不存在的记录，会先自动备份原库，再从库中剔除。\n\
-                 重建当前目录：只动这一列里列出来的图，每张绕开缓存重解一遍，和缓存里那张对不上的当场换掉。\n\
-                 重建全部：照缩略图自己记的那份名单走，每张看过的图都重解一遍；名单从本版开始记录。",
+                "检查会核对分类库里的全部资产路径：硬盘上已经不存在的记录，\n先自动备份原库，再从库中剔除。",
+                s.skin.ink_dim,
+                a.font_sm,
+                DT_LEFT | DT_WORDBREAK,
+            );
+            dlg_button(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (166.0 * k) as i32,
+                    right: lx + (118.0 * k) as i32,
+                    bottom: rect.top + (192.0 * k) as i32,
+                },
+                D_DBCHECK,
+                if a.db_busy { "请稍候…" } else { "检查数据库" },
+                true,
+                !a.db_busy && !a.scan_busy,
+            );
+            txt(
+                hdc,
+                &RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (200.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (220.0 * k) as i32,
+                },
+                "结果",
+                s.skin.ink,
+                a.font,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            let res = RECT {
+                left: lx + (14.0 * k) as i32,
+                top: rect.top + (222.0 * k) as i32,
+                right: rect.right - (16.0 * k) as i32,
+                bottom: rect.top + (270.0 * k) as i32,
+            };
+            fill(hdc, &res, s.skin.canvas);
+            frame(hdc, &res, s.skin.line_soft);
+            let none = a.db_maint.is_empty();
+            txt(
+                hdc,
+                &RECT {
+                    left: res.left + (8.0 * k) as i32,
+                    top: res.top + (8.0 * k) as i32,
+                    right: res.right - (8.0 * k) as i32,
+                    bottom: res.bottom - (8.0 * k) as i32,
+                },
+                &wrap_chars(if none { "还没有结果。" } else { &a.db_maint }, 42),
+                if none { s.skin.ink_dim } else { s.skin.ink },
+                a.font_sm,
+                DT_LEFT | DT_WORDBREAK | DT_TOP,
+            );
+            let by = rect.bottom - (42.0 * k) as i32;
+            let bh = (26.0 * k) as i32;
+            dlg_button(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: rect.right - (16.0 * k) as i32 - (74.0 * k) as i32,
+                    top: by,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: by + bh,
+                },
+                D_CLOSE,
+                "关闭",
+                false,
+                true,
+            );
+        }
+        DlgKind::ThumbDb => {
+            // 缩略图数据库自己一页：缓存统计、重建、清指纹和扫描文件夹，
+            // 以图搜图的指纹也在这一本账里。结果框只写这一页的账。
+            let dlg_font = a.font;
+            let pane = |top: f64, bottom: f64, head: &str| {
+                let r = RECT {
+                    left: lx,
+                    top: rect.top + (top * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (bottom * k) as i32,
+                };
+                fill(hdc, &r, s.skin.pane);
+                frame(hdc, &r, s.skin.line_soft);
+                let hd = RECT {
+                    left: r.left + 1,
+                    top: r.top + 1,
+                    right: r.right - 1,
+                    bottom: r.top + (24.0 * k) as i32,
+                };
+                fill(hdc, &hd, s.skin.pane_head);
+                hline(hdc, hd.left, hd.right, hd.bottom, s.skin.line);
+                txt(
+                    hdc,
+                    &RECT {
+                        left: hd.left + (8.0 * k) as i32,
+                        top: hd.top,
+                        right: hd.right - (8.0 * k) as i32,
+                        bottom: hd.bottom,
+                    },
+                    head,
+                    s.skin.ink,
+                    dlg_font,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                );
+            };
+            let (tn, tb) = cache::stats();
+            pane(42.0, 592.0, "缩略图数据库（以图搜图的指纹也在这一本账里）");
+            txt(
+                hdc,
+                &RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (76.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (98.0 * k) as i32,
+                },
+                &format!(
+                    "缩略图缓存：{} 条 · {}（指纹跟着缩略图索引走，不另设库）",
+                    tn,
+                    fmt_size(tb)
+                ),
+                s.skin.ink,
+                a.font,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+            dlg_button(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (102.0 * k) as i32,
+                    right: lx + (144.0 * k) as i32,
+                    bottom: rect.top + (128.0 * k) as i32,
+                },
+                D_THUMB_FIX,
+                if a.fix_mode { "停止重建" } else { "重建当前目录" },
+                false,
+                !a.thumb_busy,
+            );
+            dlg_button(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: lx + (152.0 * k) as i32,
+                    top: rect.top + (102.0 * k) as i32,
+                    right: lx + (244.0 * k) as i32,
+                    bottom: rect.top + (128.0 * k) as i32,
+                },
+                D_THUMB_ALL,
+                if a.thumb_busy { "停止重建" } else { "重建全部" },
+                false,
+                !a.fix_mode,
+            );
+            dlg_button(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: lx + (252.0 * k) as i32,
+                    top: rect.top + (102.0 * k) as i32,
+                    right: lx + (372.0 * k) as i32,
+                    bottom: rect.top + (128.0 * k) as i32,
+                },
+                D_DB_PRUNE,
+                if a.db_busy { "请稍候…" } else { "移除无效索引" },
+                false,
+                !a.db_busy && !a.scan_busy && !a.thumb_busy && !a.fix_mode && !a.sim_busy,
+            );
+            // 以图搜图的自动补库开关从那一页搬过来：勾上后每次查找前先补指纹。
+            dlg_check(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (134.0 * k) as i32,
+                    right: lx + (260.0 * k) as i32,
+                    bottom: rect.top + (156.0 * k) as i32,
+                },
+                D_SIM_AUTO,
+                "查找之前先补齐（以图搜图先补库再搜）",
+                a.sim_auto,
+            );
+            txt(
+                hdc,
+                &RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (160.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (192.0 * k) as i32,
+                },
+                "重建：每张绕开缓存重解一遍，和缓存里那张对不上的当场换掉；当前目录只动这一列，全部照库里的名单走。\n\
+                 移除无效索引：摘掉原图已不在盘上的指纹，缩略图保留，全部档位一次清完。",
                 s.skin.ink_dim,
                 a.font_sm,
                 DT_LEFT | DT_WORDBREAK,
@@ -12080,10 +12331,144 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             txt(
                 hdc,
                 &RECT {
-                    left: lx,
-                    top: rect.top + (248.0 * k) as i32,
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (198.0 * k) as i32,
                     right: rect.right - (16.0 * k) as i32,
-                    bottom: rect.top + (268.0 * k) as i32,
+                    bottom: rect.top + (218.0 * k) as i32,
+                },
+                "扫描文件夹（含子文件夹）",
+                s.skin.ink,
+                a.font_b,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            // ── 扫描文件夹：名单 + 增删/开扫/停止 ─────────────────────
+            let scan_dirs = a.scan_dirs.clone();
+            let scan_sel = a.scan_sel;
+            let scan_scroll = a.scan_scroll;
+            let scan_busy = a.scan_busy;
+            // 库上只能有一件重活：重建/检查/找相似在跑就都别动扫描。
+            let idle = !a.scan_busy
+                && !a.db_busy
+                && !a.thumb_busy
+                && !a.fix_mode
+                && !a.sim_busy;
+            let list = RECT {
+                left: lx,
+                top: rect.top + (220.0 * k) as i32,
+                right: rect.right - (16.0 * k) as i32,
+                bottom: rect.top + (332.0 * k) as i32,
+            };
+            a.scan_list = list;
+            fill(hdc, &list, s.skin.canvas);
+            frame(hdc, &list, s.skin.line);
+            let row_h = (22.0 * k) as i32;
+            let maxs = scan_dirs.len().saturating_sub(SCAN_VIS);
+            let top_row = scan_scroll.min(maxs);
+            if scan_dirs.is_empty() {
+                txt(
+                    hdc,
+                    &list,
+                    "（名单是空的，先点「添加…」挑一个文件夹）",
+                    s.skin.ink_off,
+                    a.font_sm,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
+            }
+            for vi in 0..SCAN_VIS {
+                let idx = top_row + vi;
+                if idx >= scan_dirs.len() {
+                    break;
+                }
+                let root = &scan_dirs[idx];
+                let (p, t) = (&root.path, root.last);
+                let row = RECT {
+                    left: list.left + 1,
+                    top: list.top + 1 + vi as i32 * row_h,
+                    right: list.right - 1,
+                    bottom: (list.top + 1 + (vi as i32 + 1) * row_h).min(list.bottom - 1),
+                };
+                let sel = idx == scan_sel;
+                fill(hdc, &row, if sel { s.skin.hov } else { s.skin.canvas });
+                if sel {
+                    frame(hdc, &row, s.skin.acc);
+                }
+                let when = if t == 0 {
+                    "还没扫过".to_string()
+                } else {
+                    format!("上次 {}", local(t))
+                };
+                // 名单上看得见哪条带了规则：有的在时间前面挂一枚"有规则"的牌。
+                if !root.dirs.is_empty() || !root.exts.is_empty() {
+                    txt(
+                        hdc,
+                        &RECT {
+                            left: row.right - (168.0 * k) as i32,
+                            top: row.top,
+                            right: row.right - (122.0 * k) as i32,
+                            bottom: row.bottom,
+                        },
+                        "有规则",
+                        s.skin.acc,
+                        a.font_sm,
+                        DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+                    );
+                }
+                txt(
+                    hdc,
+                    &RECT {
+                        left: row.left + (6.0 * k) as i32,
+                        top: row.top,
+                        right: row.right - (172.0 * k) as i32,
+                        bottom: row.bottom,
+                    },
+                    p,
+                    s.skin.ink,
+                    a.font_sm,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS,
+                );
+                txt(
+                    hdc,
+                    &RECT {
+                        left: row.right - (114.0 * k) as i32,
+                        top: row.top,
+                        right: row.right - (6.0 * k) as i32,
+                        bottom: row.bottom,
+                    },
+                    &when,
+                    s.skin.ink_off,
+                    a.font_sm,
+                    DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+                );
+                a.dlg_btns.push((D_SCAN_ROW + vi, row));
+            }
+            let sb_y = rect.top + (338.0 * k) as i32;
+            let sb_h = (26.0 * k) as i32;
+            dlg_button(hdc, a, s, RECT { left: lx, top: sb_y, right: lx + (88.0 * k) as i32, bottom: sb_y + sb_h }, D_SCAN_ADD, "添加…", false, !scan_busy);
+            dlg_button(hdc, a, s, RECT { left: lx + (96.0 * k) as i32, top: sb_y, right: lx + (166.0 * k) as i32, bottom: sb_y + sb_h }, D_SCAN_DEL, "移除", false, scan_sel < scan_dirs.len());
+            dlg_button(hdc, a, s, RECT { left: lx + (174.0 * k) as i32, top: sb_y, right: lx + (280.0 * k) as i32, bottom: sb_y + sb_h }, D_SCAN_RUN, "扫描所选", false, idle && scan_sel < scan_dirs.len());
+            dlg_button(hdc, a, s, RECT { left: lx + (288.0 * k) as i32, top: sb_y, right: lx + (394.0 * k) as i32, bottom: sb_y + sb_h }, D_SCAN_ALL, "全部扫描", false, idle && !scan_dirs.is_empty());
+            dlg_button(hdc, a, s, RECT { left: lx + (402.0 * k) as i32, top: sb_y, right: lx + (468.0 * k) as i32, bottom: sb_y + sb_h }, D_SCAN_STOP, "停止", false, scan_busy);
+            dlg_button(hdc, a, s, RECT { left: lx + (476.0 * k) as i32, top: sb_y, right: lx + (564.0 * k) as i32, bottom: sb_y + sb_h }, D_SCAN_RULES, "规则…", false, scan_sel < scan_dirs.len());
+            txt(
+                hdc,
+                &RECT {
+                    left: lx + (14.0 * k) as i32,
+                    top: rect.top + (370.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (390.0 * k) as i32,
+                },
+                "每个文件夹可带排除规则（「规则…」），命中的贴图文件夹整棵剪掉、不入搜图库。",
+                s.skin.ink_dim,
+                a.font_sm,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+            txt(
+                hdc,
+                &RECT {
+                    left: lx,
+                    top: rect.top + (398.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (418.0 * k) as i32,
                 },
                 "结果",
                 s.skin.ink,
@@ -12092,15 +12477,15 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             );
             let res = RECT {
                 left: lx,
-                top: rect.top + (270.0 * k) as i32,
+                top: rect.top + (420.0 * k) as i32,
                 right: rect.right - (16.0 * k) as i32,
                 bottom: rect.bottom - (58.0 * k) as i32,
             };
             fill(hdc, &res, s.skin.canvas);
             frame(hdc, &res, s.skin.line_soft);
             let mut text = String::new();
-            if !a.db_maint.is_empty() {
-                text.push_str(&a.db_maint);
+            if !a.db_prune.is_empty() {
+                text.push_str(&a.db_prune);
             }
             // 全部重建跑在后台线程上，进度就从那两个计数现读，不等它推消息。
             let going = a.thumb_busy;
@@ -12116,6 +12501,29 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                     text.push('\n');
                 }
                 text.push_str(&a.db_thumb);
+            }
+            // 扫描文件夹的进度同样现读；跑完落进 db_scan，跟检查/重建各记各的。
+            if a.scan_busy {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                if a.scan_total == 0 {
+                    text.push_str("正在翻文件夹找图…");
+                } else {
+                    text.push_str(&format!(
+                        "正在扫描：{} / {}，新增 {}，跳过 {}，失败 {}。",
+                        a.scan_done.load(Ordering::Relaxed),
+                        a.scan_total,
+                        a.scan_added.load(Ordering::Relaxed),
+                        a.scan_skip.load(Ordering::Relaxed),
+                        a.scan_err.load(Ordering::Relaxed)
+                    ));
+                }
+            } else if !a.db_scan.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&a.db_scan);
             }
             let none = text.is_empty();
             txt(
@@ -12133,36 +12541,112 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             );
             let by = rect.bottom - (42.0 * k) as i32;
             let bh = (26.0 * k) as i32;
+            // 底下只留关闭：四颗库操作按钮已经各自归进上面的板块里。
+            dlg_button(
+                hdc,
+                a,
+                s,
+                RECT {
+                    left: rect.right - (16.0 * k) as i32 - (74.0 * k) as i32,
+                    top: by,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: by + bh,
+                },
+                D_CLOSE,
+                "关闭",
+                false,
+                true,
+            );
+        }
+        DlgKind::ScanRule => {
+            // 选中那条扫描根的排除规则。两个输入框是原生控件，字在框里自己长，
+            // 这里只管说明、摆位和底下那排按钮。
+            let (root, has_root) = match a.scan_dirs.get(a.scan_sel) {
+                Some(r) => (r.path.clone(), true),
+                None => (String::new(), false),
+            };
+            let edit1 = RECT {
+                left: lx,
+                top: rect.top + (94.0 * k) as i32,
+                right: rect.right - (16.0 * k) as i32,
+                bottom: rect.top + (122.0 * k) as i32,
+            };
+            let edit2 = RECT {
+                left: lx,
+                top: rect.top + (154.0 * k) as i32,
+                right: rect.right - (16.0 * k) as i32,
+                bottom: rect.top + (182.0 * k) as i32,
+            };
+            txt(
+                hdc,
+                &RECT {
+                    left: lx,
+                    top: rect.top + (44.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (66.0 * k) as i32,
+                },
+                &format!("作用对象：{root}"),
+                s.skin.ink_dim,
+                a.font_sm,
+                DT_LEFT | DT_SINGLELINE | DT_PATH_ELLIPSIS,
+            );
+            txt(
+                hdc,
+                &RECT {
+                    left: lx,
+                    top: rect.top + (72.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (92.0 * k) as i32,
+                },
+                "排除文件夹关键字（逗号分隔；文件夹名包含即命中，不分大小写）：",
+                s.skin.ink,
+                a.font_sm,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            place_rule_edits(a, &[edit1, edit2]);
+            txt(
+                hdc,
+                &RECT {
+                    left: lx,
+                    top: rect.top + (130.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (150.0 * k) as i32,
+                },
+                "排除文件格式（逗号分隔、不带点；后缀精确命中）：",
+                s.skin.ink,
+                a.font_sm,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            txt(
+                hdc,
+                &RECT {
+                    left: lx,
+                    top: rect.top + (190.0 * k) as i32,
+                    right: rect.right - (16.0 * k) as i32,
+                    bottom: rect.top + (214.0 * k) as i32,
+                },
+                "保存后自动把库里已入账、命中规则的指纹摘掉（缩略图保留，浏览贴图不受影响）。",
+                s.skin.ink_dim,
+                a.font_sm,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            let by = rect.bottom - (42.0 * k) as i32;
+            let bh = (26.0 * k) as i32;
+            let bw = (120.0 * k) as i32;
             let gap = (8.0 * k) as i32;
-            let bwc = (74.0 * k) as i32;
-            let bwk = (104.0 * k) as i32;
-            let bwa = (92.0 * k) as i32;
-            let bwf = (130.0 * k) as i32;
-            let close = RECT { left: rect.right - (16.0 * k) as i32 - bwc, top: by, right: rect.right - (16.0 * k) as i32, bottom: by + bh };
-            let fix = RECT { left: close.left - gap - bwf, top: by, right: close.left - gap, bottom: by + bh };
-            let all = RECT { left: fix.left - gap - bwa, top: by, right: fix.left - gap, bottom: by + bh };
-            let check = RECT { left: all.left - gap - bwk, top: by, right: all.left - gap, bottom: by + bh };
-            dlg_button(hdc, a, s, check, D_DBCHECK, if a.db_busy { "请稍候…" } else { "检查数据库" }, true, !a.db_busy);
-            dlg_button(
-                hdc,
-                a,
-                s,
-                all,
-                D_THUMB_ALL,
-                if a.thumb_busy { "停止重建" } else { "重建全部" },
-                false,
-                !a.fix_mode,
-            );
-            dlg_button(
-                hdc,
-                a,
-                s,
-                fix,
-                D_THUMB_FIX,
-                if a.fix_mode { "停止重建" } else { "重建当前目录" },
-                false,
-                !a.thumb_busy,
-            );
+            let close = RECT {
+                left: rect.right - (16.0 * k) as i32 - (74.0 * k) as i32,
+                top: by,
+                right: rect.right - (16.0 * k) as i32,
+                bottom: by + bh,
+            };
+            let save = RECT {
+                left: close.left - gap - bw,
+                top: by,
+                right: close.left - gap,
+                bottom: by + bh,
+            };
+            dlg_button(hdc, a, s, save, D_RULE_SAVE, "保存并清理已入账", true, has_root);
             dlg_button(hdc, a, s, close, D_CLOSE, "关闭", false, true);
         }
         DlgKind::Assoc => {
@@ -12174,7 +12658,7 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                     left: lx,
                     top: rect.top + (40.0 * k) as i32,
                     right: rect.right - (16.0 * k) as i32,
-                    bottom: rect.top + (102.0 * k) as i32,
+                    bottom: rect.top + (98.0 * k) as i32,
                 },
                 "Windows 10/11 不允许程序静默修改默认应用。这里的勾选只是把 Xsee 登记成这些格式的「打开方式」候选，\
                  双击文件时用的仍是系统当前的默认程序。\n\
@@ -12183,37 +12667,67 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 a.font_sm,
                 DT_LEFT | DT_WORDBREAK | DT_TOP,
             );
-            txt(
-                hdc,
-                &RECT {
-                    left: lx,
-                    top: rect.top + (106.0 * k) as i32,
-                    right: rect.right - (16.0 * k) as i32,
-                    bottom: rect.top + (126.0 * k) as i32,
-                },
-                "登记为候选的格式：",
-                s.skin.ink,
-                a.font_b,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-            );
+            // 按格式牌归组，和浏览窗口、资源管理器里看到的牌一一对应：
+            // 0..8 是常用格式，9 是 RAW 家族，10 起是后来接的专业格式。
             let list = a.assoc.clone();
-            let cols = 3usize;
-            let colw = (rect.right - (16.0 * k) as i32 - lx) / cols as i32;
-            let rh = (24.0 * k) as i32;
-            for (i, (ext, on)) in list.iter().enumerate() {
-                let left = lx + (i % cols) as i32 * colw;
-                let top = rect.top + (130.0 * k) as i32 + (i / cols) as i32 * rh;
-                let r = RECT { left, top, right: left + colw - (8.0 * k) as i32, bottom: top + rh };
-                dlg_check(hdc, a, s, r, D_ASSOC + i, &format!(".{ext}  {}", type_label(ext)), *on);
+            let mut groups: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for (i, (ext, _)) in list.iter().enumerate() {
+                let g = match fmticon::index(ext) {
+                    Some(9) => 1,
+                    Some(f) if f >= 10 => 2,
+                    _ => 0,
+                };
+                groups[g].push(i);
             }
+            let titles = ["常用图片格式", "相机 RAW 格式", "其他图像格式"];
+            let cols = 6usize;
+            let colw = (rect.right - (16.0 * k) as i32 - lx) / cols as i32;
+            let rh = (26.0 * k) as i32;
+            let hh = (21.0 * k) as i32;
+            let isz = (22.0 * k) as i32;
+            let cbx = (13.0 * k) as i32;
+            let icon_bg = s.skin.chrome_hi;
+            let mut y = rect.top + (102.0 * k) as i32;
+            let list_right = rect.right - (16.0 * k) as i32;
+            for (gi, idxs) in groups.iter().enumerate() {
+                let hr = RECT { left: lx, top: y, right: list_right, bottom: y + hh };
+                txt(hdc, &hr, titles[gi], s.skin.ink, a.font_b, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                txt(hdc, &hr, &format!("{} 个扩展名", idxs.len()), s.skin.ink_dim, a.font_sm, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                y += hh;
+                for (n, &ii) in idxs.iter().enumerate() {
+                    let left = lx + (n % cols) as i32 * colw;
+                    let top = y + (n / cols) as i32 * rh;
+                    let r = RECT { left, top, right: left + colw - (4.0 * k) as i32, bottom: top + rh };
+                    if over(&r, a.pt.0, a.pt.1) {
+                        fill(hdc, &r, s.skin.hov);
+                    }
+                    let (ext, on) = &list[ii];
+                    // 勾选框复用标准控件（命中区登记在整格上），右边补格式牌和扩展名。
+                    dlg_check(hdc, a, s, r, D_ASSOC + ii, "", *on);
+                    let ix = r.left + cbx + (5.0 * k) as i32;
+                    let iy = top + (rh - isz) / 2;
+                    if let Some(fi) = fmticon::index(ext) {
+                        icon_cached(hdc, IK_FMT_LIST + fi as u8, ix, iy, isz, fmticon::pick(fi, icon_bg), icon_bg);
+                    }
+                    let tr = RECT {
+                        left: ix + isz + (5.0 * k) as i32,
+                        top,
+                        right: r.right,
+                        bottom: r.bottom,
+                    };
+                    txt(hdc, &tr, &format!(".{ext}"), s.skin.ink, a.font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                }
+                y += (idxs.len().div_ceil(cols)) as i32 * rh;
+            }
+            let n_on = list.iter().filter(|(_, on)| *on).count();
             if let Ok(exe) = std::env::current_exe() {
                 txt(
                     hdc,
                     &RECT {
                         left: lx,
-                        top: rect.top + (376.0 * k) as i32,
-                        right: rect.right - (16.0 * k) as i32,
-                        bottom: rect.top + (394.0 * k) as i32,
+                        top: rect.top + (470.0 * k) as i32,
+                        right: list_right - (120.0 * k) as i32,
+                        bottom: rect.top + (488.0 * k) as i32,
                     },
                     &format!("程序位置：{}", exe.display()),
                     s.skin.ink_dim,
@@ -12221,15 +12735,28 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                     DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS,
                 );
             }
+            txt(
+                hdc,
+                &RECT {
+                    left: list_right - (120.0 * k) as i32,
+                    top: rect.top + (470.0 * k) as i32,
+                    right: list_right,
+                    bottom: rect.top + (488.0 * k) as i32,
+                },
+                &format!("已勾选 {n_on} / {} 项", list.len()),
+                s.skin.ink_dim,
+                a.font_sm,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+            );
             dlg_check(
                 hdc,
                 a,
                 s,
                 RECT {
                     left: lx,
-                    top: rect.top + (400.0 * k) as i32,
+                    top: rect.top + (494.0 * k) as i32,
                     right: lx + (300.0 * k) as i32,
-                    bottom: rect.top + (424.0 * k) as i32,
+                    bottom: rect.top + (516.0 * k) as i32,
                 },
                 D_ASSOC_CHECK,
                 "每次启动检查并补回这些关联",
@@ -12237,9 +12764,9 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
             );
             let res = RECT {
                 left: lx,
-                top: rect.top + (430.0 * k) as i32,
+                top: rect.top + (522.0 * k) as i32,
                 right: rect.right - (16.0 * k) as i32,
-                bottom: rect.bottom - (58.0 * k) as i32,
+                bottom: rect.top + (570.0 * k) as i32,
             };
             fill(hdc, &res, s.skin.canvas);
             frame(hdc, &res, s.skin.line_soft);
@@ -12254,7 +12781,7 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                     right: res.right - (8.0 * k) as i32,
                     bottom: res.bottom - (8.0 * k) as i32,
                 },
-                &wrap_chars(msg, 40),
+                msg,
                 if a.assoc_msg.is_empty() { s.skin.ink_dim } else { s.skin.ink },
                 a.font_sm,
                 DT_LEFT | DT_WORDBREAK | DT_TOP,
@@ -12298,9 +12825,8 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 .unwrap_or_default();
             // 底色取皮肤文件那一层，不是当前生效那张：草稿清空时色块要能回到文件默认色。
             let dk = theme::preview(&theme::skin_of(&a.skin), &draft);
-            let dg = theme::preview_grad(&theme::Grad::default(), &draft);
-            let tw = (rect.right - rect.left - (24.0 * k) as i32) / 4;
-            for (i, name) in ["字体", "配色", "渐变", "目录"].iter().enumerate() {
+            let tw = (rect.right - rect.left - (24.0 * k) as i32) / 3;
+            for (i, name) in ["字体", "配色", "目录"].iter().enumerate() {
                 let r = RECT {
                     left: rect.left + (12.0 * k) as i32 + i as i32 * tw,
                     top: rect.top + (40.0 * k) as i32,
@@ -12410,9 +12936,10 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 }
                 1 => {
                     let colw = (bw2 - bx - (16.0 * k) as i32) / 2;
-                    for (i, slot) in theme::SLOTS.iter().enumerate() {
-                        let cx = bx + (i as i32 / 11) * (colw + (16.0 * k) as i32);
-                        let cy = body.top + (10.0 * k) as i32 + (i as i32 % 11) * (26.0 * k) as i32;
+                    let per_col = (COLOR_SLOTS.len() + 1) / 2;
+                    for (i, slot) in COLOR_SLOTS.iter().enumerate() {
+                        let cx = bx + (i as i32 / per_col as i32) * (colw + (16.0 * k) as i32);
+                        let cy = body.top + (10.0 * k) as i32 + (i as i32 % per_col as i32) * (26.0 * k) as i32;
                         let r = RECT { left: cx, top: cy, right: cx + colw, bottom: cy + (22.0 * k) as i32 };
                         let hot = over(&r, a.pt.0, a.pt.1);
                         if hot {
@@ -12431,39 +12958,7 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                     txt(
                         hdc,
                         &RECT { left: bx, top: body.bottom - (38.0 * k) as i32, right: bw2, bottom: body.bottom - (10.0 * k) as i32 },
-                        "点一行改这个槽位；色块先跟着草稿走，点确定才换到界面上。",
-                        s.skin.ink_dim,
-                        a.font_sm,
-                        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-                    );
-                }
-                2 => {
-                    for (i, key) in theme::GRAD_KEYS.iter().enumerate() {
-                        let cy = body.top + (12.0 * k) as i32 + i as i32 * (30.0 * k) as i32;
-                        let r = RECT {
-                            left: bx,
-                            top: cy,
-                            right: bw2,
-                            bottom: cy + (24.0 * k) as i32,
-                        };
-                        let hot = over(&r, a.pt.0, a.pt.1);
-                        if hot {
-                            fill(hdc, &r, s.skin.hov);
-                        }
-                        txt(hdc, &r, grad_label(key), s.skin.ink, a.font_sm, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-                        let sw = RECT {
-                            left: r.right - (58.0 * k) as i32,
-                            top: r.top + (3.0 * k) as i32,
-                            right: r.right - (16.0 * k) as i32,
-                            bottom: r.bottom - (3.0 * k) as i32,
-                        };
-                        swatch(hdc, &sw, dg.get(key, &dk), s, over(&sw, a.pt.0, a.pt.1));
-                        a.dlg_rows.push((D_GRAD + i, sw));
-                    }
-                    txt(
-                        hdc,
-                        &RECT { left: bx, top: body.bottom - (38.0 * k) as i32, right: bw2, bottom: body.bottom - (10.0 * k) as i32 },
-                        "每行是一个渐变端点；点色块改色，未改的端点继续按皮肤色推导。",
+                        "点一行改这个颜色；色块马上跟着变，点确定才写进皮肤文件。文字颜色在「字体」页按版块单独调。",
                         s.skin.ink_dim,
                         a.font_sm,
                         DT_LEFT | DT_SINGLELINE | DT_VCENTER,
@@ -12742,10 +13237,15 @@ unsafe fn begin_rename(hwnd: HWND, idx: usize) {
         let path = g.entries[idx].path.clone();
         let name = g.disp(idx);
         // 高亮只盖名字本体，扩展名原样留着，和资源管理器同一个手势。
-        let stem_len = Path::new(&path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().chars().count())
-            .unwrap_or(name.chars().count());
+        // 文件夹没有扩展名，整个名字选中。
+        let stem_len = if g.entries[idx].is_dir {
+            name.chars().count()
+        } else {
+            Path::new(&path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().chars().count())
+                .unwrap_or(name.chars().count())
+        };
         let keep = stem_len.min(name.chars().count());
         // 格子档的名字本来就居中排，改名框跟着居中；两个列表档靠左，才靠左。
         let center = matches!(g.mode, Mode::Grid | Mode::Small);
@@ -13034,7 +13534,9 @@ unsafe fn open_dlg(hwnd: HWND, kind: DlgKind) {
             DlgKind::Convert | DlgKind::FmtOpt => g.conv_fmt,
             _ => 0,
         };
-        if kind == DlgKind::Convert && g.conv_out.is_empty() {
+        // 输出文件夹默认跟着当前文件夹走：空着没填过，或者用户没自己定过路径，
+        // 都按打开对话框时所在的文件夹算。定死的路径换文件夹后就成了暗坑。
+        if kind == DlgKind::Convert && (g.conv_out.is_empty() || g.conv_out_auto) {
             g.conv_out = g.dir.display().to_string();
         }
         // 关联页打开时默认把所有支持的格式全部勾上：用户图的就是"一次全给 Xsee"。
@@ -13070,6 +13572,119 @@ unsafe fn open_dlg(hwnd: HWND, kind: DlgKind) {
         create_dlg_edit(hwnd, kind);
     }
     refresh(hwnd);
+}
+
+/// 规则对话框：压在缩略图数据库页上（dlg_hold 那套，只叠一层），两个原生输入框
+/// 预填选中那条扫描根的现行规则。开了这层期间维护页只画不认点击。
+unsafe fn open_rule_dlg(hwnd: HWND) {
+    {
+        let mut g = app().lock().unwrap();
+        if g.scan_sel >= g.scan_dirs.len() {
+            drop(g);
+            refresh(hwnd);
+            return;
+        }
+        if g.dlg.is_some() {
+            if g.dlg_hold.is_some() {
+                return;
+            }
+            // 底下是维护页，没有原生输入框要摘；整层压进 hold 当背景。
+            g.dlg_hold = g.dlg.take();
+        }
+        let k = g.scale;
+        let Some((w, h)) = dlg_size(DlgKind::ScanRule, k) else { return };
+        let rc = client(hwnd);
+        let rect = dlg_rect(&rc, w, h);
+        g.dlg = Some(Dlg {
+            kind: DlgKind::ScanRule,
+            rect,
+            fmt: 0,
+            opt: encode::Opt::default(),
+            scope_db: false,
+            combo_open: false,
+            ask_title: String::new(),
+            ask_body: String::new(),
+            ask_yes: false,
+            ask_cmd: 0,
+            look_draft: g.look.clone(),
+            skin_before: g.look.clone(),
+            look_keep: false,
+            save_as: false,
+            arm_del: false,
+        });
+    }
+    create_rule_edits(hwnd);
+    refresh(hwnd);
+}
+
+/// 规则对话框的两个输入框，预填选中那条根的现行规则。摆位在 paint 里按帧对齐。
+unsafe fn create_rule_edits(hwnd: HWND) {
+    let (texts, font) = {
+        let mut g = app().lock().unwrap();
+        if g.rule_edits.iter().any(|h| !h.0.is_null()) {
+            return;
+        }
+        let Some(r) = g.scan_dirs.get(g.scan_sel) else { return };
+        (
+            [r.dirs.join(","), r.exts.join(",")],
+            g.zf[theme::Z_DLG].f,
+        )
+    };
+    let mut made = [HWND::default(); 2];
+    for (i, t) in texts.iter().enumerate() {
+        let htxt = HSTRING::from(t.as_str());
+        let ed = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(pw("EDIT").as_ptr()),
+            &htxt,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x0080),
+            0,
+            0,
+            10,
+            10,
+            Some(hwnd),
+            None,
+            None,
+            None,
+        );
+        let Ok(ed) = ed else { continue };
+        let _ = SendMessageW(ed, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        let _ = SetWindowSubclass(ed, Some(edit_proc), 1, 0);
+        made[i] = ed;
+    }
+    app().lock().unwrap().rule_edits = made;
+}
+
+/// 规则对话框的两个输入框跟着画框走。
+unsafe fn place_rule_edits(a: &App, rects: &[RECT; 2]) {
+    for (ed, r) in a.rule_edits.iter().zip(rects) {
+        if ed.0.is_null() {
+            continue;
+        }
+        let _ = SetWindowPos(
+            *ed,
+            None,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+unsafe fn drop_rule_edits() {
+    // 守卫先摘柄再销毁：框多半攥着焦点，DestroyWindow 同步触发 EN_KILLFOCUS
+    // 回 WM_COMMAND，那里还要拿这把锁。
+    let hs = std::mem::replace(
+        &mut app().lock().unwrap().rule_edits,
+        [HWND::default(); 2],
+    );
+    for ed in hs {
+        if !ed.0.is_null() {
+            let _ = DestroyWindow(ed);
+        }
+    }
 }
 
 /// 把关联页的勾选落到注册表。写坏的项汇总成一句话贴在页面上，不另弹框打断。
@@ -13184,10 +13799,13 @@ unsafe fn open_fmtopt(hwnd: HWND) {
         save_as: false,
         arm_del: false,
     });
-    if let Some(ed) = g.dlg_edit.take() {
+    // 先在锁内把句柄摘下来，放锁之后再销毁：这个框此刻多半还攥着焦点，
+    // DestroyWindow 会同步触发 EN_KILLFOCUS 回到 WM_COMMAND，那里还要拿这把锁。
+    let dlg_ed = g.dlg_edit.take();
+    drop(g);
+    if let Some(ed) = dlg_ed {
         let _ = DestroyWindow(ed);
     }
-    drop(g);
     refresh(hwnd);
 }
 
@@ -13224,6 +13842,9 @@ unsafe fn back_to_conv(hwnd: HWND) {
 /// `yes` 决定按钮是“是/否”还是单个“确定”；`cmd` 非 0 表示点确认后要重发这条命令。
 /// 已经有窗开着（皮肤设置窗）时，那一层压到 dlg_hold 上当背景，答完再换回来——只叠一层。
 unsafe fn open_ask(hwnd: HWND, title: &str, body: &str, yes: bool, cmd: usize) {
+    // 名字输入框是原生 EDIT，跟着上一层窗走；压起来前先毁掉，不然它会浮在确认框上。
+    // 句柄先摘下、放锁后销毁：毁掉带焦点的框会同步发 EN_KILLFOCUS，那里还要拿这把锁。
+    let mut dlg_ed: Option<HWND> = None;
     {
         let mut g = app().lock().unwrap();
         if g.dlg.is_some() {
@@ -13231,10 +13852,7 @@ unsafe fn open_ask(hwnd: HWND, title: &str, body: &str, yes: bool, cmd: usize) {
                 return;
             }
             g.dlg_hold = g.dlg.take();
-            // 名字输入框是原生 EDIT，跟着上一层窗走；压起来前先毁掉，不然它会浮在确认框上
-            if let Some(ed) = g.dlg_edit.take() {
-                let _ = DestroyWindow(ed);
-            }
+            dlg_ed = g.dlg_edit.take();
         }
         g.open_menu = None;
         g.open_sub = None;
@@ -13279,13 +13897,51 @@ unsafe fn open_ask(hwnd: HWND, title: &str, body: &str, yes: bool, cmd: usize) {
             arm_del: false,
         });
     }
+    if let Some(ed) = dlg_ed {
+        let _ = DestroyWindow(ed);
+    }
     refresh(hwnd);
+}
+
+/// 头一回点「以图搜图」先讲一页：这一页怎么使、库和文件夹在哪维护、规则怎么写。
+/// 弹出即算看过（Esc / ✕ 关掉也一样），下次直接进搜索页；点「确定」还会接着
+/// 打开搜索页（ask_cmd = M_FINDSIM，走确认框那条回头路）。
+unsafe fn sim_intro(hwnd: HWND) {
+    {
+        let mut g = app().lock().unwrap();
+        if g.sim_intro {
+            return;
+        }
+        g.sim_intro = true;
+    }
+    ui_save(&app().lock().unwrap(), hwnd);
+    let body = "以图搜图不是搜整台电脑，它只在「已经入了库」的图里找。\n\
+                看过的图会自动入库；没打开过的文件夹，要自己加进来扫一次。\n\
+                \n\
+                1. 先把文件夹加进来（做一次就够）\n\
+                　 菜单「工具 → 缩略图数据库」→ 点「添加…」，选一个文件夹。\n\
+                　 子文件夹会一起扫；选好点「开始扫描」，等进度跑完。\n\
+                　 以后这个文件夹里看过的图都会自动入库，不用再扫。\n\
+                \n\
+                2. 开始搜\n\
+                　 在图片上右键，选「以图搜图」。这一页默认拿你选中的那张当查询图。\n\
+                　 点「开始查找」，下面按相似度从高到低列出结果。\n\
+                \n\
+                3. 调结果\n\
+                　 嫌结果太杂，把「相似度」往高处拉；嫌漏了，往低处拉。\n\
+                　 查询图是歪的，勾上「旋转」「镜像」再查一次。\n\
+                \n\
+                4. 维护和排除\n\
+                　 缩略图数据库是搜图的地基。原图删了记录还在，点「移除无效索引」清理；\n\
+                　 缩略图坏了，点「重建」重新生成。\n\
+                　 不想要的文件夹，在名单里选中它点「规则…」：一行填文件夹名的关键字，\n\
+                　 一行填不要的格式（如 psd,tif），用逗号隔开，扫的时候自动跳过。";
+    open_ask(hwnd, "以图搜图 · 第一次使用", body, false, M_FINDSIM);
 }
 
 /// 找不回的那类删除先弹确认框（彻底删除、删类别）；正文按命令现取，点"是"后才重发原命令。
 /// 进回收站的那条不问——回收站里能还原。
-unsafe fn ask_delete(hwnd: HWND, id: usize) {
-    let (title, body) = if id == M_CAT_DEL {
+unsafe fn ask_delete(hwnd: HWND, id: usize) {    let (title, body) = if id == M_CAT_DEL {
         let (cid, name) = {
             let g = app().lock().unwrap();
             (
@@ -13303,9 +13959,26 @@ unsafe fn ask_delete(hwnd: HWND, id: usize) {
             format!("删除类别「{name}」？\n\n它的子类别和归类标记会一起删掉，图片文件本身不动。"),
         )
     } else {
-        let n = app().lock().unwrap().selected_paths().len();
+        // 树落点按一行算，格子选区按选中个数算——两边同一个落点规则，
+        // 不然树上 Shift+Del 报的是别处的数量。
+        let (tree, tp) = tree_target();
+        let n = if tree {
+            match tp {
+                Some(d) => {
+                    let editable = {
+                        let g = app().lock().unwrap();
+                        g.tree_editable(&d)
+                    };
+                    if editable { 1 } else { 0 }
+                }
+                None => 0,
+            }
+        } else {
+            app().lock().unwrap().selected_paths().len()
+        };
         if n == 0 {
-            app().lock().unwrap().msg = "没有选中文件".to_string();
+            let m = if tree { "这一项不能删除" } else { "没有选中文件" };
+            app().lock().unwrap().msg = m.to_string();
             refresh(hwnd);
             return;
         }
@@ -13319,7 +13992,7 @@ unsafe fn ask_delete(hwnd: HWND, id: usize) {
 
 /// 覆盖当前皮肤：把草稿里的颜色合并进它自己的 .skin 文件，然后收尾关窗。
 /// 颜色既然进了文件，个人覆盖里那一层就当场清掉——同一组数不能留两个来源。
-/// 字体和渐变还是留在这套皮肤的个人改动里（皮肤文件只装颜色）。
+/// 字体还是留在这套皮肤的个人改动里（皮肤文件只装颜色）。
 unsafe fn skin_commit(hwnd: HWND) {
     let (name, draft, base) = {
         let g = app().lock().unwrap();
@@ -13359,7 +14032,7 @@ unsafe fn skin_commit(hwnd: HWND) {
     app().lock().unwrap().msg = format!("已把这套颜色写进皮肤「{name}」");
 }
 
-/// 另存为一套新皮肤：新文件收下全部颜色，字体和渐变作为这套皮肤自己的个人覆盖带走。
+/// 另存为一套新皮肤：新文件收下全部颜色，字体作为这套皮肤自己的个人覆盖带走。
 unsafe fn skin_save_as(hwnd: HWND) {
     let (mut draft, raw) = {
         let g = app().lock().unwrap();
@@ -13452,13 +14125,17 @@ unsafe fn skin_delete(hwnd: HWND) {
 
 /// 收掉对话框上那个系统输入框。换页签时另存为的名字框不该继续浮在别的页上。
 unsafe fn drop_dlg_edit() {
-    if let Some(ed) = app().lock().unwrap().dlg_edit.take() {
+    // 守卫先放下再销毁：框多半正攥着焦点，DestroyWindow 会同步触发 EN_KILLFOCUS
+    // 回到 WM_COMMAND，那里还要拿这把锁。
+    let ed = app().lock().unwrap().dlg_edit.take();
+    if let Some(ed) = ed {
         let _ = DestroyWindow(ed);
     }
 }
 
 unsafe fn close_dlg(hwnd: HWND) {
     drop_dlg_edit();
+    drop_rule_edits();
     let revert = {
         let mut g = app().lock().unwrap();
         // 皮肤设置窗是边改边在界面上预览的，所以取消、Esc、"不覆盖"这些出口都得把
@@ -13561,8 +14238,15 @@ fn sim_rgba_at(path: &str, bw: u32, bh: u32) -> Option<Rgba> {
     job::make(path, bw, bh).ok().map(|t| t.img)
 }
 
+/// 缓存里解出来的是 RGBA，Img 的约定是 GDI 直接能贴的 BGRA（1143 行）；
+/// 不转的话相似页那两块预览红蓝颠倒，网格没事是因为它出图时转过了。
 fn img_of(px: Rgba) -> Img {
-    Img { w: px.w, h: px.h, px: px.px, fit: None }
+    Img {
+        w: px.w,
+        h: px.h,
+        px: rgba_to_bgra(&px.px),
+        fit: None,
+    }
 }
 
 /// 底下那两块预览：查询图 + 表里选中那一张。解码放后台，点一行不该卡一下界面。
@@ -13571,7 +14255,9 @@ unsafe fn sim_previews(hwnd: HWND) {
     let gid = SIM_PV_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let (bw, bh, q, hit) = {
         let g = app().lock().unwrap();
-        let (w, h) = g.tbox();
+        // 预览跟搜索同一个目标档：图标/列表视图借库里最大的一档，不然预览
+        // 对着小格档要么没图、要么现解一张塞进不该有账的档里。
+        let Some((w, h)) = sim_target_tier(&g) else { return };
         let n = if g.sim_hits.is_empty() { usize::MAX } else { g.sim_sel.min(g.sim_hits.len() - 1) };
         (
             w,
@@ -13599,74 +14285,247 @@ unsafe fn sim_previews(hwnd: HWND) {
     });
 }
 
-/// 左栏那两个库操作：补齐指纹、移除无效索引。都是后台跑，进度沿用心跳现读。
-/// `del` 为真就是清理那条，跟名单无关。
-unsafe fn start_sim_lib(hwnd: HWND, del: bool) {
-    let hp = hwnd.0 as isize;
-    let prog = Arc::new(AtomicUsize::new(0));
-    let (bw, bh, folder, dir) = {
+/// 以图搜图用哪个档：缩略图视图用当前档；图标/列表/详细资料这些小格档自己
+/// 不生成缩略图、没有指纹，借库里账最多的一档。相似库还没读进内存就是 None
+/// （界面线程不该为了挑档把整库读进来），后台读完下一帧就有了。
+fn sim_target_tier(g: &App) -> Option<(u32, u32)> {
+    let (w, h) = g.tbox();
+    if g.wants_thumb() && w.min(h) >= sim::MIN_SIDE {
+        return Some((w, h));
+    }
+    sim::biggest_tier_loaded().map(|(bw, bh)| (bw as u32, bh as u32))
+}
+
+/// 把选中的扫描文件夹从名单里摘掉，「移除」按钮和 Del 键共用这一把刀。
+/// 扫描在跑也允许：这一轮要扫哪些根在开扫时已经拍下快照，摘掉只影响
+/// 收尾时给谁盖"上次扫描"的时间戳，名单落盘的就是摘完的样子。
+unsafe fn remove_scan_sel(hwnd: HWND) {
+    let mut g = app().lock().unwrap();
+    if g.scan_sel >= g.scan_dirs.len() {
+        return;
+    }
+    let sel = g.scan_sel;
+    g.scan_dirs.remove(sel);
+    g.scan_sel = sel.min(g.scan_dirs.len().saturating_sub(1));
+    g.scan_scroll = g.scan_scroll.min(g.scan_dirs.len().saturating_sub(SCAN_VIS));
+    save_scan_cfg(&g.scan_dirs);
+    // 名单少了一条，规则关口跟着重排。
+    sync_scan_rules(&g.scan_dirs);
+    drop(g);
+    refresh(hwnd);
+}
+
+/// 缩略图数据库页那颗「移除无效索引」：全部档位一次清完（从以图搜图页挪过来的，
+/// 这里没有"这一档"的口径）。结果写自己的 db_prune 槽——和分类库的检查各走各的。
+unsafe fn start_db_prune(hwnd: HWND) {
+    let go = {
         let mut g = app().lock().unwrap();
-        if g.sim_fill_busy || g.sim_busy {
-            g.sim_lib_msg = "上头已经有一件在跑，等它一下".to_string();
+        let on_page = g.dlg.as_ref().is_some_and(|d| d.kind == DlgKind::ThumbDb);
+        if on_page && !g.db_busy && !g.scan_busy {
+            g.db_prune = "正在移除无效索引…".to_string();
+            g.db_busy = true;
+            true
+        } else {
+            false
+        }
+    };
+    if !go {
+        return;
+    }
+    refresh(hwnd);
+    let hp = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        sim::ensure_loaded();
+        let (gone, left) = sim::prune_all();
+        let msg = format!(
+            "移除无效索引完成：摘掉 {gone} 条原图已不在盘上的指纹（缩略图保留），全部档位还剩 {left} 条。"
+        );
+        {
+            let mut g = app().lock().unwrap();
+            g.db_prune = msg.clone();
+            g.db_busy = false;
+            g.msg = msg;
+        }
+        let hwnd = HWND(hp as *mut core::ffi::c_void);
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_PV, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// 维护页的扫描文件夹：把名单里的文件夹（含子文件夹）里的图片直接生成缩略图入库，
+/// 不用一张张翻。跳过的口径：这一档已经有和原图对得上的缩略图（cache::has_thumb，
+/// 只查索引不解码）。先在后台把目录树走完拿总数，再四路分头照 job::make 那条线
+/// 出图——没命中就解码入库、指纹跟着写，命中说明扫过，直接跳过。
+/// 跑完把各根的扫描时间记回名单落盘，下次再扫同一份名单还是这个口径。
+/// `only` 有值就只扫选中的那一个。
+unsafe fn start_dir_scan(hwnd: HWND, only: Option<usize>) {
+    let hp = hwnd.0 as isize;
+    let (bw, bh, roots) = {
+        let mut g = app().lock().unwrap();
+        if g.scan_busy || g.db_busy || g.thumb_busy || g.fix_mode || g.sim_busy {
+            g.msg = "还有别的库活在跑，等它结束再扫".to_string();
             drop(g);
             refresh(hwnd);
             return;
         }
         let (w, h) = g.tbox();
-        // 图标、列表档不出缩略图，也就没有指纹可建；这里 tbox 报的是格子尺寸，光看尺寸分不出来。
+        // 图标、列表档不出缩略图；档太小就算扫进去了也建不了指纹，搜不到。
         if !g.wants_thumb() || w.min(h) < sim::MIN_SIDE {
-            g.sim_lib_msg = if g.wants_thumb() {
+            g.msg = if g.wants_thumb() {
                 format!(
-                    "这一档缩略图只有 {}×{}，够不上建指纹（短边要 ≥{}）。按 F8 换成缩略图视图。",
-                    w,
-                    h,
+                    "这一档缩略图只有 {w}×{h}，扫进去也建不了指纹（短边要 ≥{}）。按 F8 换成缩略图视图再扫。",
                     sim::MIN_SIDE
                 )
             } else {
-                "这一档只画图标，不生成缩略图，建不了指纹库。按 F8 换成缩略图视图再来。".to_string()
+                "这一档只画图标，不生成缩略图。按 F8 换成缩略图视图再扫。".to_string()
             };
             drop(g);
             refresh(hwnd);
             return;
         }
-        g.sim_fill_busy = true;
-        g.sim_done = prog.clone();
-        g.sim_total = 0;
-        g.sim_speed = 0.0;
-        g.sim_t0 = Some(Instant::now());
-        g.sim_stop.store(false, Ordering::SeqCst);
-        (w, h, g.sim_folder, g.sim_dir.clone())
+        let roots: Vec<ScanRoot> = g
+            .scan_dirs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| only.map_or(true, |o| *i == o))
+            .map(|(_, r)| r.clone())
+            .collect();
+        if roots.is_empty() {
+            g.msg = "名单是空的，先添加文件夹".to_string();
+            drop(g);
+            refresh(hwnd);
+            return;
+        }
+        g.scan_busy = true;
+        g.scan_total = 0;
+        g.db_scan.clear();
+        (w, h, roots)
     };
-    let stop = app().lock().unwrap().sim_stop.clone();
+    let (done, added, skip, err, stop) = {
+        let mut g = app().lock().unwrap();
+        let (done, added, skip, err) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        g.scan_done = done.clone();
+        g.scan_added = added.clone();
+        g.scan_skip = skip.clone();
+        g.scan_err = err.clone();
+        g.scan_stop = stop.clone();
+        (done, added, skip, err, stop)
+    };
     refresh(hwnd);
     std::thread::spawn(move || {
-        let hwnd = HWND(hp as *mut core::ffi::c_void);
         job::init_com();
-        let msg = if del {
-            let gone = sim::prune(bw, bh);
-            let (inlib, dead) = sim::stat(bw, bh);
-            format!("移掉 {gone} 条图已经不在盘上的，这一档还留 {inlib} 条（还剩 {dead} 条没查）")
-        } else {
-            // 指纹和缩略图同一条记录，所以待补名单直接从缩略图库拿：
-            // 这一档缩略图已经在、指纹还缺的那些，不用再翻路径名单。
-            let prefix = (folder && !dir.is_empty())
-                .then(|| dir.trim_end_matches(['\\', '/']).to_ascii_lowercase());
-            sim::ensure_loaded();
-            let todo = cache::missing_fps(bw, bh, prefix.as_deref());
-            let n = todo.len();
-            app().lock().unwrap().sim_total = n;
-            let made = sim::fill(todo, bw, bh, &prog, &stop);
-            let (inlib, _) = sim::stat(bw, bh);
-            format!("这一档要补 {n} 张，新记下 {made} 条，现在 {inlib} 条")
-        };
-        {
-            let mut g = app().lock().unwrap();
-            g.sim_fill_busy = false;
-            g.sim_total = 0;
-            g.sim_lib_msg = msg;
+        // 先把目录树走完才知道总数；两个根互相套住时（a 和 a\b 都在名单里）去重。
+        // 每个根带着自己的排除规则走：命中的文件夹整棵剪枝，贴图根本不枚举。
+        let mut all: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ruled = 0usize;
+        for r in &roots {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let (files, skipped) =
+                scan::walk_images(&r.path, &stop, &r.dirs, &r.exts);
+            ruled += skipped;
+            for p in files {
+                if seen.insert(p.to_ascii_lowercase()) {
+                    all.push(p);
+                }
+            }
         }
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_SIM_LIB, WPARAM(0), LPARAM(0));
+        all.sort_by_key(|p| p.to_ascii_lowercase());
+        let total = all.len();
+        app().lock().unwrap().scan_total = total;
+        // 轮流发牌，四路各自的队列长度差不到一张，和全部重建同一个分法。
+        let mut chunks: Vec<Vec<String>> = (0..4).map(|_| Vec::new()).collect();
+        for (i, p) in all.into_iter().enumerate() {
+            chunks[i % 4].push(p);
+        }
+        let live = Arc::new(AtomicUsize::new(chunks.len()));
+        for chunk in chunks {
+            let (live, done, added, skip, err, stop) = (
+                live.clone(),
+                done.clone(),
+                added.clone(),
+                skip.clone(),
+                err.clone(),
+                stop.clone(),
+            );
+            // 收尾要用名单对回时间戳，四个 worker 各带一份小克隆。
+            let roots = roots.clone();
+            std::thread::spawn(move || {
+                let hwnd = HWND(hp as *mut core::ffi::c_void);
+                job::init_com();
+                for p in chunk {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if cache::has_thumb(&p, bw, bh) {
+                        skip.fetch_add(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    match job::make(&p, bw, bh) {
+                        Ok(_) => added.fetch_add(1, Ordering::Relaxed),
+                        Err(_) => err.fetch_add(1, Ordering::Relaxed),
+                    };
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+                if live.fetch_sub(1, Ordering::AcqRel) != 1 {
+                    return;
+                }
+                // 最后一颗收尾：记账、报数、把各根的扫描时间写回名单。
+                let (n_done, n_added) = (
+                    done.load(Ordering::Relaxed),
+                    added.load(Ordering::Relaxed),
+                );
+                let (n_skip, n_err) =
+                    (skip.load(Ordering::Relaxed), err.load(Ordering::Relaxed));
+                let stopped = stop.load(Ordering::Relaxed);
+                // 命中排除规则的张数单独报，规则写没写对当场看得见。
+                let rule_tail = if ruled > 0 {
+                    format!("，按规则跳过 {ruled} 张")
+                } else {
+                    String::new()
+                };
+                let msg = if stopped {
+                    format!(
+                        "扫描已停止：走到 {n_done} / {total}，新增 {n_added}，跳过 {n_skip}，失败 {n_err}{rule_tail}。"
+                    )
+                } else {
+                    format!(
+                        "扫描完成：新增 {n_added} 张，跳过 {n_skip} 张（缩略图已有了），失败 {n_err} 张{rule_tail}。这一档 {bw}×{bh}。"
+                    )
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                {
+                    let mut g = app().lock().unwrap();
+                    // 只给这一轮真扫过的根盖时间。扫描当中新添的文件夹没参与这轮，
+                    // 时间留在 0，界面上照旧显示"还没扫过"。
+                    for r in g.scan_dirs.iter_mut() {
+                        if roots.iter().any(|x| x.path.eq_ignore_ascii_case(&r.path)) {
+                            r.last = now;
+                        }
+                    }
+                    save_scan_cfg(&g.scan_dirs);
+                    g.db_scan = msg.clone();
+                    g.scan_busy = false;
+                    g.scan_total = 0;
+                    g.msg = msg.lines().next().unwrap_or("扫描完成").to_string();
+                }
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_PV, WPARAM(0), LPARAM(0));
+                }
+            });
         }
     });
 }
@@ -13707,38 +14566,32 @@ unsafe fn reveal_in_view(hwnd: HWND, p: &str) {
     refresh(hwnd);
 }
 
-/// 找相似，一整页那种走法。第一步是补库：这一档还没记过指纹的（或者原图改过的），
+/// 找相似，一整页那种走法。第一步是补库：目标档还没记过指纹的（或者原图改过的），
 /// 从缩略图缓存里现成那张取图补上——全程不开原图，几千张也就几秒。
-/// 第二步取查询图的方向变体，在同一档里比对：几万条 319 位的整数异或加数位，几毫秒。
-/// 指纹只和同一档的比，所以用的就是当前格子的盒尺寸：换了档位等于重新攒，
-/// 和缩略图缓存按盒尺寸分键是同一件事。
+/// 第二步跨档搜：查询图在哪几档有过缩略图，就各算一份指纹、各搜各的账——
+/// 指纹只有同档才可比，所以查询图的指纹也得按那一档算。一档都没见过就兜底：
+/// 目标档解码原图入一档再搜，不然新图永远搜不到自己。
+/// 图标/列表/详细资料这些小格档自己没有指纹，目标档自动借库里账最多的一档。
 /// 跑在后台线程，界面照旧能动，进度由 60 毫秒心跳现读。
 unsafe fn start_sim_search(hwnd: HWND) {
     let hp = hwnd.0 as isize;
     let gid = SIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let prog = Arc::new(AtomicUsize::new(0));
-    let (bw, bh, q, pct, algo, rot, flip, auto, folder, dir) = {
+    let (bw, bh, q, pct, algo, rot, flip, auto) = {
         let mut g = app().lock().unwrap();
-        if g.sim_busy || g.sim_fill_busy {
+        if g.sim_busy {
             g.sim_lib_msg = "上一次还没跑完，等它一下".to_string();
             drop(g);
             refresh(hwnd);
             return;
         }
-        let (w, h) = g.tbox();
-        if !g.wants_thumb() || w.min(h) < sim::MIN_SIDE {
-            g.sim_lib_msg = if g.wants_thumb() {
-                format!(
-                    "这一档的缩略图只有 {}×{}，指纹认不准。按 F8 换成缩略图视图再找。",
-                    w, h
-                )
-            } else {
-                "这一档只画图标，不生成缩略图，没有指纹可比。按 F8 换成缩略图视图再找。".to_string()
-            };
+        let Some((tw, th)) = sim_target_tier(&g) else {
+            g.sim_lib_msg =
+                "指纹库还是空的：先在缩略图视图里翻几张图，或去缩略图数据库页扫描一批。".to_string();
             drop(g);
             refresh(hwnd);
             return;
-        }
+        };
         if g.sim_path.is_empty() || !Path::new(&g.sim_path).is_file() {
             g.sim_lib_msg = "先挑一张要用来找的图片".to_string();
             drop(g);
@@ -13748,20 +14601,16 @@ unsafe fn start_sim_search(hwnd: HWND) {
         g.sim_busy = true;
         g.sim_done = prog.clone();
         g.sim_total = 0;
-        g.sim_speed = 0.0;
-        g.sim_t0 = Some(Instant::now());
         g.sim_stop.store(false, Ordering::SeqCst);
         (
-            w,
-            h,
+            tw,
+            th,
             g.sim_path.clone(),
             g.sim_pct,
             g.sim_algo,
             g.sim_rot,
             g.sim_flip,
             g.sim_auto,
-            g.sim_folder,
-            g.sim_dir.clone(),
         )
     };
     let stop = app().lock().unwrap().sim_stop.clone();
@@ -13772,34 +14621,79 @@ unsafe fn start_sim_search(hwnd: HWND) {
         let t0 = Instant::now();
         if auto {
             // 同"补齐指纹"：待补名单直接来自缩略图库，不再先翻一遍路径名单。
-            let prefix = (folder && !dir.is_empty())
-                .then(|| dir.trim_end_matches(['\\', '/']).to_ascii_lowercase());
             sim::ensure_loaded();
-            let todo = cache::missing_fps(bw, bh, prefix.as_deref());
+            let todo = cache::missing_fps(bw, bh, None);
             app().lock().unwrap().sim_total = todo.len();
             sim::fill(todo, bw, bh, &prog, &stop);
         }
-        let hits = sim_rgba_at(&q, bw, bh).map(|img| {
-            let qs = sim::variants(&img, rot, flip);
-            sim::search(bw, bh, &qs, algo, sim::dist_from_pct(pct, algo), sim::MAX_HITS)
-                .into_iter()
-                .map(|(d, path)| {
-                    // 大小、改期在这一刻一次取好，绘制每帧只读内存，不再碰盘。
-                    let (size, mtime) = match std::fs::metadata(&path) {
-                        Ok(m) => {
-                            let secs = m
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            (m.len(), secs.min(u32::MAX as u64) as u32)
-                        }
-                        Err(_) => (0, 0),
-                    };
-                    SimHit { path, dist: d, size, mtime }
-                })
-                .collect::<Vec<_>>()
+        // 跨档搜：查询图在哪几档有过缩略图就搜哪几档；一档都没有（新图）就
+        // 兜底在目标档解码原图入一档再搜——不然它永远搜不到自己。
+        let mut cand = sim::search_all_tiers(
+            &q,
+            rot,
+            flip,
+            algo,
+            sim::dist_from_pct(pct, algo),
+            sim::MAX_HITS + 1024,
+        );
+        if cand.is_empty() {
+            if let Some(img) = sim_rgba_at(&q, bw, bh) {
+                let qs = sim::variants(&img, rot, flip);
+                cand = sim::search(
+                    bw,
+                    bh,
+                    &qs,
+                    algo,
+                    sim::dist_from_pct(pct, algo),
+                    sim::MAX_HITS + 1024,
+                );
+            }
+        }
+        let hits = (!cand.is_empty()).then(|| {
+            // 盘上已经不在的条目不进结果：0 字节 + 01-01 的日期，排最前还双击
+            // 不动，纯搅局。逐条问盘四路并行（慢盘一次几毫秒，串行就是半秒起），
+            // 各路带着原下标回来按原序拼回，榜还是按差异排的那个榜。
+            // 库里的死账交给维护页「移除无效索引」清，结果表只认现存的文件。
+            let mut v: Vec<(usize, SimHit)> = std::thread::scope(|s| {
+                const W: usize = 4;
+                (0..W)
+                    .map(|w| {
+                        let cand = &cand;
+                        s.spawn(move || {
+                            cand.iter()
+                                .skip(w)
+                                .step_by(W)
+                                .enumerate()
+                                .filter_map(|(i, (d, path))| {
+                                    let m = std::fs::metadata(path).ok()?;
+                                    let secs = m
+                                        .modified()
+                                        .ok()
+                                        .and_then(|t| {
+                                            t.duration_since(std::time::UNIX_EPOCH).ok()
+                                        })
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    Some((
+                                        i * W + w,
+                                        SimHit {
+                                            path: path.clone(),
+                                            dist: *d,
+                                            size: m.len(),
+                                            mtime: secs.min(u32::MAX as u64) as u32,
+                                        },
+                                    ))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            v.sort_unstable_by_key(|(i, _)| *i);
+            let mut v: Vec<SimHit> = v.into_iter().map(|(_, h)| h).collect();
+            v.truncate(sim::MAX_HITS);
+            v
         });
         let ms = t0.elapsed().as_millis();
         let slot = SIM_RES.get_or_init(|| Mutex::new(None));
@@ -14240,14 +15134,18 @@ unsafe fn start_conv(
     del_src: bool,
 ) {
     if CONV_RUN.swap(true, Ordering::SeqCst) {
-        app().lock().unwrap().msg = "上一批还在转换，等它跑完".to_string();
+        let mut g = app().lock().unwrap();
+        g.msg = "上一批还在转换，等它跑完".to_string();
+        g.conv_msg = "上一批还在转换".to_string();
         refresh(hwnd);
         return;
     }
     CONV_STOP.store(false, Ordering::SeqCst);
+    encode::begin_batch();
     if let Ok(mut v) = CONV_ERRS.lock() {
         v.clear();
     }
+    app().lock().unwrap().conv_msg.clear();
     let hp = hwnd.0 as isize;
     let total = paths.len();
     let prog_done = {
@@ -14261,6 +15159,7 @@ unsafe fn start_conv(
     let paths = Arc::new(paths);
     let out = Arc::new(out);
     let opt = Arc::new(opt);
+    let batch = Arc::new(encode::batch_set(&paths));
     let next = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicUsize::new(0));
     let ok = Arc::new(AtomicUsize::new(0));
@@ -14272,6 +15171,7 @@ unsafe fn start_conv(
         let paths = paths.clone();
         let out = out.clone();
         let opt = opt.clone();
+        let batch = batch.clone();
         let next = next.clone();
         let done = done.clone();
         let ok = ok.clone();
@@ -14287,10 +15187,12 @@ unsafe fn start_conv(
                 break;
             }
             let p = &paths[i];
-            match encode::convert_file(p, &out, fmt, &opt, policy) {
-                Ok(encode::Outcome::Done(_, _)) => {
+            match encode::convert_file(p, &out, fmt, &opt, policy, &batch) {
+                Ok(encode::Outcome::Done(outp, _)) => {
                     ok.fetch_add(1, Ordering::SeqCst);
-                    if del_src {
+                    // 同格式转到同一个文件夹时输出就是源路径：这一下删的不是
+                    // "原文件"，是刚转出来的那份——删完这批等于白转。
+                    if del_src && !encode::paths_eq(&outp, p) {
                         let _ = clip::delete_to_recycle(&[p.clone()]);
                     }
                 }
@@ -14364,6 +15266,10 @@ unsafe fn dlg_ok(hwnd: HWND) {
             }
             {
                 let mut g = app().lock().unwrap();
+                // 框里改过路径就落定，之后不再跟当前文件夹；没动过就保持跟手。
+                if out != g.conv_out {
+                    g.conv_out_auto = false;
+                }
                 g.conv_out = out.clone();
                 g.conv_fmt = fmt;
             }
@@ -14570,7 +15476,9 @@ unsafe fn dlg_ok(hwnd: HWND) {
             app().lock().unwrap().msg = outcome;
             close_dlg(hwnd);
         }
-        DlgKind::DbMaint => close_dlg(hwnd),
+        DlgKind::CatDb | DlgKind::ThumbDb => close_dlg(hwnd),
+        // 规则对话框的回车不替人按「保存」：清理是个有后果的动作，走按钮。
+        DlgKind::ScanRule => {}
         // 以图搜图那一页全是按钮点出来的（选图/补齐/查找），回车不该替人按下哪一个。
         DlgKind::SimSearch => {}
         // 改动已经实时叠到界面上了，确定这一步只问一句：这套颜色要不要写进皮肤文件。
@@ -14824,13 +15732,19 @@ unsafe fn set_wallpaper(hwnd: HWND, mode: usize) {
 }
 
 unsafe fn show_props(hwnd: HWND) {
-    // 树右键时看的是被点的那个文件夹，不看格子里的选区。
-    let paths = {
-        let g = app().lock().unwrap();
-        match g.ctx_dir.clone() {
+    // 树落点优先（右键或键盘焦点在树上），看的是那个文件夹本体，不看格子里的选区。
+    let (tree, tp) = tree_target();
+    let paths = if tree {
+        match tp {
             Some(d) => vec![d],
-            None => g.selected_paths(),
+            None => {
+                app().lock().unwrap().msg = "先在文件夹树上选一个文件夹".to_string();
+                refresh(hwnd);
+                return;
+            }
         }
+    } else {
+        app().lock().unwrap().selected_paths()
     };
     let Some(first) = paths.first().cloned() else {
         app().lock().unwrap().msg = "没有选中文件".to_string();
@@ -14838,45 +15752,89 @@ unsafe fn show_props(hwnd: HWND) {
         return;
     };
     if paths.len() > 1 {
-        let sz: u64 = paths.iter().map(|p| stat_of(p).0).sum();
-        open_ask(
-            hwnd,
-            "属性",
-            &format!("已选 {} 个文件，合计 {}", paths.len(), fmt_size(sz)),
-            false,
-            0,
-        );
+        // 多选：文件和文件夹分开数，大小只算文件——文件夹自己那条 metadata 长度是 0，
+        // 混进合计里只会让人以为选中的东西很小。
+        let (mut nf, mut nd, mut sz) = (0usize, 0usize, 0u64);
+        for p in &paths {
+            if let Ok(m) = std::fs::metadata(p) {
+                if m.is_dir() {
+                    nd += 1;
+                } else {
+                    nf += 1;
+                    sz += m.len();
+                }
+            }
+        }
+        let mut body = format!("已选 {} 项\n文件：{nf} 个\n文件夹：{nd} 个", paths.len());
+        if nf > 0 {
+            body.push_str(&format!("\n合计大小：{}（{sz} 字节）", fmt_size(sz)));
+        }
+        open_ask(hwnd, "属性", &body, false, 0);
         return;
     }
-    let (sz, date) = stat_of(&first);
+    let meta = std::fs::metadata(&first).ok();
+    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    // 文件名带扩展名，和资源管理器一致；盘根没有末级名字，整条路径顶上去。
+    let name = Path::new(&first)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| first.clone());
     let dir = Path::new(&first)
         .parent()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let is_dir = Path::new(&first).is_dir();
-    let kind = if is_dir { "文件夹".to_string() } else { kind_label(Path::new(&first)) };
-    let dims = if is_dir {
-        String::new()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "此电脑".to_string());
+    let kind = if is_dir {
+        "文件夹".to_string()
+    } else if scan::is_image(&first) {
+        format!("{} 图像", kind_label(Path::new(&first)))
+    } else if Path::new(&first).extension().is_some() {
+        format!("{} 文件", kind_label(Path::new(&first)))
     } else {
-        job::open_meta(&first)
-            .map(|(w, h, bpp)| {
-                if bpp > 0 {
-                    format!("尺寸：{w} × {h} · {bpp} 位\n")
-                } else {
-                    format!("尺寸：{w} × {h}\n")
-                }
-            })
-            .unwrap_or_default()
+        "文件".to_string()
     };
-    let body = format!(
-        "名称：{}\n位置：{}\n大小：{}\n修改时间：{}\n类型：{}\n{}",
-        stem(&first),
-        dir,
-        fmt_size(sz),
-        date,
-        kind,
-        dims
-    );
+    let mut body = format!("文件名：{name}\n类型：{kind}\n位置：{dir}\n");
+    if let Some(m) = &meta {
+        if !is_dir {
+            body.push_str(&format!("大小：{}（{} 字节）\n", fmt_size(m.len()), m.len()));
+        }
+        let c = fmt_sys_time(m.created());
+        let mo = fmt_sys_time(m.modified());
+        let ac = fmt_sys_time(m.accessed());
+        if !c.is_empty() {
+            body.push_str(&format!("创建时间：{c}\n"));
+        }
+        if !mo.is_empty() {
+            body.push_str(&format!("修改时间：{mo}\n"));
+        }
+        if !ac.is_empty() {
+            body.push_str(&format!("访问时间：{ac}\n"));
+        }
+        // 只列常规页会亮出来的那三个；“存档”几乎每个文件都有，写上去只会占一行。
+        let attrs = m.file_attributes();
+        let mut at: Vec<&str> = Vec::new();
+        if attrs & FILE_ATTRIBUTE_READONLY.0 != 0 {
+            at.push("只读");
+        }
+        if attrs & FILE_ATTRIBUTE_HIDDEN.0 != 0 {
+            at.push("隐藏");
+        }
+        if attrs & FILE_ATTRIBUTE_SYSTEM.0 != 0 {
+            at.push("系统");
+        }
+        body.push_str(&format!(
+            "属性：{}\n",
+            if at.is_empty() { "无".to_string() } else { at.join("、") }
+        ));
+    } else {
+        body.push_str("（读不到这个文件的详细信息）\n");
+    }
+    if !is_dir {
+        if let Some((w, h, bpp)) = job::open_meta(&first) {
+            let depth = if bpp > 0 { format!(" · {bpp} 位") } else { String::new() };
+            body.push_str(&format!("尺寸：{w} × {h}{depth}\n"));
+        }
+    }
     open_ask(hwnd, "属性", &body, false, 0);
 }
 
@@ -14936,6 +15894,7 @@ unsafe fn paint(hwnd: HWND) {
             fill(mem, &RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom }, s.skin.win);
             g.btns.clear();
         }
+        flush_edit_ops(hwnd);
         xsee_host::viewer::paint(mem, rc);
         // 标题栏最后画：放大后的图比画布大，会画到顶上，得让它压在标题栏底下。
         {
@@ -14956,6 +15915,7 @@ unsafe fn paint(hwnd: HWND) {
     // 正拖着浮层：重绘区只有浮层走过的那条带，内容照样要画回来。
     let drag = DRAGGING.load(Ordering::Relaxed);
     render_into(hwnd, hdc, drag, &ps.rcPaint);
+    flush_edit_ops(hwnd);
     frame_end(ft, fgap, hwnd);
     let _ = EndPaint(hwnd, &ps);
 }
@@ -15191,6 +16151,9 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
     }
     SelectObject(mem, old);
     let _ = DeleteDC(mem);
+    // 命中表按"这一帧真画上屏了"的那一份导出。以前只在画转换页时导出，
+    // 面板被关掉之后文件里还是上一帧的旧坐标，照着它点就全点空。
+    conv_dump_hits(&g, &z.org);
     segmark!(7);
     // 记下这一帧画进位图的是哪个滚动位置，下一帧只挪动就搬它。
     // 位图刚重建过又只补了列表那一块的那一帧，别处还是空的，不认。
@@ -15349,6 +16312,19 @@ unsafe fn wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             let visible = ((g.sim_list.bottom - g.sim_list.top) / rh.max(1)).max(1) as usize;
             let maxs = n.saturating_sub(visible) as i32;
             g.sim_scroll = (g.sim_scroll - (d as i32 / 120) * 3).clamp(0, maxs);
+            drop(g);
+            refresh(hwnd);
+            return;
+        }
+        // 缩略图数据库页的扫描名单同一套办法：滚轮落在名单那块上就滚名单。
+        if g.dlg.as_ref().is_some_and(|d| d.kind == DlgKind::ThumbDb)
+            && g.scan_dirs.len() > SCAN_VIS
+            && over(&g.scan_list, pt.x, pt.y)
+        {
+            let rh = (22.0 * g.scale) as i32;
+            let visible = ((g.scan_list.bottom - g.scan_list.top) / rh.max(1)).max(1) as usize;
+            let maxs = g.scan_dirs.len().saturating_sub(visible) as i32;
+            g.scan_scroll = (g.scan_scroll as i32 - (d as i32 / 120) * 2).clamp(0, maxs) as usize;
             drop(g);
             refresh(hwnd);
             return;
@@ -15538,6 +16514,36 @@ fn addr_caret(xs: &[(usize, i32)], x: i32) -> usize {
     best
 }
 
+/// 把一批文件真的拖出去（OLE 模态循环），松手后按落点结果刷新。
+/// 格子和左树树行共用这一趟；2 = DROPEFFECT_MOVE：外面按移动接走了，
+/// 源文件已经不在了，不重扫一遍的话旧缩略图还钉在原位，得手动刷新才消失。
+unsafe fn run_file_drag(hwnd: HWND, paths: Vec<String>) {
+    let _ = ReleaseCapture();
+    SELF_DRAG.store(true, Ordering::SeqCst);
+    let (_, eff) = xsee_host::drag::start(paths);
+    SELF_DRAG.store(false, Ordering::SeqCst);
+    {
+        let mut g = app().lock().unwrap();
+        g.drop_hl = None;
+        if eff & 2 != 0 {
+            if matches!(g.src, Src::Folder) {
+                let d = g.dir.display().to_string();
+                g.goto(&d, hwnd, false);
+            } else {
+                g.refresh_src(hwnd);
+            }
+        }
+    }
+    refresh(hwnd);
+}
+
+/// 按下点记下的起点，拖过系统那条拖动阈值才真的起拖。
+fn drag_threshold(gone: (i32, i32)) -> bool {
+    let tx = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1);
+    let ty = unsafe { GetSystemMetrics(SM_CYDRAG) }.max(1);
+    gone.0.abs() > tx || gone.1.abs() > ty
+}
+
 unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM, keys: usize) {
     let x = (lparam.0 & 0xffff) as u16 as i16 as i32;
     let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
@@ -15553,13 +16559,12 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM, keys: usize) {
     if let Some((dx, dy)) = g.dlg_drag {
         // 按住浮层标题条拖：让浮层左上角跟住鼠标，扣掉按下时那点的偏移。
         // 只在客户区里活动，左右各留一点边，省得整页拖没了找不回来。
-        let (edge, keep, sh) = (
-            (80.0 * g.scale) as i32,
-            (30.0 * g.scale) as i32,
-            (4.0 * g.scale) as i32,
-        );
+        let k = g.scale;
+        let (edge, keep) = ((80.0 * k) as i32, (30.0 * k) as i32);
         let Some(d) = g.dlg.as_mut() else { return };
         let (nw, nh) = (d.rect.right - d.rect.left, d.rect.bottom - d.rect.top);
+        // 脏区要一直盖到影子最外那一圈，不然拖过的地方留一道旧影子。
+        let reach = shadow_off(k);
         let left = (x - dx).clamp(rc.left - nw + edge, rc.right - edge);
         let top = (y - dy).clamp(rc.top, rc.bottom - keep);
         // 顶到边上还在推：位置一动没动，这种 MOVE 一笔都不许画。
@@ -15571,8 +16576,8 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM, keys: usize) {
         let dirty = RECT {
             left: d.rect.left.min(left),
             top: d.rect.top.min(top),
-            right: d.rect.right.max(left + nw) + sh,
-            bottom: d.rect.bottom.max(top + nh) + sh,
+            right: d.rect.right.max(left + nw) + reach,
+            bottom: d.rect.bottom.max(top + nh) + reach,
         };
         d.rect = RECT { left, top, right: left + nw, bottom: top + nh };
         drop(g);
@@ -15642,11 +16647,9 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM, keys: usize) {
     }
     if let Some((sx, sy, idx0)) = g.drag_seed {
         let down = GetKeyState(VK_LBUTTON.0 as i32) < 0;
-        let tx = GetSystemMetrics(SM_CXDRAG).max(1);
-        let ty = GetSystemMetrics(SM_CYDRAG).max(1);
         if !down {
             g.drag_seed = None;
-        } else if (x - sx).abs() > tx || (y - sy).abs() > ty {
+        } else if drag_threshold((x - sx, y - sy)) {
             g.drag_seed = None;
             let paths: Vec<String> = match g.entries.get(idx0) {
                 Some(e) if g.marked.contains(&e.path) => g.marked.iter().cloned().collect(),
@@ -15654,25 +16657,19 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM, keys: usize) {
                 None => Vec::new(),
             };
             drop(g);
-            let _ = ReleaseCapture();
-            SELF_DRAG.store(true, Ordering::SeqCst);
-            let (_, eff) = xsee_host::drag::start(paths);
-            SELF_DRAG.store(false, Ordering::SeqCst);
-            {
-                let mut g = app().lock().unwrap();
-                g.drop_hl = None;
-                // 2 = DROPEFFECT_MOVE：外面按移动接走了，源文件已经不在了，
-                // 不重扫一遍的话旧缩略图还钉在原位，得手动刷新才消失。
-                if eff & 2 != 0 {
-                    if matches!(g.src, Src::Folder) {
-                        let d = g.dir.display().to_string();
-                        g.goto(&d, hwnd, false);
-                    } else {
-                        g.refresh_src(hwnd);
-                    }
-                }
-            }
-            refresh(hwnd);
+            run_file_drag(hwnd, paths);
+            return;
+        }
+    }
+    // 左树那一行也可以拖走：拖到另一行就是把这个文件夹搬进去
+    if let Some((sx, sy, path)) = g.tree_seed.clone() {
+        let down = GetKeyState(VK_LBUTTON.0 as i32) < 0;
+        if !down {
+            g.tree_seed = None;
+        } else if drag_threshold((x - sx, y - sy)) {
+            g.tree_seed = None;
+            drop(g);
+            run_file_drag(hwnd, vec![path]);
             return;
         }
     }
@@ -15750,6 +16747,12 @@ unsafe fn mouse_move(hwnd: HWND, lparam: LPARAM, keys: usize) {
         g.conv_scroll = (v * overflow as i64 / span.max(1) as i64).min(overflow as i64) as i32;
         drop(g);
         refresh(hwnd);
+        return;
+    }
+    if let Some((sid, l, rr)) = g.conv_sdrag {
+        drop(g);
+        // 拖动一路走的是 conv_command 里那同一条换算，值只可能从一处来
+        conv_command(hwnd, sid, x, &RECT { left: l, top: 0, right: rr, bottom: 0 });
         return;
     }
     if let Some((_cid, x0, y0)) = g.org_cat_drag {
@@ -15933,6 +16936,7 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
     {
         let mut g = app().lock().unwrap();
         g.drag_seed = None;
+        g.tree_seed = None;
         // 点到地址栏外面就把选区摘掉，跟正文里点一下取消选中同一个道理
         let inaddr = over(&g.addr_tr, x, y);
         if !inaddr && g.addr_sel.take().is_some() {
@@ -15960,7 +16964,10 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
             hit = rows.iter().find(|(_, r)| over(r, x, y)).map(|(i, _)| *i);
         }
         let Some(id) = hit else {
-            if let Some(ed) = app().lock().unwrap().dlg_edit {
+            // 守卫先放下再还焦点：万一焦点此刻在某个原生输入框上，
+            // SetFocus 会同步触发 EN_KILLFOCUS 回 WM_COMMAND，那里还要拿锁。
+            let ed = app().lock().unwrap().dlg_edit;
+            if let Some(ed) = ed {
                 let _ = SetFocus(Some(ed));
             }
             return;
@@ -15987,7 +16994,7 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
             D_DBCHECK => {
                 let go = {
                     let mut g = app().lock().unwrap();
-                    let is_maint = g.dlg.as_ref().is_some_and(|d| d.kind == DlgKind::DbMaint);
+                    let is_maint = g.dlg.as_ref().is_some_and(|d| d.kind == DlgKind::CatDb);
                     if is_maint && !g.db_busy {
                         g.db_maint = "正在检查数据库…".to_string();
                         true
@@ -16008,6 +17015,88 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                 };
                 let mut g = app().lock().unwrap();
                 g.db_maint = msg;
+                drop(g);
+                refresh(hwnd);
+            }
+            D_DB_PRUNE => unsafe { start_db_prune(hwnd) },
+            D_SCAN_ADD => {
+                if let Some(d) = browse_for_folder(hwnd, "挑一个要扫的文件夹") {
+                    let mut g = app().lock().unwrap();
+                    if !g.scan_dirs.iter().any(|o| o.path.eq_ignore_ascii_case(&d)) {
+                        g.scan_dirs.push(ScanRoot {
+                            path: d,
+                            last: 0,
+                            dirs: Vec::new(),
+                            exts: Vec::new(),
+                        });
+                        g.scan_sel = g.scan_dirs.len() - 1;
+                        // 新加的在名单末尾，把视图滚到能看见它。
+                        g.scan_scroll = g.scan_dirs.len().saturating_sub(SCAN_VIS);
+                        save_scan_cfg(&g.scan_dirs);
+                    }
+                    drop(g);
+                    refresh(hwnd);
+                }
+            }
+            D_SCAN_RULES => unsafe { open_rule_dlg(hwnd) },
+            D_RULE_SAVE => {
+                // 框里的字先读出来，保存进名单，规则同步给指纹关口，然后把库里
+                // 已入账、命中规则的指纹摘掉（后台跑，完事报数）。
+                let texts: Vec<String> = {
+                    let g = app().lock().unwrap();
+                    g.rule_edits.iter().map(|ed| edit_text(*ed)).collect()
+                };
+                {
+                    let mut g = app().lock().unwrap();
+                    let sel = g.scan_sel;
+                    if let Some(r) = g.scan_dirs.get_mut(sel) {
+                        r.dirs = rule_words(Some(&texts.first().cloned().unwrap_or_default()));
+                        r.exts = rule_words(Some(&texts.get(1).cloned().unwrap_or_default()));
+                    }
+                    save_scan_cfg(&g.scan_dirs);
+                    sync_scan_rules(&g.scan_dirs);
+                }
+                drop_rule_edits();
+                close_dlg(hwnd);
+                let hp = hwnd.0 as isize;
+                std::thread::spawn(move || {
+                    let n = sim::purge_excluded();
+                    {
+                        let mut g = app().lock().unwrap();
+                        g.msg = if n > 0 {
+                            format!("规则已保存：摘掉 {n} 条命中规则的已入账指纹")
+                        } else {
+                            "规则已保存：库里没有命中规则的已入账指纹".to_string()
+                        };
+                    }
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hp as *mut core::ffi::c_void)),
+                            WM_PV,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                });
+                refresh(hwnd);
+            }
+            D_SCAN_DEL => remove_scan_sel(hwnd),
+            D_SCAN_RUN => {
+                let sel = app().lock().unwrap().scan_sel;
+                unsafe { start_dir_scan(hwnd, Some(sel)) };
+            }
+            D_SCAN_ALL => unsafe { start_dir_scan(hwnd, None) },
+            D_SCAN_STOP => {
+                let mut g = app().lock().unwrap();
+                g.scan_stop.store(true, Ordering::Relaxed);
+                g.msg = "正在收尾…".to_string();
+                drop(g);
+                refresh(hwnd);
+            }
+            i if i >= D_SCAN_ROW && i < D_SCAN_ROW + SCAN_VIS => {
+                let mut g = app().lock().unwrap();
+                let maxs = g.scan_dirs.len().saturating_sub(SCAN_VIS);
+                g.scan_sel = g.scan_scroll.min(maxs) + (i - D_SCAN_ROW);
                 drop(g);
                 refresh(hwnd);
             }
@@ -16184,7 +17273,7 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                 }
             }
             D_SKIN_DIR_DEF => skin_dir_switch(hwnd, None),
-            i if i >= D_SKIN_TAB && i < D_SKIN_TAB + 4 => {
+            i if i >= D_SKIN_TAB && i < D_SKIN_TAB + 3 => {
                 let mut had_edit = false;
                 if let Some(d) = app().lock().unwrap().dlg.as_mut() {
                     d.fmt = i - D_SKIN_TAB;
@@ -16200,15 +17289,6 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
             // ── 以图搜图那一页 ──────────────────────────────────────────
             // 这页的参数是"当场生效"的：改一项就动，点开始查找才扫，
             // 不套设置窗那种"点确定才落"的草稿语义。
-            i if i >= D_SIM_SRC && i < D_SIM_SRC + 2 => {
-                let mut g = app().lock().unwrap();
-                g.sim_folder = i == D_SIM_SRC + 1;
-                if g.sim_folder && g.sim_dir.is_empty() {
-                    g.sim_lib_msg = "还没挑文件夹：按右边那个\u{201c}选文件夹\u{201d}。".to_string();
-                }
-                drop(g);
-                refresh(hwnd);
-            }
             D_TITLEBAR => {
                 // 记下按下这点离浮层左上角差多少，剩下的交给 mouse_move 平移。
                 let off = app().lock().unwrap().dlg.as_ref().map(|d| (x - d.rect.left, y - d.rect.top));
@@ -16217,24 +17297,6 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                     DRAGGING.store(true, Ordering::Relaxed);
                     let _ = SetCapture(hwnd);
                 }
-            }
-            D_SIM_DIR => {
-                if let Some(d) = browse_for_folder(hwnd, "挑一个要建指纹的文件夹") {
-                    let mut g = app().lock().unwrap();
-                    g.sim_dir = d;
-                    g.sim_folder = true;
-                    drop(g);
-                    refresh(hwnd);
-                }
-            }
-            D_SIM_FILL => unsafe { start_sim_lib(hwnd, false) },
-            D_SIM_PRUNE => unsafe { start_sim_lib(hwnd, true) },
-            D_SIM_STOP => {
-                let mut g = app().lock().unwrap();
-                g.sim_stop.store(true, Ordering::SeqCst);
-                g.sim_lib_msg = "正在收尾…".to_string();
-                drop(g);
-                refresh(hwnd);
             }
             D_SIM_AUTO => {
                 let mut g = app().lock().unwrap();
@@ -16313,10 +17375,6 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                 drop(g);
                 refresh(hwnd);
             }
-            i if i >= D_SIM_KEEP && i < D_SIM_KEEP + 2 => {
-                app().lock().unwrap().sim_to_view = i == D_SIM_KEEP + 1;
-                refresh(hwnd);
-            }
             D_SIM_GO => unsafe { start_sim_search(hwnd) },
             i if i >= D_SIM_ROW && i < D_SIM_ROW + SIM_ROWS => {
                 let (n, rev) = {
@@ -16386,8 +17444,8 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                 }
                 refresh(hwnd);
             }
-            i if i >= D_COLOR && i < D_COLOR + theme::SLOTS.len() => {
-                let slot = theme::SLOTS[i - D_COLOR].to_string();
+            i if i >= D_COLOR && i < D_COLOR + COLOR_SLOTS.len() => {
+                let slot = COLOR_SLOTS[i - D_COLOR].to_string();
                 let cur = {
                     let g = app().lock().unwrap();
                     let base = theme::skin_of(&g.skin);
@@ -16400,28 +17458,6 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                     let mut g = app().lock().unwrap();
                     if let Some(d) = g.dlg.as_mut() {
                         d.look_draft.colors.insert(slot, c);
-                    }
-                    g.apply_draft(hwnd);
-                }
-                refresh(hwnd);
-            }
-            i if i >= D_GRAD && i < D_GRAD + theme::GRAD_KEYS.len() => {
-                let key = theme::GRAD_KEYS[i - D_GRAD].to_string();
-                let cur = {
-                    let g = app().lock().unwrap();
-                    let (base, grad) = (theme::skin_of(&g.skin), theme::Grad::default());
-                    match g.dlg.as_ref() {
-                        Some(d) => {
-                            let sk = theme::preview(&base, &d.look_draft);
-                            theme::preview_grad(&grad, &d.look_draft).get(&key, &sk)
-                        }
-                        None => grad.get(&key, &base),
-                    }
-                };
-                if let Some(c) = pick_color(hwnd, cur) {
-                    let mut g = app().lock().unwrap();
-                    if let Some(d) = g.dlg.as_mut() {
-                        d.look_draft.grad.insert(key, c);
                     }
                     g.apply_draft(hwnd);
                 }
@@ -16531,8 +17567,14 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
                     refresh(hwnd);
                     return;
                 }
-                if !it.off && !tree_ctx_off(&app().lock().unwrap(), it.id) {
-                    picked = Some(it.id);
+                if !it.off {
+                    let off = {
+                        let g = app().lock().unwrap();
+                        tree_ctx_off(&g, it.id) || grid_ctx_off(&g, it.id)
+                    };
+                    if !off {
+                        picked = Some(it.id);
+                    }
                 }
             }
         }
@@ -16549,6 +17591,8 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
         }
         // 命令已经拿到落点，这里再清，免得随后的键盘命令又撞上刚才那次树右键。
         app().lock().unwrap().ctx_dir = None;
+        app().lock().unwrap().ctx_img = None;
+        app().lock().unwrap().ctx_blank = true;
         refresh(hwnd);
         return;
     }
@@ -16943,6 +17987,10 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
         {
             let mut g = app().lock().unwrap();
             g.tree_kb = true;
+            if !dbl {
+                // 记下起点：拖过阈值才把这一行当文件拖出去，普通单击不受影响
+                g.tree_seed = Some((x, y, path.clone()));
+            }
             if path == "此电脑" {
                 if dbl {
                     drop(g);
@@ -17134,7 +18182,8 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
             let a = if g.anchor == usize::MAX { g.sel } else { g.anchor };
             if a != usize::MAX {
                 let (a, b) = (a.min(hit), a.max(hit));
-                let add: Vec<String> = (a..=b)
+                // b 夹到表尾：锚点理论上已随视图重置，这里再兜一道底。
+                let add: Vec<String> = (a..=b.min(g.entries.len() - 1))
                     .filter(|&j| g.pickable(j))
                     .map(|j| g.entries[j].path.clone())
                     .collect();
@@ -17161,6 +18210,12 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
             g.sel = hit;
             g.anchor = hit;
             g.stamp += 1;
+        } else if pickable && g.marked.contains(&path) {
+            // 资源管理器规矩：按在已经选中的一项上，整组选区保留，只把光标挪过来——
+            // 不然"拖一组文件进文件夹"这一下就被压成一项，看着就像只能拖走一个。
+            g.sel = hit;
+            g.sel_lit = true;
+            g.anchor = hit;
         } else {
             // 不带修饰键的单击 = 从头只选这一个。虚拟的 `..` 只挪光标，进不了选区。
             g.marked.clear();
@@ -17207,12 +18262,42 @@ impl App {
         if d.len() > 3 && d.ends_with('\\') {
             d.pop();
         }
-        self.tsel = format!("{d}\\");
-        // 树里点出来的那一下：行停在原地，也不替用户展开节点。
+        let want = format!("{d}\\");
+        self.tsel = want;
+        // 树里点出来的那一下：不替用户展开节点。滚动位置任何时候都不由程序动。
         let keep = self.tree_noscroll;
-        self.tree_focus = !keep;
         self.tree_noscroll = false;
         if keep || d.len() < 2 {
+            return;
+        }
+        // 桌面在树顶单独占一行。从桌面或它下面的子目录进来时只走这一支，不再从
+        // 「此电脑」把 C:\ → Users → lz → Desktop 整条链展开，树里凭空多出一长串上级。
+        if let Some(i) = self.tree.iter().position(|n| {
+            let dp = n.path.trim_end_matches('\\');
+            d.eq_ignore_ascii_case(dp)
+                || (d.len() > dp.len()
+                    && d.get(..dp.len()).is_some_and(|pre| pre.eq_ignore_ascii_case(dp))
+                    && d.get(dp.len()..).is_some_and(|rest| rest.starts_with('\\')))
+        }) {
+            let desk = &mut self.tree[i];
+            let base = desk.path.clone();
+            let dp = base.trim_end_matches('\\').len();
+            desk.open = true;
+            let mut cur = base;
+            let mut nodes = &mut desk.kids;
+            let rest = d.get(dp..).unwrap_or("").trim_start_matches('\\');
+            for part in rest.split('\\').filter(|p| !p.is_empty()) {
+                cur = format!("{cur}{part}\\");
+                let Some(n) = nodes.iter_mut().find(|n| n.path.eq_ignore_ascii_case(&cur)) else {
+                    break;
+                };
+                if !n.loaded {
+                    n.kids = sub_dirs(&n.path);
+                    n.loaded = true;
+                }
+                n.open = true;
+                nodes = &mut n.kids;
+            }
             return;
         }
         let drive = format!("{}\\", &d[..2]);
@@ -17257,6 +18342,8 @@ unsafe fn accelerators() -> HACCEL {
         ACCEL { fVirt: cs, key: 0x4F, cmd: M_ORG as u16 },
         ACCEL { fVirt: cs, key: 0x45, cmd: M_PANE_PV as u16 },
         ACCEL { fVirt: cs, key: 0x46, cmd: M_PANE_TREE as u16 },
+        ACCEL { fVirt: cs, key: 0x4E, cmd: M_NEWDIR as u16 },
+        ACCEL { fVirt: cs, key: 0x56, cmd: M_VIEWER as u16 },
         ACCEL { fVirt: c, key: 0x41, cmd: M_ALL as u16 },
         ACCEL { fVirt: c, key: 0x42, cmd: M_CONV_PANEL as u16 },
         ACCEL { fVirt: c, key: 0x43, cmd: M_COPYF as u16 },
@@ -17264,8 +18351,8 @@ unsafe fn accelerators() -> HACCEL {
         ACCEL { fVirt: c, key: 0x56, cmd: M_PASTE as u16 },
         ACCEL { fVirt: c, key: 0x45, cmd: M_CONV as u16 },
         ACCEL { fVirt: c, key: 0x46, cmd: M_FIND as u16 },
-        ACCEL { fVirt: c, key: 0x4E, cmd: M_NEWDIR as u16 },
-        ACCEL { fVirt: c, key: 0x57, cmd: M_NEWWIN as u16 },
+        ACCEL { fVirt: c, key: 0x4E, cmd: M_NEWWIN as u16 },
+        ACCEL { fVirt: c, key: 0x57, cmd: M_CLOSE as u16 },
     ];
     CreateAcceleratorTableW(&table).unwrap_or(HACCEL(std::ptr::null_mut()))
 }
@@ -17275,23 +18362,52 @@ unsafe fn key(hwnd: HWND, vk: u32) {
     let alt = GetKeyState(VK_MENU.0 as i32) < 0;
     let (z, _) = layout(hwnd);
     // 正在原地改名：只有 Enter/Esc 归窗口，别的按键都留在编辑框里改字。
-    if matches!(vk, 0x0D | 0x1B) && app().lock().unwrap().ren_edit.is_some() {
+    if !alt && matches!(vk, 0x0D | 0x1B) && app().lock().unwrap().ren_edit.is_some() {
         end_rename(hwnd, vk == 0x0D);
         return;
     }
-    // 对话框开着时，键先归它：Enter 确定、Esc 关闭，其余交给里面的输入框
-    if app().lock().unwrap().dlg.is_some() {
-        match vk {
-            0x1B => {
-                if app().lock().unwrap().dlg.as_ref().map(|d| d.kind) == Some(DlgKind::FmtOpt) {
-                    back_to_conv(hwnd);
-                } else {
-                    close_dlg(hwnd);
-                }
+    // 对话框开着时，键先归它：Enter 确定、Esc 关闭，其余交给里面的输入框。
+    // 维护页多认一个 Del：删掉选中的扫描文件夹，跟「移除」按钮同一把刀。
+    // Alt 组合不归对话框（Alt+Enter 不能当成"确定"再开一层属性框）。
+    // 以图搜图那一页不模态：只有 Esc 是收页，别的键跟鼠标一样算底下那屏的。
+    // 这一档先取出来再放锁：close_dlg/dlg_ok 自己还要拿这把锁，临时 guard 活到
+    // 整个 if let 结束的话，进去就是死锁。
+    let dlg_kind = {
+        let g = app().lock().unwrap();
+        g.dlg.as_ref().map(|d| d.kind)
+    };
+    if let Some(kind) = dlg_kind {
+        if kind == DlgKind::SimSearch {
+            if vk == 0x1B && !alt {
+                close_dlg(hwnd);
+                return;
             }
-            0x0D => dlg_ok(hwnd),
-            _ => {}
+        } else {
+            if alt {
+                return;
+            }
+            match vk {
+                0x1B => {
+                    if kind == DlgKind::FmtOpt {
+                        back_to_conv(hwnd);
+                    } else {
+                        close_dlg(hwnd);
+                    }
+                }
+                0x0D => dlg_ok(hwnd),
+                0x2E => {
+                    if kind == DlgKind::ThumbDb {
+                        remove_scan_sel(hwnd);
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
+    }
+    // Shift+F10 和菜单键：跟右键同一个入口，落点在当前焦点那一项上。
+    if vk == 0x5D || (vk == 0x79 && shift) {
+        ctx_menu_key(hwnd);
         return;
     }
     // Tab / F6 在两个窗格之间换键盘焦点，和资源管理器一样。
@@ -17299,32 +18415,21 @@ unsafe fn key(hwnd: HWND, vk: u32) {
         let mut g = app().lock().unwrap();
         if g.pane_tree {
             g.tree_kb = !g.tree_kb;
-            if g.tree_kb {
-                g.tree_focus = true;
-            }
             drop(g);
             refresh(hwnd);
             return;
         }
     }
-    // 键盘焦点在树上时，方向键/回车/翻页都归树。Delete 和 F2 先不接：
-    // 现在它们按的是文件选区，在树上按下去会误伤当前目录。
-    if app().lock().unwrap().tree_kb {
-        match vk {
-            0x26 | 0x28 | 0x25 | 0x27 | 0x24 | 0x23 | 0x21 | 0x22 | 0x0D => {
-                tree_key(hwnd, vk);
-                return;
-            }
-            0x2E | 0x71 => return,
-            _ => {}
-        }
-    }
-    // Ctrl 组合键不在这里处理：它们走加速键表，中文输入法激活时也拦得住
+    // Alt 组合先认下来：树上按 Alt+Enter 是属性，不是"回车进目录"；
+    // Alt+←/→ 也始终是前进后退，不在树上折节点。
     if alt {
         let want = match vk {
             0x0D => Some(M_PROP),
+            0x43 => Some(M_COPY),
+            0x4D => Some(M_MOVE),
             0x58 => Some(M_QUIT),
             0x25 => Some(M_BACK),
+            0x26 => Some(M_UP),
             0x27 => Some(M_FWD),
             _ => None,
         };
@@ -17333,11 +18438,41 @@ unsafe fn key(hwnd: HWND, vk: u32) {
             return;
         }
     }
+    // 键盘焦点在树上时，方向键/回车/翻页都归树。Del/F2 只在树上有文件落点
+    // （不是“此电脑”）时放行，交给底下那套命令按树行执行。
+    if app().lock().unwrap().tree_kb {
+        match vk {
+            0x26 | 0x28 | 0x25 | 0x27 | 0x24 | 0x23 | 0x21 | 0x22 | 0x0D => {
+                tree_key(hwnd, vk);
+                return;
+            }
+            0x2E | 0x71 => {
+                if app().lock().unwrap().tree_focus_dir().is_none() {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Ctrl 组合键不在这里处理：它们走加速键表，中文输入法激活时也拦得住
+    let ctrl_down = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    // 小键盘排序：菜单上写的就是 NumPad 0–6。紧跟着的 WM_CHAR 要吞掉，
+    // 不然那个数字会被“打字跳条目”接走。
+    if (0x60..=0x66).contains(&vk) && !ctrl_down {
+        CHAR_SWALLOW.store(true, Ordering::SeqCst);
+    }
     let quick = match vk {
         0x70 => Some(M_HELP),
         0x71 => Some(M_RENAME),
         0x74 => Some(M_RESCAN),
         0x2E => Some(if shift { M_DEL_PERM } else { M_DEL }),
+        0x60 => Some(M_SORT_DESC),
+        0x61 => Some(M_SORT_NAME),
+        0x62 => Some(M_SORT_EXT),
+        0x63 => Some(M_SORT_SIZE),
+        0x64 => Some(M_SORT_TYPE),
+        0x65 => Some(M_SORT_DATE),
+        0x66 => Some(M_SORT_IMAGE),
         _ => None,
     };
     if let Some(id) = quick {
@@ -17355,6 +18490,8 @@ unsafe fn key(hwnd: HWND, vk: u32) {
         g.ctx_sub = None;
         g.ctx_cat = None;
         g.ctx_dir = None;
+        g.ctx_img = None;
+        g.ctx_blank = true;
         drop(g);
         // 工具栏菜单可能是带着悬停预览开着的，收掉时把那套外观还回去
         if had_b {
@@ -17445,7 +18582,9 @@ unsafe fn key(hwnd: HWND, vk: u32) {
             // 转换正在跑时，Esc 先用来停转换，别顺手把标记也清了
             if CONV_RUN.load(Ordering::SeqCst) {
                 CONV_STOP.store(true, Ordering::SeqCst);
-                app().lock().unwrap().msg = "正在停止转换，等手上这几张收尾…".to_string();
+                // 这里 g 还攥在手里，再 app().lock() 一次就是自己等自己：界面当场不动，
+                // worker 取进度时也要这把锁，跟着一起停。
+                g.msg = "正在停止转换，等手上这几张收尾…".to_string();
                 drop(g);
                 refresh(hwnd);
                 return;
@@ -17607,8 +18746,8 @@ unsafe fn menu_preview(hwnd: HWND, id: usize) {
             MENU_PREV.store(true, Ordering::SeqCst);
             g.restyle_preview(hwnd);
         }
-    } else if id > M_LAYOUT && id < M_LAYOUT + 1 + glyphs::SETS.len() {
-        let key = glyphs::SETS[id - M_LAYOUT - 1].key;
+    } else if id > M_LAYOUT && id < M_LAYOUT + 1 + glyphs::all().len() {
+        let key = glyphs::all()[id - M_LAYOUT - 1].key;
         let mut g = app().lock().unwrap();
         if g.layout.as_deref() != Some(key) {
             g.layout = Some(key.to_string());
@@ -17690,7 +18829,7 @@ fn bar_items(a: &App, btn: usize) -> Vec<BItem> {
                 }
                 sk.extend(loose);
             }
-            let ly: Vec<BItem> = glyphs::SETS
+            let ly: Vec<BItem> = glyphs::all()
                 .iter()
                 .enumerate()
                 .map(|(i, st)| {
@@ -17715,7 +18854,7 @@ fn bar_items(a: &App, btn: usize) -> Vec<BItem> {
 /// 这一项是不是"路过就换上给他看"的外观项
 fn preview_id(id: usize) -> bool {
     (id >= M_SKIN && id - M_SKIN < theme::skins().len())
-        || (id > M_LAYOUT && id < M_LAYOUT + 1 + glyphs::SETS.len())
+        || (id > M_LAYOUT && id < M_LAYOUT + 1 + glyphs::all().len())
 }
 
 /// 打开工具栏 ▾ 菜单。条目在这一刻现排，顺手把外观快照记下来，
@@ -17879,22 +19018,15 @@ unsafe fn paint_bitems(
     hover: i32,
 ) -> Vec<(usize, RECT)> {
     let k = s.scale;
+    fill(hdc, rect, s.skin.popup);
     if fine(s) {
-        vgrad(
-            hdc,
-            rect,
-            mix(s.skin.chrome_hi, s.skin.pane, 0.13),
-            mix(s.skin.chrome_hi, s.skin.canvas, 0.17),
-        );
         hline(
             hdc,
             rect.left + 1,
             rect.right - 1,
             rect.top + 1,
-            mix(s.skin.chrome_hi, s.skin.line_soft, 0.55),
+            mix(s.skin.popup, s.skin.line_soft, 0.55),
         );
-    } else {
-        fill(hdc, rect, s.skin.chrome_hi);
     }
     frame(hdc, rect, s.skin.acc);
     let pad = (8.0 * k) as i32;
@@ -17902,7 +19034,7 @@ unsafe fn paint_bitems(
     let mut rows = Vec::with_capacity(items.len());
     let mut cy = rect.top + (2.0 * k) as i32;
     for (i, it) in items.iter().enumerate() {
-        let rh = if it.sep { (6.0 * k) as i32 } else { s.row };
+        let rh = if it.sep { (6.0 * k) as i32 } else { popup_row(s) };
         let r = RECT { left: rect.left, top: cy, right: rect.right, bottom: cy + rh };
         cy += rh;
         if it.sep {
@@ -17943,7 +19075,7 @@ unsafe fn paint_bitems(
         } else if it.id != 0 {
             if let Some(g) = menuicons::find(it.id) {
                 let isz = (MENU_IC_W * k).round() as i32;
-                let ibg = if hot { tst.bar } else { s.skin.chrome_hi };
+                let ibg = if hot { tst.bar } else { s.skin.popup };
                 draw_glyph(
                     hdc,
                     g,
@@ -18009,7 +19141,7 @@ unsafe fn paint_bmenu(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
             h += (6.0 * k) as i32;
             continue;
         }
-        h += s.row;
+        h += popup_row(s);
         lw = lw.max(text_w(hdc, &it.label, a.font));
     }
     let w = (menu_text_x(k) + lw + (26.0 * k) as i32).max((150.0 * k) as i32);
@@ -18034,7 +19166,7 @@ unsafe fn paint_bmenu(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
                     h += (6.0 * k) as i32;
                     continue;
                 }
-                h += s.row;
+                h += popup_row(s);
                 lw = lw.max(text_w(hdc, &it.label, a.font));
             }
             let w2 = (menu_text_x(k) + lw + (26.0 * k) as i32).max((150.0 * k) as i32);
@@ -18066,6 +19198,18 @@ unsafe fn command(hwnd: HWND, id: usize) {
         let go = app().lock().unwrap().ask_go;
         if go != id {
             ask_delete(hwnd, id);
+            return;
+        }
+        app().lock().unwrap().ask_go = 0;
+    }
+    // 以图搜图头一回点先讲一页；说明框的「确定」带 ask_go 回来，这一趟直接进搜索页。
+    if id == M_FINDSIM {
+        let (seen, go) = {
+            let g = app().lock().unwrap();
+            (g.sim_intro, g.ask_go)
+        };
+        if !seen && go != id {
+            sim_intro(hwnd);
             return;
         }
         app().lock().unwrap().ask_go = 0;
@@ -18119,12 +19263,15 @@ unsafe fn command(hwnd: HWND, id: usize) {
         }
         M_EXPL => {
             // 转到文件：类别视图和查找结果里列的图各来自不同文件夹，这一条是
-            // 带回它自己那个文件夹的。树右键时落点就是被点的文件夹本体。
+            // 带回它自己那个文件夹的。右键落点或被键盘选中的树行就是文件夹本体。
             let p = {
                 let g = app().lock().unwrap();
-                match g.ctx_dir.clone() {
-                    Some(d) => Some(d),
-                    None => g.entries.get(g.sel).map(|e| e.path.clone()),
+                if let Some(d) = g.ctx_dir.clone() {
+                    Some(d)
+                } else if g.tree_kb {
+                    g.tree_focus_dir()
+                } else {
+                    g.entries.get(g.sel).map(|e| e.path.clone())
                 }
             };
             if let Some(p) = p {
@@ -18136,6 +19283,30 @@ unsafe fn command(hwnd: HWND, id: usize) {
             app().lock().unwrap().goto(&d, hwnd, false);
             request_pv(hwnd);
             refresh(hwnd);
+        }
+        M_TREE_REFRESH => {
+            // 只重扫右键那一行的子节点；它正好是当前目录时，格子也跟着重扫一遍
+            let d = app().lock().unwrap().ctx_dir.clone();
+            if let Some(d) = d {
+                let nm = Path::new(&d)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| d.clone());
+                let mut g = app().lock().unwrap();
+                tree_reload(&mut g.tree, &d);
+                let hit = g
+                    .dir
+                    .to_string_lossy()
+                    .trim_end_matches('\\')
+                    .eq_ignore_ascii_case(d.trim_end_matches('\\'));
+                if hit {
+                    g.goto(&d, hwnd, false);
+                }
+                g.msg = format!("已刷新 {nm} 这一层");
+                drop(g);
+                request_pv(hwnd);
+                refresh(hwnd);
+            }
         }
         M_FILT_ALL => {
             {
@@ -18277,11 +19448,19 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     _ => g.sort_desc = true,
                 }
                 g.apply_sort();
+                // 右键菜单/查看菜单改排列也当场记一笔，不等到关窗：崩了或没关干净就不丢
+                ui_save(&g, hwnd);
             }
             done_view(hwnd);
             request_pv(hwnd);
         }
         M_NEWDIR => {
+            // 类别视图底下没有落地目录，和粘贴同一个口径，别往上一处文件夹里乱建。
+            if matches!(app().lock().unwrap().src, Src::Category(_)) {
+                app().lock().unwrap().msg = "类别视图没有落地目录，请先打开一个文件夹再新建".to_string();
+                refresh(hwnd);
+                return;
+            }
             let dir = app().lock().unwrap().dir.clone();
             let mut name = "新建文件夹".to_string();
             let mut n = 2;
@@ -18294,16 +19473,26 @@ unsafe fn command(hwnd: HWND, id: usize) {
             match std::fs::create_dir(&p) {
                 Ok(()) => {
                     let d = dir.display().to_string();
-                    {
+                    let (z, _) = layout(hwnd);
+                    let idx = {
                         let mut g = app().lock().unwrap();
                         g.goto(&d, hwnd, false);
+                        // 左树里这个目录的子节点列表也要多出这一格
+                        tree_reload(&mut g.tree, &d);
                         let target = p.display().to_string();
-                        if let Some(i) = g.entries.iter().position(|e| e.path.eq_ignore_ascii_case(&target)) {
+                        let i = g.entries.iter().position(|e| e.path.eq_ignore_ascii_case(&target));
+                        if let Some(i) = i {
                             g.set_sel(i);
+                            g.keep_visible(z.grid);
                         }
-                    }
+                        i
+                    };
                     request_pv(hwnd);
                     refresh(hwnd);
+                    // 和资源管理器一样：新建完直接进改名态，名字整段选中，敲字就替换。
+                    if let Some(i) = idx {
+                        begin_rename(hwnd, i);
+                    }
                 }
                 Err(e) => {
                     app().lock().unwrap().msg = format!("新建文件夹失败：{e}");
@@ -18326,15 +19515,35 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     return;
                 }
             }
-            // 树上右键的那次：复制/剪切的是右键中的那个文件夹本体，不是格子选区。
-            let paths = match app().lock().unwrap().ctx_dir.clone() {
-                Some(d) => vec![d],
-                None => app().lock().unwrap().selected_paths(),
+            // 树上右键/键盘焦点在树上时：复制或剪切的是树上的文件夹本体，
+            // 不是格子选区。只许 lock 一次：match 的临时 guard 活到整个表达式结束，
+            // 以前 None 分支里又 lock 了一遍，std 的 Mutex 不可重入，按 Ctrl+C 整窗直接挂死。
+            let (tree, tp) = tree_target();
+            let paths = match (tree, tp) {
+                (true, Some(d)) => {
+                    let editable = {
+                        let g = app().lock().unwrap();
+                        g.tree_editable(&d)
+                    };
+                    if id == M_CUT && !editable {
+                        app().lock().unwrap().msg = "这一项不能剪切".to_string();
+                        refresh(hwnd);
+                        return;
+                    }
+                    vec![d]
+                }
+                (true, None) => {
+                    app().lock().unwrap().msg = "先在文件夹树上选一个文件夹".to_string();
+                    refresh(hwnd);
+                    return;
+                }
+                (false, _) => app().lock().unwrap().selected_paths(),
             };
             let cut = id == M_CUT;
             let r = clip::copy_paths(&paths, cut);
             {
                 let mut g = app().lock().unwrap();
+                let ok = r.is_ok();
                 g.msg = match r {
                     Ok(()) => format!(
                         "已{} {} 个文件到剪贴板",
@@ -18343,7 +19552,11 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     ),
                     Err(e) => e,
                 };
-                g.flash = Some(Instant::now());
+                // 没进剪贴板就别闪：这一下整窗提示是"办成了"的信号，
+                // 失败也闪的话，后面粘贴不出文件就找不到是复制那一步没成。
+                if ok {
+                    g.flash = Some(Instant::now());
+                }
             }
             refresh(hwnd);
         }
@@ -18355,6 +19568,30 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     Err(e) => e,
                 },
                 None => "没有选中图片".to_string(),
+            };
+            app().lock().unwrap().msg = msg;
+            refresh(hwnd);
+        }
+        M_COPYPATH => {
+            // 路径按纯文本进剪贴板：树落点优先，其次格子里的选区。多选用换行分开，
+            // 和资源管理器“复制路径”的口径一致。
+            let (tree, tp) = tree_target();
+            let paths = match (tree, tp) {
+                (true, Some(d)) => vec![d],
+                (true, None) => {
+                    app().lock().unwrap().msg = "先在文件夹树上选一个文件夹".to_string();
+                    refresh(hwnd);
+                    return;
+                }
+                (false, _) => app().lock().unwrap().selected_paths(),
+            };
+            let msg = if paths.is_empty() {
+                "没有选中文件".to_string()
+            } else {
+                match clip::copy_text(&paths.join("\r\n")) {
+                    Ok(()) => format!("已复制 {} 个路径", paths.len()),
+                    Err(e) => e,
+                }
             };
             app().lock().unwrap().msg = msg;
             refresh(hwnd);
@@ -18372,11 +19609,19 @@ unsafe fn command(hwnd: HWND, id: usize) {
                 return;
             }
             let dir = app().lock().unwrap().dir.display().to_string();
-            let (pairs, skip) = clip::paste_into(&paths, &dir, cut);
-            let mut m = format!("粘贴 {} 个文件", pairs.len());
-            if skip > 0 {
-                m.push_str(&format!("，跳过 {skip} 个（同名或失败）"));
-            }
+            let (pairs, skip, err) = clip::paste_into(&paths, &dir, cut);
+            let mut m = if pairs.is_empty() && !err.is_empty() {
+                format!("粘贴失败：{err}")
+            } else {
+                let mut s = format!("粘贴 {} 个文件", pairs.len());
+                if skip > 0 {
+                    s.push_str(&format!("，{skip} 个没过去"));
+                }
+                if !err.is_empty() {
+                    s.push_str(&format!("：{err}"));
+                }
+                s
+            };
             {
                 let mut g = app().lock().unwrap();
                 if cut && !pairs.is_empty() {
@@ -18391,17 +19636,45 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     }
                 }
                 g.msg = m;
+                // 树里那两层的缓存也要跟着改：搬走的不再钉在老位置，搬进来的要出现
+                for (old, new) in &pairs {
+                    for p in [old, new] {
+                        if let Some(par) = Path::new(p).parent() {
+                            tree_reload(&mut g.tree, &par.display().to_string());
+                        }
+                    }
+                }
+                if !pairs.is_empty() {
+                    g.flash = Some(Instant::now());
+                }
                 g.refresh_src(hwnd);
             }
             request_pv(hwnd);
         }
         M_DEL | M_DEL_PERM => {
             // 确认（只有彻底删除要）在 command() 开头做过，这里只管执行
-            // 树上右键的那次：删的是右键中的那个文件夹本体。
-            let folder = app().lock().unwrap().ctx_dir.clone();
-            let paths = match folder.clone() {
-                Some(d) => vec![d],
-                None => app().lock().unwrap().selected_paths(),
+            // 树落点：删的是右键中或键盘选中的那个文件夹本体。
+            let (tree, tp) = tree_target();
+            let folder = if tree { tp.clone() } else { None };
+            let paths = match (tree, tp) {
+                (true, Some(d)) => {
+                    let editable = {
+                        let g = app().lock().unwrap();
+                        g.tree_editable(&d)
+                    };
+                    if !editable {
+                        app().lock().unwrap().msg = "这一项不能删除".to_string();
+                        refresh(hwnd);
+                        return;
+                    }
+                    vec![d]
+                }
+                (true, None) => {
+                    app().lock().unwrap().msg = "先在文件夹树上选一个文件夹".to_string();
+                    refresh(hwnd);
+                    return;
+                }
+                (false, _) => app().lock().unwrap().selected_paths(),
             };
             if paths.is_empty() {
                 app().lock().unwrap().msg = "没有选中文件".to_string();
@@ -18447,11 +19720,20 @@ unsafe fn command(hwnd: HWND, id: usize) {
             request_pv(hwnd);
         }
         M_RENAME => {
-            // 改名只在名字那一格上原地进行，没有对话框。树右键来的改的是那一行
-            // 文件夹本体，没有树落点才改格子里光标那一项。
-            let tree = app().lock().unwrap().ctx_dir.clone();
-            if let Some(d) = tree {
-                if !app().lock().unwrap().tree_editable(&d) {
+            // 改名只在名字那一格上原地进行，没有对话框。树落点优先（右键或键盘焦点），
+            // 没有树落点才改格子里光标那一项。
+            let (tree, tp) = tree_target();
+            if tree {
+                let Some(d) = tp else {
+                    app().lock().unwrap().msg = "先在文件夹树上选一个文件夹".to_string();
+                    refresh(hwnd);
+                    return;
+                };
+                let editable = {
+                    let g = app().lock().unwrap();
+                    g.tree_editable(&d)
+                };
+                if !editable {
                     app().lock().unwrap().msg = "这一项不能改名".to_string();
                     refresh(hwnd);
                 } else if let Some(r) = tree_row_rect(hwnd, &d) {
@@ -18485,7 +19767,8 @@ unsafe fn command(hwnd: HWND, id: usize) {
         M_ASSOC => open_dlg(hwnd, DlgKind::Assoc),
         M_PROP => show_props(hwnd),
         M_SKIN_SET => open_dlg(hwnd, DlgKind::Skin),
-        M_DBMAINT => open_dlg(hwnd, DlgKind::DbMaint),
+        M_CATDB => open_dlg(hwnd, DlgKind::CatDb),
+        M_THUMBDB => open_dlg(hwnd, DlgKind::ThumbDb),
         M_HELP => open_ask(
             hwnd,
             "帮助",
@@ -18515,8 +19798,17 @@ unsafe fn command(hwnd: HWND, id: usize) {
         }
         M_FINDSIM => {
             // 多选时拿第一张：一次只能有一张当查询图，那一页上写明用的是哪张。
+            // 右键进来的直接认右键那一格的图（ctx_img），不走全局选区。
+            let q = {
+                let mut g = app().lock().unwrap();
+                g.ctx_img
+                    .take()
+                    .map(|p| vec![p])
+                    .unwrap_or_else(|| g.selected_images())
+                    .into_iter()
+                    .next()
+            };
             unsafe { open_dlg(hwnd, DlgKind::SimSearch) };
-            let q = app().lock().unwrap().selected_images().into_iter().next();
             match q {
                 Some(p) => unsafe {
                     {
@@ -18531,8 +19823,28 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     start_sim_search(hwnd);
                 },
                 None => {
-                    app().lock().unwrap().sim_lib_msg = "先在格子里点一张图片".to_string();
-                    sim_previews(hwnd);
+                    // 这一页会记住上次选的那张图。文件被删、被移走以后，再打开就只剩
+                    // 一句“原图打不开”和空预览框，看着像坏了；这里当场把死路径清掉。
+                    let mut g = app().lock().unwrap();
+                    let stale = !g.sim_path.is_empty() && !Path::new(&g.sim_path).is_file();
+                    if stale {
+                        g.sim_path.clear();
+                        g.sim_qinfo_path.clear();
+                        g.sim_qinfo.clear();
+                        g.sim_src_img = None;
+                        g.sim_hit_img = None;
+                        g.sim_hits.clear();
+                        g.sim_sel = 0;
+                        g.sim_scroll = 0;
+                        g.sim_ms = 0;
+                        g.sim_lib_msg = "上次那张图已经不在了，请重新选择".to_string();
+                    } else {
+                        g.sim_lib_msg = "先在格子里点一张图片".to_string();
+                    }
+                    drop(g);
+                    if !stale {
+                        sim_previews(hwnd);
+                    }
                     refresh(hwnd);
                 }
             }
@@ -18740,8 +20052,6 @@ unsafe fn command(hwnd: HWND, id: usize) {
                 close_conv_panel(hwnd);
             }
         }
-        M_CONV_TAB_ORG => set_dock_tab(hwnd, 0),
-        M_CONV_TAB => set_dock_tab(hwnd, 1),
         // 窗格开关：窗格头那个 ✕ 和查看菜单里那一项是同一个 id，一处口径
         M_PANE_TREE | M_PANE_PV => {
             let mut g = app().lock().unwrap();
@@ -18836,8 +20146,8 @@ unsafe fn command(hwnd: HWND, id: usize) {
                 ui_put_str("skin", &g.skin);
             }
         }
-        i if i > M_LAYOUT && i < M_LAYOUT + 1 + glyphs::SETS.len() => {
-            let key = glyphs::SETS[i - M_LAYOUT - 1].key;
+        i if i > M_LAYOUT && i < M_LAYOUT + 1 + glyphs::all().len() => {
+            let key = glyphs::all()[i - M_LAYOUT - 1].key;
             let previewed = MENU_PREV.swap(false, Ordering::SeqCst);
             *MENU_SNAP.lock().unwrap() = None;
             {
@@ -18911,6 +20221,66 @@ unsafe fn nudge_thumb(hwnd: HWND, up: bool) {
     done_view(hwnd);
 }
 
+/// Shift+F10 / 菜单键：在键盘焦点那一项上弹同一个右键菜单。
+/// 焦点在树上就落焦点行，在格子里就落光标那一格；都没有时贴格子中间。
+unsafe fn ctx_menu_key(hwnd: HWND) {
+    let (z, _) = layout(hwnd);
+    let (tree_kb, tree_path, cell, img) = {
+        let g = app().lock().unwrap();
+        if g.tree_kb {
+            (true, g.tree_focus_dir(), None, None)
+        } else if g.sel != usize::MAX {
+            let r = g.name_rect(g.sel, z.grid);
+            let e = g.entries.get(g.sel);
+            (
+                false,
+                None,
+                Some(r),
+                e.filter(|e| !e.is_dir)
+                    .map(|e| e.path.clone())
+                    .filter(|p| scan::is_image(p)),
+            )
+        } else {
+            (false, None, None, None)
+        }
+    };
+    // “此电脑”这类行没有文件落点，右键本来也不弹，键盘这边保持一致。
+    if tree_kb && tree_path.is_none() {
+        return;
+    }
+    let blank = !tree_kb && cell.is_none();
+    let (x, y, ctx_dir) = if let Some(p) = tree_path {
+        let Some(r) = tree_row_rect(hwnd, &p) else { return };
+        (r.left + 2, (r.top + r.bottom) / 2, Some(p))
+    } else if let Some(r) = cell.filter(|r| {
+        r.top >= z.grid.top && r.bottom <= z.grid.bottom && r.left >= z.grid.left && r.right <= z.grid.right
+    }) {
+        ((r.left + r.right) / 2, (r.top + r.bottom) / 2, None)
+    } else {
+        (
+            (z.grid.left + z.grid.right) / 2,
+            (z.grid.top + z.grid.bottom) / 2,
+            None,
+        )
+    };
+    let mut g = app().lock().unwrap();
+    g.open_menu = None;
+    g.open_sub = None;
+    g.ctx_at = Some((x, y));
+    g.ctx_sub = None;
+    g.ctx_tree = ctx_dir.is_some();
+    g.ctx_dir = ctx_dir;
+    g.ctx_img = img;
+    g.ctx_blank = blank;
+    g.ctx_rows.clear();
+    g.ctx_sub_rows.clear();
+    g.hover = usize::MAX;
+    g.hover_btn = None;
+    g.hover_menu = None;
+    drop(g);
+    refresh(hwnd);
+}
+
 unsafe fn ctx_menu(hwnd: HWND, lparam: LPARAM) {
     let x = (lparam.0 & 0xffff) as u16 as i16 as i32;
     let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
@@ -18946,6 +20316,8 @@ unsafe fn ctx_menu(hwnd: HWND, lparam: LPARAM) {
         g.ctx_tree = false;
         g.ctx_cat = Some((x, y));
         g.ctx_dir = None;
+        g.ctx_img = None;
+        g.ctx_blank = true;
         g.hover = usize::MAX;
         g.hover_btn = None;
         g.hover_menu = None;
@@ -18953,11 +20325,32 @@ unsafe fn ctx_menu(hwnd: HWND, lparam: LPARAM) {
         refresh(hwnd);
         return;
     }
-    let hit = app().lock().unwrap().hit(z.grid, x, y);
-    if hit != usize::MAX {
-        app().lock().unwrap().set_sel(hit);
-        request_pv(hwnd);
-    }
+    {
+        let mut g = app().lock().unwrap();
+        // 右键落在文件区，键盘焦点也收到这边来：不然树上还亮着，接下来的
+        // 复制/删除会按“树落点”认走树上那一行，而不是刚右键的这张图。
+        if over(&z.grid, x, y) {
+            g.tree_kb = false;
+        }
+        let h = g.hit(z.grid, x, y);
+        if h != usize::MAX {
+            g.set_sel(h);
+            // 右键落在哪个格子就把那张图记下来：以图搜图从右键进来时直接认它，
+            // 不经过全局选区，菜单开关之间选区被谁动了都不碍事。
+            g.ctx_img = g
+                .entries
+                .get(h)
+                .filter(|e| !e.is_dir)
+                .map(|e| e.path.clone())
+                .filter(|p| scan::is_image(p));
+            g.ctx_blank = false;
+            drop(g);
+            request_pv(hwnd);
+        } else {
+            g.ctx_img = None;
+            g.ctx_blank = true;
+        }
+    };
     // 树上右键：那一行按单击同一条路先选中再切过去，粘贴/新建文件夹才有
     // 落点，复制/删除/改名按文件夹本体算（命令那头看 ctx_dir 认）。
     // 标题条、滚动条、“此电脑”和行下面的空白都不弹这张菜单：它们没有文件层面的
@@ -18980,6 +20373,8 @@ unsafe fn ctx_menu(hwnd: HWND, lparam: LPARAM) {
             g.ctx_at = None;
             g.ctx_sub = None;
             g.ctx_dir = None;
+            g.ctx_img = None;
+            g.ctx_blank = true;
             drop(g);
             refresh(hwnd);
             return;
@@ -18989,6 +20384,8 @@ unsafe fn ctx_menu(hwnd: HWND, lparam: LPARAM) {
             g.tree_kb = true;
             g.tsel = path.clone();
             g.tree_noscroll = true;
+            g.ctx_img = None;
+            g.ctx_blank = true;
             g.goto(&path, hwnd, true);
         }
         // 树行的路径带着结尾反斜杠；存落点前摘掉（盘根的 "D:\" 原样留着），
@@ -19208,39 +20605,46 @@ fn transfer_to_folder(hwnd: HWND, paths: Vec<String>, dir: String, copy: bool) {
             use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         }
-        let mut from: Vec<u16> = Vec::new();
         let mut pairs: Vec<(String, String)> = Vec::new();
         for p in &paths {
             let src = Path::new(p);
-            let Some(name) = src.file_name() else { continue };
-            // 同名的不覆盖
-            let dst = Path::new(&dir).join(name);
-            if dst.exists() {
+            let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
                 continue;
-            }
-            from.extend(src.as_os_str().encode_wide());
-            from.push(0);
+            };
+            // 只有"复制到自己待着的那个文件夹"才直接落副本；其余撞名交给系统弹框
+            let dst_name = if copy && clip::same_folder(p, &dir) {
+                clip::copy_name(Path::new(&dir), &name)
+            } else {
+                name.clone()
+            };
+            let dst = Path::new(&dir).join(dst_name);
             pairs.push((p.clone(), dst.display().to_string()));
         }
+        // 一个一个落：pTo 给完整目标路径才落得出我们算好的名字（见 clip::shell_move）
         let mut done = 0usize;
-        if !from.is_empty() {
-            from.push(0);
-            let mut to: Vec<u16> = dir.encode_utf16().collect();
-            to.push(0);
-            to.push(0);
-            let mut op = SHFILEOPSTRUCTW {
-                wFunc: if copy { FO_COPY } else { FO_MOVE },
-                pFrom: PCWSTR(from.as_ptr()),
-                pTo: PCWSTR(to.as_ptr()),
-                fFlags: (FOF_NOCONFIRMATION.0
-                    | FOF_NOERRORUI.0
-                    | FOF_SILENT.0
-                    | FOF_NOCONFIRMMKDIR.0
-                    | FOF_ALLOWUNDO.0) as u16,
-                ..Default::default()
-            };
-            if unsafe { SHFileOperationW(&mut op) } == 0 {
-                done = 1;
+        let mut fail = 0usize;
+        let mut err = String::new();
+        for (src, dst) in &pairs {
+            match clip::shell_move(src, dst, !copy) {
+                Ok(()) => done += 1,
+                Err(e) => {
+                    fail += 1;
+                    if err.is_empty() {
+                        err = e;
+                    }
+                }
+            }
+        }
+        *DROP_ERR.lock().unwrap() = err;
+        // 动过的目录：目标那层 + 每个源的上层。树里这些节点缓存着子项，
+        // 不重扫的话搬走的文件夹还钉在老位置、搬进来的那个也不出现。
+        {
+            let mut v = DROP_DIRS.lock().unwrap();
+            v.push(dir.clone());
+            for p in &paths {
+                if let Some(par) = Path::new(p).parent() {
+                    v.push(par.display().to_string());
+                }
             }
         }
         // 真的搬过去的：源已经不在、目标已经在了。缩略图按旧图直接挂到新路径，
@@ -19257,7 +20661,7 @@ fn transfer_to_folder(hwnd: HWND, paths: Vec<String>, dir: String, copy: bool) {
             MOVED_IMGS.lock().unwrap().extend(moved);
         }
         unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_DROP_DONE, WPARAM(done), LPARAM(0));
+            let _ = PostMessageW(Some(hwnd), WM_DROP_DONE, WPARAM(done), LPARAM(fail as isize));
             windows::Win32::System::Com::CoUninitialize();
         }
     });
@@ -19541,6 +20945,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 g.ctx_sub = None;
                 g.ctx_cat = None;
                 g.ctx_dir = None;
+                g.ctx_img = None;
+                g.ctx_blank = true;
                 drop(g);
                 refresh(hwnd);
             }
@@ -19611,15 +21017,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);
-            let (title, btns) = {
+            let (title, btns, on_dlg) = {
                 let g = app().lock().unwrap();
                 let t = if xsee_host::viewer::is_open() {
                     xsee_host::viewer::title_h()
                 } else {
                     g.th.title
                 };
-                (t, g.btns.clone())
+                // 浮层能被拖到标题栏那一条上，它画在上层：那一片的点击归它。
+                // 否则 HTCAPTION 先被系统拿去拖主窗口，浮层连鼠标消息都收不到。
+                let on = g.dlg.as_ref().is_some_and(|d| over(&d.rect, pt.x, pt.y));
+                (t, g.btns.clone(), on)
             };
+            if on_dlg {
+                return LRESULT(HTCLIENT as isize);
+            }
             if pt.y < title {
                 if btns.iter().any(|(_, r)| over(r, pt.x, pt.y)) {
                     return LRESULT(HTCLIENT as isize);
@@ -19673,6 +21085,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let (z, _) = layout(hwnd);
             let mut upd = app().lock().unwrap().pump();
+            // 这一轮是不是后台有新缩略图到齐。滚停后的宽限期里只认这一笔。
+            let pumped = upd;
             // 这一帧要动到网格外头吗。提示纱盖整窗、维护页的重建进度、找相似的提示条
             // 都在网格外，照旧整窗；新缩略图上屏和格底缘那道走光只落在列表里，
             // 整窗重画一帧要四五十毫秒，滚动中撞上就是一次明显的一顿。
@@ -19697,30 +21111,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     full = true;
                 }
                 // 找相似的进度写在提示条和那一页上，借同一颗心跳，不另发消息
-                if g.sim_busy || g.sim_fill_busy {
+                if g.sim_busy {
                     upd = true;
                     full = true;
                     let d = g.sim_done.load(Ordering::Relaxed);
                     let t = g.sim_total;
-                    if let Some(t0) = g.sim_t0 {
-                        let sp = d as f64 / t0.elapsed().as_secs_f64().max(0.001);
-                        g.sim_speed = sp;
-                        if sp > g.sim_peak {
-                            g.sim_peak = sp;
-                        }
-                    }
-                    g.msg = if g.sim_fill_busy {
-                        format!("正在整理相似库：{d} / {t}")
+                    g.msg = format!("正在找相似：{d} / {t}");
+                }
+                // 维护页的两件后台活（移除无效索引、扫描文件夹）进度写在页里，
+                // 借同一颗心跳顶上去；扫描没扫完前状态栏也跟着报数。
+                if g.db_busy || g.scan_busy {
+                    upd = true;
+                    full = true;
+                }
+                if g.scan_busy {
+                    let d = g.scan_done.load(Ordering::Relaxed);
+                    g.msg = if g.scan_total == 0 {
+                        "正在扫描文件夹：翻目录找图…".to_string()
                     } else {
-                        format!("正在找相似：{d} / {t}")
+                        format!("正在扫描文件夹：{d} / {}，新增 {}", g.scan_total, g.scan_added.load(Ordering::Relaxed))
                     };
                 }
             }
-            // 惯性滚动期间（速度还在，或滚停后 400 毫秒宽限内）不插整窗/整格的重画：
-            // 出图到齐、进度走光先记一笔，滚停那一帧或宽限过后的下一次心跳一次补齐。
-            // 节拍在跑时别标 grid_stale——滚动期间旧格子照搬是条带路径的前提。
-            let scrolling = app().lock().unwrap().scrolling();
-            if scrolling {
+            // 惯性还在跑就不插任何重画：出图到齐、进度走光先记一笔，滚停那一帧或
+            // 宽限过后的心跳一次补齐。节拍在跑时别标 grid_stale——滚动期间旧格子
+            // 照搬是条带路径的前提。惯性一停就只等缩略图：宽限期内收到的新图立刻
+            // 补列表，不再空等 400 毫秒；闪纱、重建进度这些要整窗的仍旧押后。
+            let (moving, scrolling) = {
+                let g = app().lock().unwrap();
+                (g.scroll_vel != 0.0 || g.grid_drag.is_some(), g.scrolling())
+            };
+            if moving {
                 if upd {
                     if ANIM_ON.load(Ordering::Relaxed) {
                         app().lock().unwrap().anim_defer = true;
@@ -19732,6 +21153,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if DEFER_FULL.swap(false, Ordering::Relaxed) {
                 upd = true;
                 full = true;
+            } else if scrolling {
+                // 滚停后的 400 毫秒宽限期：缩略图到齐只补列表，别的整窗刷新照旧等。
+                upd = pumped;
+                full = false;
             }
             // 后台把这一层的字节数点完了：只补状态栏那一格。滚动中先不去取，
             // 等停下后的下一次心跳再取，免得为一行数字打断条带重画。
@@ -19787,10 +21212,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let src = app().lock().unwrap().src;
             {
                 let mut g = app().lock().unwrap();
-                let mut m = if wparam.0 != 0 {
+                let dirs: Vec<String> = DROP_DIRS.lock().unwrap().drain(..).collect();
+                for d in &dirs {
+                    tree_reload(&mut g.tree, d);
+                }
+                let why = DROP_ERR.lock().unwrap().clone();
+                let mut m = if wparam.0 != 0 && lparam.0 == 0 {
                     "文件已经放进文件夹".to_string()
+                } else if wparam.0 != 0 {
+                    format!("放进去 {} 个，另有 {} 个没过去：{why}", wparam.0, lparam.0)
+                } else if !why.is_empty() {
+                    format!("没搬过去：{why}")
                 } else {
-                    "没有文件搬过去（可能同名已存在）".to_string()
+                    "没有文件搬过去".to_string()
                 };
                 if !moved.is_empty() {
                     match sync_cat_paths(&mut g, &moved) {
@@ -19831,7 +21265,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let to_page = {
                 let mut g = app().lock().unwrap();
-                let open = g.dlg.as_ref().is_some_and(|d| d.kind == DlgKind::DbMaint);
+                let open = g.dlg.as_ref().is_some_and(|d| d.kind == DlgKind::CatDb);
                 if open && kind == 0 {
                     g.db_maint = msg.clone();
                 }
@@ -19850,6 +21284,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let cds = lparam.0 as *const COPYDATASTRUCT;
             if cds.is_null() || (*cds).dwData != (WM_APP + 9) as usize {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            // 编辑器只回传一个路径；外来进程灌个超大 cbData 也别照单分配。
+            if (*cds).cbData > 4096 {
+                return LRESULT(0);
             }
             let p = if (*cds).cbData > 0 && !(*cds).lpData.is_null() {
                 String::from_utf8_lossy(std::slice::from_raw_parts(
@@ -19920,8 +21358,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut a = app().lock().unwrap();
                 a.sim_busy = false;
                 a.sim_total = 0;
-                // 勾了"自动补齐"时这一步可能往库里加了条目，统计要重算一次。
-                a.sim_stat_ok = false;
                 match got {
                     Some((g, ms, hits)) if g == gid => {
                         let n = hits.len();
@@ -19930,21 +21366,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         a.sim_sel = 0;
                         a.sim_scroll = 0;
                         a.sim_lib_msg = if n == 0 {
-                            "一张都没对上。把相似度调低些，或者先按左边的\u{201c}补齐指纹\u{201d}多攒一批。".to_string()
+                            "一张都没对上。把相似度调低些，或者勾上\u{201c}查找之前先补齐\u{201d}，下次会先补库再找。".to_string()
                         } else {
                             format!("找到 {n} 张，用了 {ms} 毫秒")
                         };
-                        if a.sim_to_view {
-                            a.sim_q = Path::new(&a.sim_path.clone())
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            a.search_kw.clear();
-                            a.search_files = a.sim_hits.iter().map(|h| h.path.clone()).collect();
-                            a.page = 0;
-                            a.show_page(hwnd);
-                            a.msg = format!("找到 {n} 张相似");
-                        }
                     }
                     // 后台那条没交回结果也要把"忙"摘掉，不然下次点只会回"还没跑完"。
                     _ => a.sim_lib_msg = "查找没跑成，再点一次试试".to_string(),
@@ -19952,12 +21377,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             sim_previews(hwnd);
             request_pv(hwnd);
-            refresh(hwnd);
-            LRESULT(0)
-        }
-        WM_SIM_LIB => {
-            // 库统计缓存作废一次，下一帧重算（每帧算会把全库 exists 一遍）。
-            app().lock().unwrap().sim_stat_ok = false;
             refresh(hwnd);
             LRESULT(0)
         }
@@ -19984,6 +21403,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if !errs.is_empty() {
                     m.push_str(&format!("（{}）", errs.join("；")));
                 }
+                // 面板那条提示行同写一份：对话框发起的转换也要能在面板上看到收尾，
+                // 不然面板上挂着的还是上一批的旧话。
+                g.conv_msg = m.clone();
                 g.msg = m;
                 g.refresh_src(hwnd);
             }
@@ -20030,6 +21452,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 g.col_drag = None;
                 g.org_drag = None;
                 g.conv_drag = None;
+                g.conv_sdrag = None;
                 g.addr_anchor = None;
                 if pane_drag {
                     ui_save(&g, hwnd);
@@ -20104,7 +21527,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             key(hwnd, wparam.0 as u32);
             LRESULT(0)
         }
+        // Alt 组合从系统键进来。只把菜单上写出来的那几个转给 key()，
+        // 别的（Alt+F4、Alt+空格、菜单助记符）照旧交给系统。
+        // F10 不管带不带 Shift 都是系统键：不转进来，菜单上写的 F10=列表、
+        // Shift+F10=右键 就都落空（按下只会去碰系统菜单）。
+        WM_SYSKEYDOWN => {
+            let vk = wparam.0 as u32;
+            let alt_down = GetKeyState(VK_MENU.0 as i32) < 0;
+            if matches!(
+                vk,
+                0x0D | 0x25 | 0x26 | 0x27 | 0x43 | 0x4D | 0x58
+            ) || (vk == 0x79 && !alt_down)
+            {
+                key(hwnd, vk);
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        // 上面那几个 Alt 组合已经处理过，TranslateMessage 补出来的 WM_SYSCHAR
+        // 不能再落给系统，否则会响一声或去碰菜单助记符。大小写都算上。
+        WM_SYSCHAR => {
+            if matches!(
+                wparam.0 as u32,
+                0x0D | 0x43 | 0x63 | 0x4D | 0x6D | 0x58 | 0x78
+            ) {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        // Shift+F10 / 菜单键经系统翻成这条消息。鼠标右键走的是 WM_RBUTTONUP，
+        // 这条只处理键盘来的（lparam = -1）。
+        WM_CONTEXTMENU => {
+            if lparam.0 == -1 {
+                ctx_menu_key(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_CHAR => {
+            // 小键盘排序键后面跟着的那个数字不算打字，不然刚排完又跳走。
+            if CHAR_SWALLOW.swap(false, Ordering::SeqCst) {
+                return LRESULT(0);
+            }
             type_ahead(hwnd, wparam.0 as u16);
             LRESULT(0)
         }
@@ -20120,7 +21585,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     match id {
                         E_TW => g.conv_tw = text,
                         E_TH => g.conv_th = text,
-                        E_OUT => g.conv_out = text,
+                        E_OUT => {
+                            g.conv_out = text;
+                            // 手敲了路径就算定死了，不再跟着当前文件夹走
+                            g.conv_out_auto = false;
+                        }
                         E_WM => g.conv_wm_text = text,
                         E_RN => g.conv_rn_tpl = text,
                         _ => {}
@@ -20270,9 +21739,11 @@ fn main() {
         INIT_WALL.get_or_init(|| Mutex::new(reg_get("Wallpaper")));
         // 拖放接收：资源管理器/别的窗口拖进来的文件可以落进文件夹或直接打开
         xsee_host::viewer::set_host(hwnd);
-        let _ = xsee_host::drop::register(hwnd, drop_received, drop_is_folder, drop_hover);
-        let home = app().lock().unwrap().home.clone();
-        app().lock().unwrap().tree = build_roots(&home);
+        if !xsee_host::drop::register(hwnd, drop_received, drop_is_folder, drop_hover) {
+            // 登记不上就是这台机器彻底收不到拖放，界面不会有任何动静，这句是唯一线索。
+            app().lock().unwrap().msg = "这个窗口登记拖放接收失败，拖文件进来不会有反应".to_string();
+        }
+        app().lock().unwrap().tree = build_roots();
         probe("roots");
         // 不走 ShowWindow(SW_SHOWMAXIMIZED)：那条路上系统要先放一遍最大化过渡，
         // 窗口要过一秒多才第一次出现。直接把窗口摆到所在屏的工作区，一次 SetWindowPos 就上屏。
@@ -20311,10 +21782,22 @@ fn main() {
             if let Some(i) = g.entries.iter().position(|e| e.path == start) {
                 g.set_sel(i);
             }
+            drop(g);
+            // 从资源管理器双击进来就是要看这一张，别再让他对着格子点第二下。
+            // 只认得的后缀才这么办：不认得的留在格子里，走 shell 那条分支会
+            // 又把 Xsee 叫起来（它就是这些格式自己），双击一下起一串进程。
+            if scan::is_image(&start) {
+                spawn_viewer(Path::new(&start), hwnd);
+            }
         }
         request_pv(hwnd);
         check_menu(hwnd);
         let (z, _) = layout(hwnd);
+        // 上次退出时转换页开着，这一启动面板就已经在屏幕上，不会走 open_conv_panel；
+        // 输入框只在开面板/切页时建，缺这一下五个框全是空的（目录、宽高、水印、改名都没法填）。
+        if app().lock().unwrap().conv_open {
+            create_conv_edits(hwnd);
+        }
         app().lock().unwrap().queue_visible(z.grid);
         probe("queued");
         if probe_path.is_some() {
@@ -20421,8 +21904,14 @@ fn main() {
             // 独立窗口拿到键盘焦点时也会被配中——在他点开的参考图上按 Del
             // 就会把主窗口选中的文件删了。
             let mine = m.hwnd == hwnd;
-            // 对话框开着时不抢键：里面的输入框要吃 Enter 和字母
-            let dlg_open = app().lock().unwrap().dlg.is_some();
+            // 对话框开着时不抢键：里面的输入框要吃 Enter 和字母。
+            // 以图搜图那一页不模态：Ctrl+C/V 这类快捷键照旧归底下那屏。
+            let dlg_open = app()
+                .lock()
+                .unwrap()
+                .dlg
+                .as_ref()
+                .is_some_and(|d| d.kind != DlgKind::SimSearch);
             // 只喂按下事件：松手也交给加速键表会让同一条命令跑两遍
             let down = matches!(m.message, WM_KEYDOWN | WM_SYSKEYDOWN);
             let acc = mine

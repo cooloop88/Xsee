@@ -32,10 +32,10 @@ JPEG / PNG / BMP / TIFF / GIF 互转，每个格式各存一份自己的质量�
 把 Xsee 登记成图片格式的「打开方式」候选，每种格式配一张自己的图标牌（不是共用一个通用图标）。启动时会复查一遍这些登记，被别的程序或清理工具抹掉的会补回来。
 
 **外观**  
-皮肤 24 套（浅色系 / 深色系 / 莫兰迪 / 撞色系列，一个色系一个文件夹），配色和每块字号都能自己改，改完只覆盖在你本机。版式提供 47 套开源图标库可换。皮肤目录走两级：exe 旁边有 `skins\` 就用它，没有就用 `%LOCALAPPDATA%\xsee\skins`。
+皮肤 24 套（浅色 / 深色 / 莫兰迪 / 撞色系列，一个色系一个文件夹），配色和每块字号都能自己改，改完只覆盖在你本机。版式 47 套开源图标库可换，同样走文件：`skins\图标\` 下一套一个 `.icons`。`skins\` 目录 exe 旁边有就用它，没有就用 `%LOCALAPPDATA%\xsee\skins`，设置窗里也能单独指定。
 
 **格式**  
-JPG、PNG、BMP、GIF、TIFF、ICO、WebP、HEIC、PSD，以及常见的 RAW（NEF / CR2 / CR3 / ARW / RW2 / DNG / ORF / RAF / PEF / SRW / X3F / 3FR / FFF / IIQ）。HEIC 依赖系统解码器，装了相应扩展的机器上才出图。
+JPG、PNG、BMP、GIF、TIFF、ICO、WebP、PSD、AVIF、TGA、DDS、QOI、EXR、HDR、PNM（PBM / PGM / PPM / PAM）、JPEG XR（WDP / HDP / JXR），以及常见的 RAW（NEF / CR2 / CR3 / ARW / RW2 / DNG / ORF / RAF / PEF / SRW / X3F / 3FR / FFF / IIQ）。HEIC 和 AVIF 走系统解码器，装了相应扩展的机器上才出图。
 
 ---
 
@@ -47,7 +47,9 @@ JPG、PNG、BMP、GIF、TIFF、ICO、WebP、HEIC、PSD，以及常见的 RAW（N
 xsee\
   xsee.exe          浏览窗口
   xedit.exe         编辑窗口（浏览窗口里的编辑图像要用它，两个放同一个文件夹）
-  skins\            24 套皮肤
+  skins\
+    图标\           47 套版式图标，一套一个 .icons
+    皮肤\           24 套皮肤，按色系分文件夹
 ```
 
 把整个文件夹放哪都行。有三个小坑：
@@ -142,14 +144,16 @@ Xsee 那一格给的是墙钟不是 CPU 秒，跟前两行不能直接比大小�
 
 ## 从源码构建
 
-只在 Windows 上构建，需要 Rust（edition 2024，1.85 以上）和 Windows SDK。在仓库根目录跑：
+只在 Windows 上构建，需要 Rust（edition 2024，1.85 以上）和 Windows SDK。代码在仓库的 `host\` 目录里，进去跑：
 
 ```
 cargo build --release --bin xsee      # 浏览窗口
 cargo build --release --bin xedit     # 编辑窗口
 ```
 
-产物在 `target/release/`。`build.rs` 调 Windows SDK 自带的 `rc.exe` 把图标编进 exe；没有 `rc.exe` 时只报一条警告并跳过图标，程序照常能跑。皮肤不用编译——`skins\` 里的文件改了立刻生效，exe 里另编了一套兜底配色，所以只带一个 exe 也能完整开窗。
+产物在 `target/release/`。**界面用的 `skins\` 不会自动跟着编译产物走**：把仓库根目录的 `skins\` 复制到 exe 旁边，47 套版式和 24 套皮肤才会出现在菜单里；不拷也能跑，exe 里编了一套 Lucide 图标和一套兜底配色顶着。`skins\` 里的文件改了下次启动就生效，不用重编译。发布用的二进制开了 strip 和 thin LTO（见 `Cargo.toml` 的 `[profile.release]`），比默认 release 配置小一圈。
+
+`build.rs` 调 Windows SDK 自带的 `rc.exe` 把图标编进 exe；没有 `rc.exe` 时只报一条警告并跳过图标，程序照常能跑。
 
 直接依赖只有 7 个 crate：`image`、`jpeg-decoder`、`jpeg-encoder`、`tiff`、`crossbeam-channel`、`windows`、`windows-core`，其余是它们的传递依赖。界面不挂任何 UI 框架，Win32 调用全走 `windows` 这套绑定。`src\bin\` 下除了这两个正式窗口，还有一批开发期用的命令行探针（解码计时、图标生成、库检查等），不参与发布，可以忽略。
 
@@ -175,7 +179,7 @@ cargo build --release --bin xedit     # 编辑窗口
 - **ImageSearch**（作者 ldqk，MIT）——以图搜图的感知哈希 + 汉明距离思路，只借思路，未接入它的代码
 - **nomacs 3.22.4**（GPL-3.0）——图像编辑那批像素运算按它的功能和参数口径实现，`src/edit.rs` 与 `src/bin/xedit.rs` 的文件头注明了出处
 
-版式菜单里那 47 档工具栏图标取自 36 个开源图标库（Tabler、Lucide、Phosphor、Bootstrap Icons、Fluent、Material Symbols 等），菜单那一列固定用 Tabler 那一套。每套的上游、许可证和版权行逐条记在 [`THIRD-PARTY.md`](THIRD-PARTY.md)，许可全文在 [`LICENSES/`](LICENSES)，每枚图标对应上游哪个图标名在 `LICENSES/glyph-names.json`。仓库里带的是摊平过的 SVG 路径（内嵌在 `src/glyphs.rs` 与 `src/menuicons.rs`），不二次分发上游的原始文件。
+版式菜单里那 47 档工具栏图标取自 36 个开源图标库（Tabler、Lucide、Phosphor、Bootstrap Icons、Fluent、Material Symbols 等），菜单那一列固定用 Tabler 那一套。每套的上游、许可证和版权行逐条记在 [`THIRD-PARTY.md`](THIRD-PARTY.md)，许可全文在 [`LICENSES/`](LICENSES)，每枚图标对应上游哪个图标名在 `LICENSES/glyph-names.json`。仓库里带的是摊平过的 SVG 路径：47 套版式在 `skins\图标\*.icons`（一套一个文本文件），菜单那一列在 `src/menuicons.rs` 里编进 exe。不二次分发上游的原始文件。
 
 作者：星雨文成。
 

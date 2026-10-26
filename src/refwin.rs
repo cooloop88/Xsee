@@ -1,9 +1,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-//! 参考图画布（菜单上叫画布模式）。
+//! 参考图画布（菜单上叫参考图画布模式）。
 //!
 //! 一块置顶的黑底画布，顶上只有一条标题条，别的一概没有：参考图是开着别的软件
 //! 时拿来对照的，所以它不挂成主窗口的跟班（一挂 owner，点它就会把主窗口一起抬到
-//! 前台，把正在用的那扇盖住），也不开第二扇——再点"画布模式"是往这块画布上加一张。
+//! 前台，把正在用的那扇盖住），也不开第二扇——再点"参考图画布模式"是往这块画布上加一张。
 //! 每张图自己拖，鼠标压到图片四边或四角能等比改尺寸；滚轮不管指针在图上还是空白，
 //! 一律整块画布一起缩放（所有图按同一倍率一起变大变小，相对位置不散）。
 //! 剪贴板里出现图片时标题条会写出来；右键弹一块自绘弹层，复制、粘贴、删除都在
@@ -32,7 +32,8 @@ use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_V,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_SPACE,
+    VK_V,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
@@ -46,6 +47,32 @@ const WM_IMG: u32 = WM_APP + 30;
 const WM_UNMIN: u32 = WM_APP + 31;
 const TITLE: &str = "参考图模式";
 const TITLE_CLIP: &str = "参考图模式 · 剪贴板有图片";
+/// 偏好键在主题模块那一处（`theme::ui_get/ui_put`），这边只借它记一条
+/// "说明卡看过了"；画布别的状态都不落盘。
+const INTRO_KEY: &str = "ref_intro";
+/// 第一次开画布时压在面上的使用说明：小标题 + 正文。正文按卡片宽度自然折行，
+/// 不手写断句——窗口拉宽拉窄都不会排出一半空白。
+const INTRO: &[(&str, &str)] = &[
+    (
+        "一、把图摆上来",
+        "在主窗口选中图片，右键点「参考图画布模式」，图就摆到这块板上；再点一次是再添一张。\
+         也可以从资源管理器直接把图片拖进来，或复制图片后按 Ctrl+V 贴上来。",
+    ),
+    (
+        "二、位置和大小",
+        "按住图片拖动可以挪位置；按住空白拖动，是整块画布一起移。\
+         鼠标移到图片的四边或四角，拖动可以等比改大小。\
+         滚轮压在哪儿都行，所有图一起放大缩小，相互位置不变。\
+         右键双击图片，或把鼠标压在图上按 Delete，删掉那一张。",
+    ),
+    (
+        "三、拿来对照",
+        "画布总在最前面。拖住顶部标题条就能把它挪开，不挡正在用的软件。\
+         顶部「透明」滑块往右拖，画布底越透，能看到下面的软件，图片本身不变。\
+         在图片上右键有「复制图像」「粘贴剪贴板图片」「删除这张」，Esc 收起菜单。",
+    ),
+];
+const INTRO_FOOT: &str = "支持：拖入、粘贴、多图、单独缩放、整块缩放、背景透明、复制图像、置顶";
 /// 滚轮一格
 const STEP: f64 = 1.1;
 const SCALE_MIN: f64 = 0.02;
@@ -61,11 +88,36 @@ const PAD: i32 = 16;
 /// 会被系统当成点不着，鼠标就穿到底下软件里去了，画布拖不动、空白处也贴不成图。
 const BG_SOLID: u8 = 255;
 const BG_CLEAR: u8 = 1;
-/// 标题条那一整套（底色、渐变、字色、关闭那颗的几何和悬停画法）都从主窗口喂过来。
+/// 标题条那一整套（底色、字色、关闭那颗的几何和悬停画法）都从主窗口喂过来。
 /// 正常情况下宿主每画一次主窗口的标题栏就更新一次，换肤、换缩放这条跟着走。
 /// 只有直接命令行起画布、宿主还没画过第一帧时它是空的，那时按默认皮肤现算一条 ——
 /// 画出来仍是同一套画法，不再自己定一套深灰。
 static STRIP: Mutex<Option<crate::theme::Strip>> = Mutex::new(None);
+
+/// 对话浮层那层中性配色。说明卡照它画：以图搜图那个提示窗也是这套底，
+/// 不再拿标题栏的红主色铺满一整块。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Face {
+    pub bg: u32,
+    pub line: u32,
+    pub ink: u32,
+    pub dim: u32,
+    pub hov: u32,
+}
+
+impl Face {
+    fn of(th: &crate::theme::Theme) -> Face {
+        Face {
+            bg: th.skin.chrome_hi,
+            line: th.skin.line,
+            ink: th.skin.ink,
+            dim: th.skin.ink_dim,
+            hov: th.skin.hov,
+        }
+    }
+}
+
+static FACE: Mutex<Option<Face>> = Mutex::new(None);
 
 struct Card {
     id: usize,
@@ -203,6 +255,12 @@ struct State {
     hover: (i32, i32),
     /// 右键弹层，开着才有
     menu: Option<Menu>,
+    /// 第一次开这扇时压在上面的使用说明卡；点「知道了」以后不再出现
+    intro: bool,
+    /// 说明卡上「知道了」那颗的位置（画的时候填，点的时候用）
+    intro_btn: RECT,
+    /// 指针压在「知道了」上
+    intro_hot: bool,
 }
 
 fn state() -> &'static Mutex<Option<State>> {
@@ -210,16 +268,24 @@ fn state() -> &'static Mutex<Option<State>> {
     S.get_or_init(|| Mutex::new(None))
 }
 
+fn theme_of(dpi: i32) -> crate::theme::Theme {
+    crate::theme::Theme::new(&crate::theme::default_name(), "", dpi as f64 / 96.0)
+}
+
 /// 这条多高、什么颜色：全从主窗口那套标题栏口径拿（`set_strip` 喂进来的那份）。
 fn strip_of(dpi: i32) -> crate::theme::Strip {
     if let Some(s) = *STRIP.lock().unwrap() {
         return s;
     }
-    crate::theme::Strip::top(&crate::theme::Theme::new(
-        &crate::theme::default_name(),
-        "",
-        dpi as f64 / 96.0,
-    ))
+    crate::theme::Strip::top(&theme_of(dpi))
+}
+
+/// 说明卡那套中性底。主窗口还没画过第一帧的时候照默认皮肤现算一份。
+fn face_of(dpi: i32) -> Face {
+    if let Some(f) = *FACE.lock().unwrap() {
+        return f;
+    }
+    Face::of(&theme_of(dpi))
 }
 
 fn strip_h(dpi: i32) -> i32 {
@@ -229,13 +295,14 @@ fn strip_h(dpi: i32) -> i32 {
 /// 宿主每画一次主窗口的标题栏就把那套取色喂过来：换肤、换缩放，画布这条跟着变，
 /// 不再自己定一套深灰。一个值都没变就当没事发生 —— 这句每重画一次主窗口都会叫，
 /// 画布不能跟着一直推面。
-pub fn set_strip(st: crate::theme::Strip) {
+pub fn set_strip(st: crate::theme::Strip, face: Face) {
     {
         let mut g = STRIP.lock().unwrap();
-        if *g == Some(st) {
+        if *g == Some(st) && *FACE.lock().unwrap() == Some(face) {
             return;
         }
         *g = Some(st);
+        *FACE.lock().unwrap() = Some(face);
     }
     if let Some(h) = hwnd_of() {
         unsafe { push(h) };
@@ -427,6 +494,9 @@ fn ensure(pick: HWND) -> Option<HWND> {
             dpi,
             hover: (0, 0),
             menu: None,
+            intro: !intro_seen(),
+            intro_btn: RECT::default(),
+            intro_hot: false,
         });
         if has {
             set_title(true);
@@ -777,6 +847,33 @@ fn set_title(clip: bool) {
     }
 }
 
+/// 说明卡看过没有。读不出来（没这条、打不开键）就按没看过算 —— 宁可多讲一遍。
+fn intro_seen() -> bool {
+    crate::theme::ui_get(INTRO_KEY).is_some_and(|v| v != "0")
+}
+
+/// 记下"说明卡看过了"。主窗口那份偏好是全量写自己名单的，不删名单外的值，
+/// 这一条和它们放在一块不会互相冲掉。
+fn intro_done() {
+    crate::theme::ui_put(INTRO_KEY, Some("1"));
+}
+
+/// 收起说明卡，重推一面。画布上的图一张都不动。
+unsafe fn close_intro(hwnd: HWND) {
+    let had = {
+        let mut g = state().lock().unwrap();
+        match g.as_mut() {
+            Some(s) => std::mem::replace(&mut s.intro, false),
+            None => false,
+        }
+    };
+    if !had {
+        return;
+    }
+    intro_done();
+    push(hwnd);
+}
+
 fn clipboard_has_image() -> bool {
     unsafe {
         IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok()
@@ -966,6 +1063,7 @@ unsafe fn push(hwnd: HWND) {
     }
     paint_strip(hdc, s, px, w, h);
     paint_menu(hdc, s, px, w, h);
+    paint_intro(hdc, s, px, w, h);
     let _ = GdiFlush();
     let size = SIZE { cx: w, cy: h };
     let pos = POINT { x: org.x, y: org.y };
@@ -1068,6 +1166,36 @@ unsafe fn put(px: *mut u32, w: i32, h: i32, r: &RECT, argb: u32) {
     }
 }
 
+/// 在分层窗口的后备面上盖一层半透明灰（预乘合成，跟 UpdateLayeredWindow 那套一致）。
+/// 图片那种 alpha=255 的地方就是普通插值；背景那条 RGB 是 0，按预乘补上。
+unsafe fn veil_px(px: *mut u32, w: i32, h: i32, r: &RECT, col: u32, alpha: u8) {
+    if px.is_null() || alpha == 0 {
+        return;
+    }
+    let (x0, y0) = (r.left.max(0), r.top.max(0));
+    let (x1, y1) = (r.right.min(w), r.bottom.min(h));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let a = alpha as u32;
+    let ia = 255 - a;
+    let sr = ((col >> 16) & 0xff) * a / 255;
+    let sg = ((col >> 8) & 0xff) * a / 255;
+    let sb = (col & 0xff) * a / 255;
+    for y in y0..y1 {
+        let p = px.add(y as usize * w as usize + x0 as usize);
+        for i in 0..(x1 - x0) as usize {
+            let d = *p.add(i);
+            let da = d >> 24;
+            let dr = ((d >> 16) & 0xff) * ia / 255;
+            let dg = ((d >> 8) & 0xff) * ia / 255;
+            let db = (d & 0xff) * ia / 255;
+            let na = (a + da * ia / 255).min(255);
+            *p.add(i) = (na << 24) | ((sr + dr) << 16) | ((sg + dg) << 8) | (sb + db);
+        }
+    }
+}
+
 /// 图片占的那一片钉成不透。写在 GDI 贴完之后：不管那一路把 alpha 落成了什么，
 /// 底透多少都不该透到图片身上。
 unsafe fn opaque(px: *mut u32, w: i32, h: i32, r: &RECT) {
@@ -1104,13 +1232,9 @@ unsafe fn paint_strip(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
     s.strip = sh;
     let k = |v: i32| v * s.dpi / 96;
     let top = RECT { left: 0, top: 0, right: w, bottom: sh };
-    // 底：走渐变就一行一行往下压。这块不能交给 GDI 的渐变 —— 它只写 RGB，
+    // 底：整条铺一块纯色。这块不能交给 GDI 的填充 —— 它只写 RGB，
     // alpha 那字节抹成 0，整条就跟着背景一起透出去了。
-    for y in 0..sh {
-        let t = if st.grad && sh > 1 { y as f64 / (sh - 1) as f64 } else { 0.0 };
-        let col = if st.grad { th::mix(st.bar, st.bar_lo, t) } else { st.bar };
-        put(px, w, h, &RECT { left: 0, top: y, right: w, bottom: y + 1 }, col);
-    }
+    put(px, w, h, &top, st.bar);
     put(px, w, h, &RECT { left: 0, top: sh - 1, right: w, bottom: sh }, st.edge);
     let f = HFONT(s.font as *mut core::ffi::c_void);
     SelectObject(hdc, HGDIOBJ(f.0));
@@ -1156,11 +1280,11 @@ unsafe fn paint_strip(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
             }
         }
     }
-    let _ = SetTextColor(hdc, COLORREF(st.dim & 0x00FF_FFFF));
+    let _ = SetTextColor(hdc, th::cref(st.dim));
     let mut u: Vec<u16> = "透明".encode_utf16().collect();
     let mut lr = RECT { left: tr_left - k(10) - lab_w, top: 0, right: tr_left - k(10), bottom: sh };
     let _ = DrawTextW(hdc, &mut u, &mut lr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    let _ = SetTextColor(hdc, COLORREF(st.ink & 0x00FF_FFFF));
+    let _ = SetTextColor(hdc, th::cref(st.ink));
     let mut u: Vec<u16> = if s.clip { TITLE_CLIP } else { TITLE }.encode_utf16().collect();
     let mut nr = RECT {
         left: k(12),
@@ -1175,7 +1299,7 @@ unsafe fn paint_strip(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
     if st.tag == th::TAG_PLAIN {
         let mut u: Vec<u16> = "✕".encode_utf16().collect();
         let mut cr = s.cls;
-        let _ = SetTextColor(hdc, COLORREF(col & 0x00FF_FFFF));
+        let _ = SetTextColor(hdc, th::cref(col));
         let _ = DrawTextW(hdc, &mut u, &mut cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     } else {
         let (cx, cyy) = ((s.cls.left + s.cls.right) / 2, (s.cls.top + s.cls.bottom) / 2);
@@ -1220,6 +1344,16 @@ unsafe fn paint_menu(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
     let x = mx.clamp(2, (w - mw - 2).max(2));
     let y = my.clamp(s.strip + 2, (h - mh - 2).max(s.strip + 2));
     let panel = RECT { left: x, top: y, right: x + mw, bottom: y + mh };
+    // 跟主窗口那几类弹层同一套：同尺寸灰纱往右下让 6 像素，同一处按 50% 混，
+    // 底下压着的图透得出来。
+    let off = (4.0 * (s.dpi as f64 / 96.0)) as i32 + 1;
+    let sh = RECT {
+        left: panel.left + off,
+        top: panel.top + off,
+        right: panel.right + off,
+        bottom: panel.bottom + off,
+    };
+    veil_px(px, w, h, &sh, 0x009E9E9E, 128);
     put(px, w, h, &panel, st.bar);
     let mut rows: Vec<(usize, RECT)> = Vec::with_capacity(items.len());
     for (i, (t, id)) in items.iter().enumerate() {
@@ -1241,13 +1375,13 @@ unsafe fn paint_menu(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
         } else {
             st.ink
         };
-        let _ = SetTextColor(hdc, COLORREF(col & 0x00FF_FFFF));
+        let _ = SetTextColor(hdc, th::cref(col));
         let mut tr = RECT { left: r.left + padx, top: r.top, right: r.right - padx, bottom: r.bottom };
         let mut u: Vec<u16> = t.encode_utf16().collect();
         let _ = DrawTextW(hdc, &mut u, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         rows.push((*id, r));
     }
-    // 不投落地影，只描一圈 1 像素实框，跟主窗口那四类弹层同一个做法
+    // 一圈 1 像素实框，跟主窗口那几类弹层同一做法
     let line = th::mix(st.bar, st.fg, 0.45);
     for r in [
         RECT { left: x, top: y, right: x + mw, bottom: y + 1 },
@@ -1263,6 +1397,147 @@ unsafe fn paint_menu(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
         m.rows = rows;
         m.mw = mw;
     }
+}
+
+/// 第一次开画布时压在面上的使用说明卡。卡片里的字全部按宽度自然折行，
+/// 面板高度照量出来的定；窗口太矮时少画几段，按钮始终留在底下。
+unsafe fn paint_intro(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
+    use crate::theme as th;
+    if !s.intro {
+        return;
+    }
+    let face = face_of(s.dpi);
+    let k = |v: i32| v * s.dpi / 96;
+    let f = HFONT(s.font as *mut core::ffi::c_void);
+    SelectObject(hdc, HGDIOBJ(f.0));
+    let _ = SetBkMode(hdc, TRANSPARENT);
+
+    // 标题条以下压一层黑纱：底下的图退到背景里，说明字才读得清。
+    // 标题条那一条不动，关窗和拖窗照常按得着。
+    veil_px(px, w, h, &RECT { left: 0, top: s.strip, right: w, bottom: h }, 0x00000000, 128);
+
+    let padx = k(22);
+    let pady = k(18);
+    let gap = k(10);
+    let title_h = k(24);
+    let btn_w = k(96);
+    let btn_h = k(30);
+    let margin = k(24);
+    let top0 = s.strip + k(8);
+    let cw = k(660).min((w - margin * 2).max(k(300)));
+    let body_w = (cw - padx * 2).max(k(120));
+
+    // 按正文宽把每段量一遍，面板高度照量出来的定，不做滚动条。
+    let mut hs: Vec<(i32, i32)> = Vec::with_capacity(INTRO.len());
+    let mut content = title_h + k(12);
+    for (head, body) in INTRO {
+        let mut u: Vec<u16> = head.encode_utf16().collect();
+        let mut r = RECT { left: 0, top: 0, right: body_w, bottom: 4000 };
+        let _ = DrawTextW(hdc, &mut u, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        let hh = (r.bottom - r.top).max(k(16));
+        let mut u: Vec<u16> = body.encode_utf16().collect();
+        let mut r = RECT { left: 0, top: 0, right: body_w, bottom: 4000 };
+        let _ = DrawTextW(hdc, &mut u, &mut r, DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX);
+        let bh = (r.bottom - r.top).max(k(16));
+        hs.push((hh, bh));
+        content += hh + k(3) + bh + gap;
+    }
+    content += k(6) + btn_h;
+    let max_h = (h - top0 - margin).max(k(120));
+    let ch = (content + pady * 2).min(max_h);
+    let cx = (w - cw) / 2;
+    let cy = top0 + ((h - margin - top0 - ch) / 2).max(0);
+    let panel = RECT { left: cx, top: cy, right: cx + cw, bottom: cy + ch };
+
+    // 跟别的弹层同一套投影：同尺寸灰纱、右下让 6 像素、50% 混。
+    let off = (4.0 * (s.dpi as f64 / 96.0)) as i32 + 1;
+    let sh = RECT {
+        left: panel.left + off,
+        top: panel.top + off,
+        right: panel.right + off,
+        bottom: panel.bottom + off,
+    };
+    veil_px(px, w, h, &sh, 0x009E9E9E, 128);
+    // 底和框取对话框那层（以图搜图提示窗用的也是这一套），不拿标题栏主色
+    put(px, w, h, &panel, face.bg);
+    let line = face.line;
+    for r in [
+        RECT { left: panel.left, top: panel.top, right: panel.right, bottom: panel.top + 1 },
+        RECT { left: panel.left, top: panel.bottom - 1, right: panel.right, bottom: panel.bottom },
+        RECT { left: panel.left, top: panel.top, right: panel.left + 1, bottom: panel.bottom },
+        RECT { left: panel.right - 1, top: panel.top, right: panel.right, bottom: panel.bottom },
+    ] {
+        put(px, w, h, &r, line);
+    }
+
+    // 窗口太矮时正文会被面板底边截住：先裁进面板，再逐段判断放不放得下。
+    let dc = SaveDC(hdc);
+    let _ = IntersectClipRect(hdc, panel.left + 1, panel.top + 1, panel.right - 1, panel.bottom - 1);
+
+    let mut y = panel.top + pady;
+    let _ = SetTextColor(hdc, th::cref(face.ink));
+    let mut u: Vec<u16> = "参考图画布模式 · 使用方法".encode_utf16().collect();
+    let mut tr = RECT { left: panel.left + padx, top: y, right: panel.right - padx, bottom: y + title_h };
+    let _ = DrawTextW(hdc, &mut u, &mut tr, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    y += title_h;
+    put(
+        px,
+        w,
+        h,
+        &RECT { left: panel.left + padx, top: y + k(5), right: panel.right - padx, bottom: y + k(5) + 1 },
+        th::mix(face.bg, face.ink, 0.18),
+    );
+    y += k(12);
+
+    let btn_top = panel.bottom - pady - btn_h;
+    for (i, (head, body)) in INTRO.iter().enumerate() {
+        let (hh, bh) = hs[i];
+        if y + hh + k(3) + bh > btn_top - k(8) {
+            break;
+        }
+        let _ = SetTextColor(hdc, th::cref(face.ink));
+        let mut u: Vec<u16> = head.encode_utf16().collect();
+        let mut r = RECT { left: panel.left + padx, top: y, right: panel.right - padx, bottom: y + hh };
+        let _ = DrawTextW(hdc, &mut u, &mut r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        y += hh + k(3);
+        // 正文比小标题淡一档，段落之间才有层次
+        let _ = SetTextColor(hdc, th::cref(th::mix(face.ink, face.bg, 0.12)));
+        let mut u: Vec<u16> = body.encode_utf16().collect();
+        let mut r = RECT { left: panel.left + padx, top: y, right: panel.right - padx, bottom: y + bh };
+        let _ = DrawTextW(hdc, &mut u, &mut r, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX);
+        y += bh + gap;
+    }
+
+    // 底行：左边列一眼能用的功能，右边「知道了」。
+    let btn = RECT {
+        left: panel.right - padx - btn_w,
+        top: btn_top,
+        right: panel.right - padx,
+        bottom: btn_top + btn_h,
+    };
+    let _ = SetTextColor(hdc, th::cref(face.dim));
+    let mut u: Vec<u16> = INTRO_FOOT.encode_utf16().collect();
+    let mut fr = RECT { left: panel.left + padx, top: btn_top, right: btn.left - k(12), bottom: btn_top + btn_h };
+    let _ = DrawTextW(hdc, &mut u, &mut fr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    let bcol = if s.intro_hot { face.hov } else { face.bg };
+    put(px, w, h, &btn, bcol);
+    for r in [
+        RECT { left: btn.left, top: btn.top, right: btn.right, bottom: btn.top + 1 },
+        RECT { left: btn.left, top: btn.bottom - 1, right: btn.right, bottom: btn.bottom },
+        RECT { left: btn.left, top: btn.top, right: btn.left + 1, bottom: btn.bottom },
+        RECT { left: btn.right - 1, top: btn.top, right: btn.right, bottom: btn.bottom },
+    ] {
+        put(px, w, h, &r, line);
+    }
+    let _ = SetTextColor(hdc, th::cref(face.ink));
+    let mut u: Vec<u16> = "知道了".encode_utf16().collect();
+    let mut br = btn;
+    let _ = DrawTextW(hdc, &mut u, &mut br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    s.intro_btn = btn;
+
+    let _ = RestoreDC(hdc, dc);
+    // 面板整块钉成不透：分层面上 GDI 写完字 alpha 不可靠，透出去会糊。
+    opaque(px, w, h, &panel);
 }
 
 /// 一块实色，四角各切掉 `cut` 像素（0 = 方角，取到一半就是一枚圆）。
@@ -1361,9 +1636,73 @@ unsafe fn dib(hdc: HDC, dst: &RECT, src: &View) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let x = (lp.0 & 0xffff) as u16 as i16 as i32;
     let y = ((lp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+    // 说明卡开着时它就是这扇窗的全部界面：底下的图不许被拖、被删、被滚。
+    // 标题条那一条放行 —— 关窗、拖窗、调透明还得照常按得着。
+    let (intro, strip, on_sld) = match state().lock().unwrap().as_ref() {
+        Some(s) => (s.intro, s.strip, s.drag_sld),
+        None => (false, 0, false),
+    };
+    if intro {
+        match msg {
+            // 滑块拖出标题条时这一趟还得归它，不然拖到一半就卡住
+            WM_MOUSEMOVE if y >= strip && !on_sld => {
+                let mut dirty = false;
+                if let Some(s) = state().lock().unwrap().as_mut() {
+                    let was = s.intro_hot;
+                    s.intro_hot = over(&s.intro_btn, x, y);
+                    dirty = was != s.intro_hot;
+                }
+                if dirty {
+                    push(hwnd);
+                }
+                return LRESULT(0);
+            }
+            WM_LBUTTONDOWN if y >= strip => {
+                let on = state().lock().unwrap().as_ref().is_some_and(|s| over(&s.intro_btn, x, y));
+                if on {
+                    close_intro(hwnd);
+                }
+                return LRESULT(0);
+            }
+            // 标题条上的滑块按下时抓过鼠标，这一下松开得把抓取和拖动一起收掉，
+            // 不然它会一直跟着指针跑
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                if let Some(s) = state().lock().unwrap().as_mut() {
+                    s.drag = None;
+                    s.resize = None;
+                    s.drag_sld = false;
+                }
+                return LRESULT(0);
+            }
+            WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MOUSEWHEEL | WM_DROPFILES => {
+                return LRESULT(0);
+            }
+            // 卡片盖着的图不该冒出"改尺寸"的双向箭头，卡片区域一律保持箭头
+            WM_SETCURSOR if (lp.0 & 0xffff) as u32 == HTCLIENT => {
+                if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                    SetCursor(Some(c));
+                }
+                return LRESULT(1);
+            }
+            WM_KEYDOWN => {
+                if wp.0 == VK_ESCAPE.0 as usize
+                    || wp.0 == VK_RETURN.0 as usize
+                    || wp.0 == VK_SPACE.0 as usize
+                {
+                    close_intro(hwnd);
+                }
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
     match msg {
         WM_PAINT => {
             push(hwnd);
+            // 纯 ULW 窗口不经过 BeginPaint，更新区没人清；类样式里的 CS_HREDRAW/VREDRAW
+            // 每次改尺寸整窗失效，理论上会陷入"WM_PAINT→重画→仍脏"的自旋。补一道验证。
+            let _ = ValidateRect(Some(hwnd), None);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),

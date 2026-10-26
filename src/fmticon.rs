@@ -29,7 +29,7 @@ pub struct Fmt {
 }
 
 /// 顺序就是资源号 101.. 的顺序，改顺序会让已经设好的系统图标认错格式。
-pub const FMTS: [Fmt; 10] = [
+pub const FMTS: [Fmt; 19] = [
     Fmt { label: "JPG", ink: 0xc2762c, lit: 0xd9924d },
     Fmt { label: "PNG", ink: 0x2e8b74, lit: 0x3fae99 },
     Fmt { label: "PSD", ink: 0x5566b8, lit: 0x7a8bda },
@@ -40,6 +40,17 @@ pub const FMTS: [Fmt; 10] = [
     Fmt { label: "HEIC", ink: 0x7a68a8, lit: 0xa494d0 },
     Fmt { label: "ICO", ink: 0xb35c4e, lit: 0xd88a7d },
     Fmt { label: "RAW", ink: 0x6b7355, lit: 0x98a07c },
+    // 10.. 起是 image 库默认解码器段的格式。只准往后追加——顺序就是资源号 101..，
+    // 动了前面的号，已经注册过的系统图标会认错格式。
+    Fmt { label: "AVIF", ink: 0xa85a7a, lit: 0xc9809e },
+    Fmt { label: "TGA", ink: 0x7a8a4e, lit: 0x9db070 },
+    Fmt { label: "DDS", ink: 0x5088a8, lit: 0x74aad0 },
+    Fmt { label: "QOI", ink: 0x9a6a2e, lit: 0xbd8d55 },
+    Fmt { label: "EXR", ink: 0x4e8ac0, lit: 0x74a9d8 },
+    Fmt { label: "HDR", ink: 0x8a5a30, lit: 0xad7f55 },
+    Fmt { label: "FF", ink: 0x666f80, lit: 0x8a94aa },
+    Fmt { label: "PNM", ink: 0x7d5f96, lit: 0x9f83b8 },
+    Fmt { label: "JXR", ink: 0x8a6a9a, lit: 0xad8ec0 },
 ];
 
 /// 扩展名 → 格式牌。RAW 家族共用一个牌，具体后缀不另起颜色。
@@ -55,7 +66,17 @@ pub fn index(ext: &str) -> Option<usize> {
         "heic" => 7,
         "ico" => 8,
         "nef" | "cr2" | "cr3" | "arw" | "rw2" | "dng" | "orf" | "raf" | "pef" | "srw" | "x3f"
-        | "3fr" | "fff" | "iiq" => 9,
+        | "3fr" | "fff" | "iiq" | "crw" | "nrw" | "rwl" | "mrw" | "kdc" | "k25" | "dcr" | "erf"
+        | "mos" | "srf" | "sr2" | "raw" => 9,
+        "avif" => 10,
+        "tga" => 11,
+        "dds" => 12,
+        "qoi" => 13,
+        "exr" => 14,
+        "hdr" => 15,
+        "ff" => 16,
+        "pbm" | "pgm" | "ppm" | "pnm" | "pam" => 17,
+        "wdp" | "hdp" | "jxr" => 18,
         _ => return None,
     })
 }

@@ -316,16 +316,6 @@ pub fn resize(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
     image::imageops::resize(img, w.max(1), h.max(1), FilterType::Lanczos3)
 }
 
-pub fn resize_filter(img: &RgbaImage, w: u32, h: u32, filter: usize) -> RgbaImage {
-    let f = match filter {
-        1 => FilterType::CatmullRom,
-        2 => FilterType::Triangle,
-        3 => FilterType::Nearest,
-        _ => FilterType::Lanczos3,
-    };
-    image::imageops::resize(img, w.max(1), h.max(1), f)
-}
-
 pub fn crop(img: &RgbaImage, x: u32, y: u32, w: u32, h: u32) -> RgbaImage {
     let x = x.min(img.width().saturating_sub(1));
     let y = y.min(img.height().saturating_sub(1));

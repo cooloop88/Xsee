@@ -394,7 +394,12 @@ impl CatEdit {
             }
         }
         if let Some(set) = self.by_path.remove(old) {
-            self.by_path.entry(new_s).or_default().extend(set);
+            self.by_path.entry(new_s.clone()).or_default().extend(set);
+        }
+        // 入库时间跟着搬：不然新路径没有 T 行，"按入库时间"名单里这张图就丢了，
+        // 等以后浏览到才以当下时间重新记入，原始时间永久丢失。
+        if let Some(t) = self.times.remove(old) {
+            self.times.entry(new_s.clone()).or_insert(t);
         }
         self.rebuild_counts();
     }
@@ -410,6 +415,9 @@ impl CatEdit {
         for id in ids {
             self.mark_remove(id, p);
         }
+        // T 行跟着摘掉，不然死条目要等"检查数据库"才清；同路径再来新文件
+        // 还会沿用旧时间戳。
+        self.times.remove(p);
         self.rebuild_counts();
     }
 

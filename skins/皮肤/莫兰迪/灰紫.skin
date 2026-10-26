@@ -1,0 +1,30 @@
+# 银白撞色 · 莫兰迪变体：中性骨架不动，强调色压到低彩度（H 310, C 0.048）。
+# 标记色取低彩度互补色，保留原版的双色落点关系。
+name=莫兰迪·灰紫
+style=cards_rich
+order=26
+default=0
+base=0xdfe2e3
+surface=0xecedee
+canvas=0xf1f2f3
+ink=0x121415
+dim=0x55595b
+accent=0x867693
+border=0xc6cbcd
+mark=0x718161
+chrome=0xecedee
+chrome_hi=0xf6f7f7
+pane=0xf9fafa
+pane_head=0xe8eaea
+grid=0xffffff
+line=0xc6cbcd
+line_soft=0xdadcdd
+off=0x8b9092
+inv=0xffffff
+hov=0xe5e7e8
+prs=0xd9dcde
+sel=0x695a74
+sel_ink=0xffffff
+acc_soft=0xece3eb
+flash=0xeef0f0
+focus=0x867693

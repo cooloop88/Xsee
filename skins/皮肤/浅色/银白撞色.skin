@@ -1,0 +1,33 @@
+# F 新：冷银白骨架 × 两个彩色落点（焦橙、孔雀蓝）。
+# 旧版七个面色度全等于 4——就是纯灰，强调色也是洗过的灰青，四套里最闷。
+# 骨架走干净银白阶梯，彩色只给三处：强调/选中底=焦橙，标记=孔雀蓝。
+name=银白撞色
+style=cards_rich
+order=21
+default=0
+
+base=0xdfe2e3
+surface=0xecedee
+canvas=0xf1f2f3
+ink=0x121415
+dim=0x55595b
+accent=0xd9600f
+border=0xc6cbcd
+mark=0x0e7d8f
+
+chrome=0xecedee
+chrome_hi=0xf6f7f7
+pane=0xf9fafa
+pane_head=0xe8eaea
+grid=0xffffff
+line=0xc6cbcd
+line_soft=0xdadcdd
+off=0x8b9092
+inv=0xffffff
+hov=0xe5e7e8
+prs=0xd9dcde
+sel=0x9c4205
+sel_ink=0xffffff
+acc_soft=0xf6e0cb
+flash=0xeef0f0
+focus=0xd9600f

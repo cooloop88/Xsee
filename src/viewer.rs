@@ -136,6 +136,9 @@ struct Cur {
     nav_show: bool,
     /// 手上这张 view 是不是全尺寸解出来的。快速帧不能把清晰图盖回去。
     src_full: bool,
+    /// 手上这张全尺寸 view 当初是按哪个盒子解的。同图同盒再次 show() 时
+    /// 解码线程直接跳过，缩放键/F↔1/改窗口尺寸不再每次都重解一张大图。
+    full_box: (u32, u32),
 }
 
 struct Zones {
@@ -523,6 +526,16 @@ fn follow() {
             let Some(path) = files.get(want).cloned() else { break };
             let (nw, nh) = job::open_size(&path).unwrap_or((1, 1));
             let (bw, bh) = box_for(mode, (a.right - a.left).max(1) as u32, (a.bottom - a.top).max(1) as u32, nw, nh);
+            // 同一张图、同一个解码盒，手上那张清晰 view 就是这个产物：直接跳过。
+            // 缩放键、F↔1、改窗口尺寸全走 show()，没有这道检查每次都是一次全尺寸重解码。
+            let have = {
+                let g = app().lock().unwrap();
+                g.as_ref().is_some_and(|c| c.idx == want && c.src_full && c.full_box == (bw, bh))
+            };
+            if have {
+                done = want;
+                break;
+            }
             let t = Instant::now();
             let Ok(v) = job::decode_view(&path, bw, bh) else {
                 // 这张解不开就记下，别让收尾把它当成没处理而一直重试
@@ -548,11 +561,11 @@ fn follow() {
 
 /// 清晰图到了才换画面；已经翻到别张就丢弃（结果留在 CACHE 里，翻回去不用重解）。
 pub fn clear_msg(idx: usize) -> bool {
-    let Some((view, ms)) = cache()
+    let Some((bw, bh, view, ms)) = cache()
         .lock()
         .unwrap()
         .take_if(|c| c.0 == idx)
-        .map(|c| (c.3, c.4))
+        .map(|c| (c.1, c.2, c.3, c.4))
     else {
         return false;
     };
@@ -564,6 +577,7 @@ pub fn clear_msg(idx: usize) -> bool {
     c.view = view;
     c.ms = ms;
     c.src_full = true;
+    c.full_box = (bw, bh);
     drop(g);
     set_title();
     true
@@ -979,6 +993,10 @@ fn run(k: K) -> Act {
         K::Refresh => {
             *cache().lock().unwrap() = None;
             *QUICK.lock().unwrap() = None;
+            // 命中检查认的是手上那张 view；刷新要真重解，就得把这个记录一并抹掉。
+            if let Some(c) = app().lock().unwrap().as_mut() {
+                c.full_box = (0, 0);
+            }
             show(current());
             Act::Nothing
         }
@@ -1212,16 +1230,20 @@ pub fn mouse(msg: u32, wparam: WPARAM, x: i32, y: i32) -> Act {
                 }
             }
             if over(&z.area, x, y) {
-                let mut g = app().lock().unwrap();
-                if let Some(c) = g.as_mut() {
-                    // 放大态：左键按住拖图；整张态：左键拖出选框，松手放大。
-                    if c.mode == Mode::Actual {
-                        c.pan = Some((x, y, c.panx, c.pany));
-                    } else {
-                        c.sel = Some((x, y, x, y));
-                        c.drag = true;
+                {
+                    let mut g = app().lock().unwrap();
+                    if let Some(c) = g.as_mut() {
+                        // 放大态：左键按住拖图；整张态：左键拖出选框，松手放大。
+                        if c.mode == Mode::Actual {
+                            c.pan = Some((x, y, c.panx, c.pany));
+                        } else {
+                            c.sel = Some((x, y, x, y));
+                            c.drag = true;
+                        }
                     }
                 }
+                // SetCapture 挪在放锁之后：捕获转移会同步发 WM_CAPTURECHANGED，
+                // 哪天有人让它重入拿这把锁就是当场自锁（refwin 那边是拿锁前调的）。
                 unsafe {
                     let _ = SetCapture(h);
                 }
@@ -1379,6 +1401,7 @@ pub fn open(path: &str, files: Option<Vec<String>>) -> bool {
         nav: 0,
         nav_show: false,
         src_full: false,
+        full_box: (0, 0),
     });
     *cache().lock().unwrap() = None;
     *QUICK.lock().unwrap() = None;

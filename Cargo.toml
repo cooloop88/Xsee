@@ -3,6 +3,13 @@ name = "xsee_host"
 version = "0.1.0"
 edition = "2024"
 
+# 发布版体积优先：strip 去符号，LTO + 单 codegen unit 合并代码段（全量重编约 3 分半）。
+# 不用 panic="abort"：线程 panic 时让它死线程不杀进程，别的线程还能收尾。
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [lib]
 name = "xsee_host"
 path = "src/lib.rs"
@@ -32,6 +39,8 @@ name = "view"
 path = "src/bin/view.rs"
 
 [dependencies]
+# 认的格式是这七种起步，avif/exr/tga 等默认格式段也要保留（用户点名要支持）——
+# 不关 default，多链的解码器是格式支持不是肥肉。其余格式（heic/psd/raw）走 WIC/自写解码。
 image = { version = "0.25.10", features = ["png", "jpeg", "bmp", "gif", "tiff", "ico", "webp"] }
 jpeg-decoder = "0.3.2"
 crossbeam-channel = "0.5.17"

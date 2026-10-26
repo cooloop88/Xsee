@@ -1,6 +1,6 @@
 # 第三方图标许可清单
 
-界面里那 47 档工具栏图标不是本项目画的，是从 36 个开源图标项目里各取十枚，把 SVG 路径摊平后内嵌进 `src/glyphs.rs`。菜单（顶部菜单、右键菜单、子菜单）左边那一列 62 枚固定在 Tabler·线 这一套上，不跟版式换，出处同样落在下面第一条。这里逐条记下上游、许可证、版权行和各自的硬性要求。
+界面里那 47 档工具栏图标不是本项目画的，是从 36 个开源图标项目里各取十枚，把 SVG 路径摊平后存成 `skins/图标/*.icons`（一套一个文件，仓库里带着）。菜单（顶部菜单、右键菜单、子菜单）左边那一列 62 枚固定在 Tabler·线 这一套上，不跟版式换，出处同样落在下面第一条。这里逐条记下上游、许可证、版权行和各自的硬性要求。
 
 取图途径统一走 Iconify 的 `@iconify-json/<集合>` 数据包，许可证按上游项目的算。每一档每一枚用的是上游哪个图标名，记在 `LICENSES/glyph-names.json`（档位 key → 命令 → 图标名），下游要逐枚核对出处就照这份查。
 
@@ -8,7 +8,7 @@
 
 ## 核对过、已经处理掉的三处
 
-1. **Remix Icon（原 `ri_line` / `ri_fill`）**——上游在 2026-01-25 把许可证从 Apache-2.0 换成了自定的 “Remix Icon License v1.0”，第 9 条写明图标始终受该协议约束，并警告它与强制开源（copyleft / share-alike）类许可可能不兼容。本项目按 GPL-3.0 发布正好撞上这一条，**这两档已整体摘除**，`src/glyphs.rs` 里不再有它们的图形和路径。
+1. **Remix Icon（原 `ri_line` / `ri_fill`）**——上游在 2026-01-25 把许可证从 Apache-2.0 换成了自定的 “Remix Icon License v1.0”，第 9 条写明图标始终受该协议约束，并警告它与强制开源（copyleft / share-alike）类许可可能不兼容。本项目按 GPL-3.0 发布正好撞上这一条，**这两档已整体摘除**，`skins/图标/` 下不再有它们的文件，代码里也不再留图形和路径。
 2. **Basil（原 `basil`）**——Iconify 与 npm 都记 CC BY 4.0，但上游 Craftwork 没有带 LICENSE 的代码仓库，而其现行条款（2026-10-06 生效）写着“不得拿图标做图标库 / npm 包给别人”“免费素材不得再分发或分享”。两种说法直接冲突且取不到作者第一手原文，**这一档也已整体摘除**。
 3. **品牌图标（`mdi`、`bi`）**——Material Design Icons 的许可表脚注写明 Brand / Logos 那一类图标不在此许可覆盖内；Bootstrap Icons 的仓库里也混着 github、facebook 这类品牌图形，而 MIT/Apache 都不授予商标权。这两档各十枚的实际图标名已在 `LICENSES/glyph-names.json` 里逐枚列出：`bi` 是 chevron-double-left / chevron-double-right、arrow-bar-up、search、pencil、arrow-right-square、copy、trash、info-circle、palette；`mdi` 是 chevron-double-left / chevron-double-right、arrow-up、search、pencil、folder-move、clipboard、trash、info-circle、palette。两档**全是功能图形，没有一枚品牌 logo**，因此保留，不必删。新增图标时仍要按这一条口径复查。
 
@@ -55,7 +55,7 @@
 
 ## 随附文件
 
-`LICENSES/` 目录放五种许可全文：`MIT.txt`、`ISC.txt`、`Apache-2.0.txt`、`Unlicense.txt`、`CC-BY-4.0.txt`，外加 `glyph-names.json`（47 档 × 10 枚对应的上游图标名）。Apache-2.0 那几家（MingCute、Material Symbols、MDI 图标、Carbon、IconPark、Grommet）要求“注明这些文件被改过”：`src/glyphs.rs` 里的路径是从上游 SVG 摊平、并把 Q/T 二次曲线换成三次贝塞尔之后的结果，属于已修改，这层说明写在 `src/glyphs.rs` 的头部注释里。
+`LICENSES/` 目录放五种许可全文：`MIT.txt`、`ISC.txt`、`Apache-2.0.txt`、`Unlicense.txt`、`CC-BY-4.0.txt`，外加 `glyph-names.json`（47 档 × 10 枚对应的上游图标名）。Apache-2.0 那几家（MingCute、Material Symbols、MDI 图标、Carbon、IconPark、Grommet）要求“注明这些文件被改过”：`skins/图标/*.icons` 里的路径是从上游 SVG 摊平、并把 Q/T 二次曲线换成三次贝塞尔之后的结果，属于已修改；这层说明写在每个 `.icons` 的头部注释里，也写在 `src/glyphs.rs` 的头部注释里。
 
 `system_uicons` 是 Unlicense，随附与否都不欠；这里仍然列出来，只是为了让下游能追溯到上游。
 

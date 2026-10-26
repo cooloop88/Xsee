@@ -27,10 +27,12 @@ use windows::Win32::System::Registry::{
     RegSetValueExW,
 };
 
-pub const SLOTS: [&str; 22] = [
+pub const SLOTS: [&str; 24] = [
     "base",
     "chrome",
     "chrome_hi",
+    "menu",
+    "popup",
     "canvas",
     "pane",
     "pane_head",
@@ -147,6 +149,10 @@ pub struct Skin {
     pub win: u32,
     pub chrome: u32,
     pub chrome_hi: u32,
+    /// 顶部菜单条自己的底色。原来拿 chrome 和 canvas 现算一档，现在独立成槽。
+    pub menu: u32,
+    /// 下拉弹出菜单的底色。原来跟 chrome_hi 共用，现在单独一槽，菜单条和弹层能各配各的。
+    pub popup: u32,
     pub canvas: u32,
     pub pane: u32,
     pub pane_head: u32,
@@ -170,92 +176,6 @@ pub struct Skin {
     pub focus: u32,
 }
 
-/// 渐变槽。None 表示按当前皮肤颜色现算，显式值才覆盖。
-/// 只列主视窗里真正由多种颜色组成的几处；1px 蚀刻边不在这里，它跟着 line/base 走。
-#[derive(Clone, Copy, Default)]
-pub struct Grad {
-    pub ground_hi: Option<u32>,
-    pub ground_lo: Option<u32>,
-    pub card_hi: Option<u32>,
-    pub card_mid: Option<u32>,
-    pub card_lo: Option<u32>,
-    pub tool_a: Option<u32>,
-    pub tool_b: Option<u32>,
-    pub tree_sel_a: Option<u32>,
-    pub tree_sel_b: Option<u32>,
-}
-
-pub const GRAD_KEYS: [&str; 9] = [
-    "ground_hi",
-    "ground_lo",
-    "card_hi",
-    "card_mid",
-    "card_lo",
-    "tool_a",
-    "tool_b",
-    "tree_sel_a",
-    "tree_sel_b",
-];
-
-impl Grad {
-    pub fn ground_hi(&self, s: &Skin) -> u32 {
-        self.ground_hi.unwrap_or_else(|| mix(s.chrome, s.canvas, 0.14))
-    }
-    pub fn ground_lo(&self, s: &Skin) -> u32 {
-        self.ground_lo.unwrap_or_else(|| mix(s.chrome, s.canvas, 0.48))
-    }
-    pub fn card_hi(&self, s: &Skin) -> u32 {
-        self.card_hi.unwrap_or(s.chrome_hi)
-    }
-    pub fn card_mid(&self, s: &Skin) -> u32 {
-        self.card_mid.unwrap_or(s.chrome)
-    }
-    pub fn card_lo(&self, s: &Skin) -> u32 {
-        self.card_lo.unwrap_or(s.pane)
-    }
-    pub fn tool_a(&self, s: &Skin) -> u32 {
-        self.tool_a.unwrap_or(s.chrome)
-    }
-    pub fn tool_b(&self, s: &Skin) -> u32 {
-        self.tool_b.unwrap_or(s.chrome_hi)
-    }
-    pub fn tree_sel_a(&self, s: &Skin) -> u32 {
-        self.tree_sel_a.unwrap_or_else(|| mix(s.canvas, s.sel, 0.42))
-    }
-    pub fn tree_sel_b(&self, s: &Skin) -> u32 {
-        self.tree_sel_b.unwrap_or(s.sel)
-    }
-    pub fn get(&self, key: &str, s: &Skin) -> u32 {
-        match key {
-            "ground_hi" => self.ground_hi(s),
-            "ground_lo" => self.ground_lo(s),
-            "card_hi" => self.card_hi(s),
-            "card_mid" => self.card_mid(s),
-            "card_lo" => self.card_lo(s),
-            "tool_a" => self.tool_a(s),
-            "tool_b" => self.tool_b(s),
-            "tree_sel_a" => self.tree_sel_a(s),
-            "tree_sel_b" => self.tree_sel_b(s),
-            _ => 0,
-        }
-    }
-    pub fn set(&mut self, key: &str, c: u32) -> bool {
-        match key {
-            "ground_hi" => self.ground_hi = Some(c),
-            "ground_lo" => self.ground_lo = Some(c),
-            "card_hi" => self.card_hi = Some(c),
-            "card_mid" => self.card_mid = Some(c),
-            "card_lo" => self.card_lo = Some(c),
-            "tool_a" => self.tool_a = Some(c),
-            "tool_b" => self.tool_b = Some(c),
-            "tree_sel_a" => self.tree_sel_a = Some(c),
-            "tree_sel_b" => self.tree_sel_b = Some(c),
-            _ => return false,
-        }
-        true
-    }
-}
-
 /// 界面上分得出来的十块。字号按块给：改哪一块，只有那一块的字跟着变。
 /// 键是写进个人覆盖文件的那一个（`z.<键>=字号`、`zb.<键>=1`），中文名只给设置页看。
 pub const ZONES: [(&str, &str); 10] = [
@@ -265,7 +185,7 @@ pub const ZONES: [(&str, &str); 10] = [
     ("tree", "文件夹树"),
     ("pv", "预览详情"),
     ("grid", "缩略图标题"),
-    ("org", "整理面板"),
+    ("org", "图片分类"),
     ("status", "状态栏"),
     ("popup", "弹出菜单"),
     ("dlg", "对话框"),
@@ -291,7 +211,7 @@ pub const ZONE_DEF: [i32; NZ] = [13, 13, 16, 13, 13, 13, 13, 13, 13, 13];
 /// 不能十块全拿同一支笔糊过去。
 pub const ZONE_INK: [&str; NZ] = ["ink", "ink", "ink", "ink", "dim", "ink", "ink", "dim", "ink", "ink"];
 /// 一套“在皮肤文件之上的个人改动”。按皮肤名分文件存，换皮肤就换回那套改动；
-/// 颜色与渐变都是槽位覆盖，字体是按版块的字档（逻辑值，100% 缩放）。
+/// 颜色是槽位覆盖，字体是按版块的字档（逻辑值，100% 缩放）。
 #[derive(Clone, Default)]
 pub struct Look {
     pub face: Option<String>,
@@ -301,7 +221,6 @@ pub struct Look {
     /// 每块自己的文字主色。没记的那块跟全局“正文”走。
     pub zone_c: HashMap<String, u32>,
     pub colors: HashMap<String, u32>,
-    pub grad: HashMap<String, u32>,
 }
 
 impl Look {
@@ -386,11 +305,6 @@ impl Look {
                         l.colors.insert(k[2..].to_string(), c);
                     }
                 }
-                _ if k.starts_with("g.") => {
-                    if let Ok(c) = parse_hex(v) {
-                        l.grad.insert(k[2..].to_string(), c);
-                    }
-                }
                 _ => {}
             }
         }
@@ -442,11 +356,6 @@ impl Look {
         for (k, c) in colors {
             out.push_str(&format!("c.{k}=0x{c:06x}\n"));
         }
-        let mut grads: Vec<_> = self.grad.iter().collect();
-        grads.sort_by(|a, b| a.0.cmp(b.0));
-        for (k, c) in grads {
-            out.push_str(&format!("g.{k}=0x{c:06x}\n"));
-        }
         let _ = std::fs::write(p, out);
     }
 }
@@ -473,7 +382,7 @@ fn layout_file() -> PathBuf {
 }
 
 /// 全局版式偏好：None = 内置的圆角仪表（工具栏图标也是内置那一套）；
-/// Some = 某套开源图标库的 key（见 glyphs::SETS）。
+/// Some = 某套开源图标库的 key（见 glyphs::all()）。
 /// 这里故意不放进 Look：Look 是按皮肤保存的个人覆盖，版式要跨配色保留。
 pub fn saved_layout() -> Option<String> {
     let Ok(text) = std::fs::read_to_string(layout_file()) else {
@@ -526,6 +435,8 @@ impl Skin {
             "base" => self.win,
             "chrome" => self.chrome,
             "chrome_hi" => self.chrome_hi,
+            "menu" => self.menu,
+            "popup" => self.popup,
             "canvas" => self.canvas,
             "pane" => self.pane,
             "pane_head" => self.pane_head,
@@ -555,6 +466,8 @@ impl Skin {
             "base" => self.win = c,
             "chrome" => self.chrome = c,
             "chrome_hi" => self.chrome_hi = c,
+            "menu" => self.menu = c,
+            "popup" => self.popup = c,
             "canvas" => self.canvas = c,
             "pane" => self.pane = c,
             "pane_head" => self.pane_head = c,
@@ -595,10 +508,13 @@ impl Skin {
         let inv = if lum(base) > 0.5 { 0xffffff } else { 0x0a0a0a };
         let tint = |over: f64| mix(surface, accent, over);
         let acc = get("accent", accent);
+        let chrome_hi = get("chrome_hi", lighten(surface, 0.04));
         Skin {
             win: get("base", base),
             chrome: get("chrome", surface),
-            chrome_hi: get("chrome_hi", lighten(surface, 0.04)),
+            chrome_hi,
+            menu: get("menu", mix(surface, canvas, 0.26)),
+            popup: get("popup", chrome_hi),
             canvas: get("canvas", canvas),
             pane: get("pane", canvas),
             pane_head: get("pane_head", mix(surface, base, 0.5)),
@@ -637,6 +553,8 @@ impl Skin {
         };
         want(&mut self.ink, self.canvas, 4.5, "ink/canvas");
         want(&mut self.ink, self.chrome, 4.5, "ink/chrome");
+        want(&mut self.ink, self.menu, 4.5, "ink/menu");
+        want(&mut self.ink, self.popup, 4.5, "ink/popup");
         want(&mut self.ink_dim, self.canvas, 3.0, "dim/canvas");
         want(&mut self.sel_ink, self.sel, 4.5, "sel_ink/sel");
         want(&mut self.ink, self.win, 4.5, "ink/base");
@@ -652,7 +570,7 @@ impl Skin {
 /// 用户可以在外观菜单里换成任意一档；绘制代码只认 Theme.style。
 ///   Plain = 原样平铺（工具栏文字在图标下方关掉，其余不动）
 ///   Bands = 明度带 + 单像素蚀刻线，格子保持方角
-///   Cards = Bands 之上再套圆角卡片：内容区对角柔光，卡片本体竖向渐变 + 双层边
+///   Cards = Bands 之上再套圆角卡片：内容区一块纯色，卡片本体纯色 + 双层边
 ///   CardsRich = Cards 的完整状态版：文件夹也有卡片，选中/悬停/标记会给底纹、
 ///               名称带、图标座和角标分层，而不是只描一圈边
 ///   Quiet = 静谧玻璃：低对比、薄雾、发丝线，整块界面像一块磨砂玻璃
@@ -753,8 +671,6 @@ pub const TAG_BANDS: u32 = 3;
 pub struct Strip {
     /// 这条的底色
     pub bar: u32,
-    /// 走渐变时压到的那一档
-    pub bar_lo: u32,
     /// 底缘那一条 1px
     pub edge: u32,
     /// 压在底色上最读得清的那枚文字色
@@ -771,8 +687,6 @@ pub struct Strip {
     pub ring: u32,
     /// 悬停那一层的画法（TAG_* 之一）
     pub tag: u32,
-    /// 要不要竖向渐变（false = 铺实色）
-    pub grad: bool,
     /// 制图台档：左下压一道短尺
     pub ruler: bool,
     /// 条高
@@ -798,7 +712,6 @@ impl Strip {
     fn geom(k: f64, h: i32) -> Strip {
         Strip {
             bar: 0,
-            bar_lo: 0,
             edge: 0,
             fg: 0,
             dim: 0,
@@ -807,7 +720,6 @@ impl Strip {
             hov: 0,
             ring: 0,
             tag: TAG_PLAIN,
-            grad: false,
             ruler: false,
             h,
             bw: (34.0 * k).round() as i32,
@@ -818,7 +730,7 @@ impl Strip {
     }
 
     /// 顶层窗口的标题条：底色走本主题的主色，也就是文件夹图标那枚深色。
-    /// 卡片档这一条是整块纯色，不往下压：一压蓝就发灰，和配色里的标题色对不上。
+    /// 整条铺纯色，不做渐变。
     pub fn top(th: &Theme) -> Strip {
         let s = th.skin;
         let bar = s.acc;
@@ -841,15 +753,9 @@ impl Strip {
         } else {
             TAG_BANDS
         };
-        if th.style.is_fine() {
-            (g.bar_lo, g.grad, g.edge) = (bar, false, s.line_soft);
-        } else if th.style.is_quiet() {
-            (g.bar_lo, g.grad, g.edge) = (darken(bar, 0.08), true, mix(bar, s.line_soft, 0.35));
+        g.edge = s.line_soft;
+        if th.style.is_quiet() {
             (g.hot, g.hov) = (mix(bar, fg, 0.10), mix(bar, fg, 0.10));
-        } else if th.style.is_cards() {
-            (g.bar_lo, g.grad, g.edge) = (bar, false, s.line_soft);
-        } else {
-            (g.bar_lo, g.grad, g.edge) = (darken(bar, 0.14), true, s.line);
         }
         g
     }
@@ -898,8 +804,6 @@ pub struct Theme {
     pub zf: [(i32, bool); NZ],
     /// 界面字体名。数字/路径仍用等宽字体，避免目录名对不齐。
     pub face: String,
-    /// 渐变覆盖；None 的地方继续按皮肤色现算。
-    pub grad: Grad,
     pub name: String,
     /// 这套尺寸是按哪个 DPI 倍率算的，画界面时要按它换算列宽
     pub scale: f64,
@@ -945,7 +849,14 @@ fn parse(text: &str) -> File {
             "order" => f.order = v.parse().unwrap_or(i32::MAX),
             "default" => f.is_default = matches!(v, "1" | "true" | "yes"),
             _ => {
-                if let Ok(c) = u32::from_str_radix(v.trim_start_matches(['#', '0', 'x', 'X']), 16) {
+                // 只剥一次前缀再解析：早先按字符集 trim 会把 "#000000" 这类纯黑
+                // 整串吞成空串，解析失败后这个槽位就静默回落到派生值了。
+                let s = v
+                    .strip_prefix("0x")
+                    .or_else(|| v.strip_prefix("0X"))
+                    .or_else(|| v.strip_prefix('#'))
+                    .unwrap_or(v);
+                if let Ok(c) = u32::from_str_radix(s, 16) {
                     f.kv.insert(k.to_string(), c);
                 }
             }
@@ -985,7 +896,7 @@ fn builtin_name() -> &'static str {
     N.get_or_init(|| parse(BUILTIN_SKIN).name)
 }
 
-/// 出厂默认的工具栏图标库（见 glyphs::SETS）。没有 appearance.tsv 时用它，
+/// 出厂默认的工具栏图标库（见 glyphs::all()）。没有 appearance.tsv 时用它，
 /// 和内置配色凑成一整套外观；盘上有偏好文件就照文件来。
 pub const DEFAULT_LAYOUT: &str = "lucide";
 
@@ -1001,13 +912,16 @@ pub fn rescan() {
 
 fn scan() -> Registry {
     // 皮肤来源：设置窗选定的目录（没选过是 skin_dir() 按默认两级算出的那处）下的 *.skin，
-    // 外加一层分类子目录。子目录名就是菜单里的分类名，显示名仍以文件里的
-    // name= 为准。
+    // 正式的住处是它的「皮肤」子文件夹，分类子目录一层在「皮肤」里面（浅色/深色…），
+    // 子目录名就是菜单里的分类名；散在 skins 根上的 .skin 也认，归"未分类"。
+    // 显示名仍以文件里的 name= 为准。图标库（图标\）不在这里扫。
     let dir = skin_dir();
+    let inner = dir.join("皮肤");
     let mut files: Vec<(PathBuf, File, String)> = Vec::new();
-    if dir.is_dir() {
-        let mut buckets = vec![dir.clone()];
-        if let Ok(rd) = std::fs::read_dir(&dir) {
+    let mut buckets = vec![dir.clone()];
+    if inner.is_dir() {
+        buckets.push(inner.clone());
+        if let Ok(rd) = std::fs::read_dir(&inner) {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -1015,32 +929,32 @@ fn scan() -> Registry {
                 }
             }
         }
-        for bucket in buckets {
-            let group = if bucket == dir {
-                String::new()
-            } else {
-                bucket
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            };
-            let Ok(rd) = std::fs::read_dir(&bucket) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() || p.extension().and_then(|x| x.to_str()) != Some("skin") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&p) else { continue };
-                let mut f = parse(&text);
-                if f.name.is_empty() {
-                    f.name = p
-                        .file_stem()
-                        .and_then(|x| x.to_str())
-                        .unwrap_or("?")
-                        .to_string();
-                }
-                files.push((p, f, group.clone()));
+    }
+    for bucket in buckets {
+        let group = if bucket == dir {
+            String::new()
+        } else {
+            bucket
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let Ok(rd) = std::fs::read_dir(&bucket) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() || p.extension().and_then(|x| x.to_str()) != Some("skin") {
+                continue;
             }
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let mut f = parse(&text);
+            if f.name.is_empty() {
+                f.name = p
+                    .file_stem()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+            }
+            files.push((p, f, group.clone()));
         }
     }
     // 内置那一套也混进同一份清单：排序、重名、默认三件事跟盘上的皮肤走同一条
@@ -1164,14 +1078,25 @@ fn dir_has_skins(dir: &Path) -> bool {
             return true;
         }
     }
-    subdirs.iter().any(|d| {
-        std::fs::read_dir(d)
-            .map(|it| {
-                it.flatten()
-                    .any(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("skin")))
-            })
-            .unwrap_or(false)
-    })
+    subdirs.iter().any(|d| has_skin_two_levels(d))
+}
+
+/// 分类子目录现在住在「皮肤」里面（skins\皮肤\浅色\*.skin），往里再多看一层。
+fn has_skin_two_levels(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if has_skin_two_levels(&p) {
+                return true;
+            }
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("skin")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 现在的皮肤目录是不是没在设置窗里单独指定过。
@@ -1307,18 +1232,10 @@ pub fn preview(base: &Skin, draft: &Look) -> Skin {
     s
 }
 
-pub fn preview_grad(base: &Grad, draft: &Look) -> Grad {
-    let mut g = *base;
-    for (k, v) in &draft.grad {
-        g.set(k, *v);
-    }
-    g
-}
-
-/// 把一套皮肤整个写成文件。22 个槽位全写死：读回来和屏幕上看到的完全一致，
+/// 把一套皮肤整个写成文件。24 个槽位全写死：读回来和屏幕上看到的完全一致，
 /// 不给派生留余地，否则覆盖一次皮肤颜色就会自己漂掉。
 pub fn write_skin(name: &str, style: Style, order: i32, def: bool, skin: &Skin) -> Result<PathBuf, String> {
-    let dir = skin_dir();
+    let dir = skin_dir().join("皮肤");
     if std::fs::create_dir_all(&dir).is_err() {
         return Err("皮肤目录打不开".to_string());
     }
@@ -1333,10 +1250,10 @@ pub fn write_skin(name: &str, style: Style, order: i32, def: bool, skin: &Skin) 
         return Err("这套皮肤的名字只剩符号，做不出文件名".to_string());
     }
     // 覆盖已有皮肤时写回它原来那个文件（可能在色系子目录里）；
-    // 只有另存成新名字才落到 skins/ 顶层。
+    // 只有另存成新名字才落到 skins\皮肤\ 顶层。
     let p = skin_path(name).unwrap_or_else(|| dir.join(format!("{stem}.skin")));
     let mut out = String::new();
-    out.push_str("# 皮肤设置窗写出：22 个槽位全写死，读回来就是当时看到的那张脸。\n");
+    out.push_str("# 皮肤设置窗写出：24 个槽位全写死，读回来就是当时看到的那张脸。\n");
     out.push_str(&format!(
         "name={name}\nstyle={}\norder={order}\ndefault={}\n",
         style.key(),
@@ -1379,6 +1296,8 @@ pub fn audit(name: &str) -> (Skin, Vec<String>) {
     for (fg, bg, min, what) in [
         (s.ink, s.canvas, 4.5, "正文/画布"),
         (s.ink, s.chrome, 4.5, "正文/工具条"),
+        (s.ink, s.menu, 4.5, "正文/菜单条"),
+        (s.ink, s.popup, 4.5, "正文/弹出菜单"),
         (s.ink_dim, s.canvas, 3.0, "次文/画布"),
         (s.sel_ink, s.sel, 4.5, "选中文字/选中底"),
         (s.ink, s.win, 4.5, "正文/窗底"),
@@ -1406,7 +1325,7 @@ impl Theme {
     }
 
     /// 和 new_with 相同，但允许把工具栏图标换成某套开源图标库。
-    /// `layout` 是 glyphs::SETS 里的 key；None 或认不出来的键都用内置图标。
+    /// `layout` 是 glyphs::all() 里的 key；None 或认不出来的键都用内置图标。
     pub fn new_with_layout(
         skin: &str,
         density: &str,
@@ -1441,7 +1360,6 @@ impl Theme {
             font_path: 16,
             zf: [(13, false); NZ],
             face: look.face().to_string(),
-            grad: Grad::default(),
             name: skin.to_string(),
             scale: 1.0,
         };
@@ -1464,9 +1382,6 @@ impl Theme {
         }
         for (k, v) in &look.colors {
             t.skin.set_slot(k, *v);
-        }
-        for (k, v) in &look.grad {
-            t.grad.set(k, *v);
         }
         for v in [
             &mut t.title,
@@ -1597,6 +1512,8 @@ pub fn mock(s: &Skin) -> image::DynamicImage {
         s.win,
         s.chrome,
         s.chrome_hi,
+        s.menu,
+        s.popup,
         s.canvas,
         s.pane,
         s.pane_head,

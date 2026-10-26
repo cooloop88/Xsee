@@ -1,0 +1,33 @@
+# 墨黛青：颜色取自参考图像素。底色=上半场墨黛紫 #514F69（81,79,105），
+# 标题栏=下半场马尔斯绿 #68A0A9（104,160,169），圆盘自身是在 74,73,94 / 94,149,151。
+# 浅蓝作标题时程序自动配深字（6.3:1）；正文/画布 8.9:1。
+name=墨黛青
+style=cards_rich
+order=31
+default=0
+
+base=0x514f69
+surface=0x5b5973
+canvas=0x3f3d51
+ink=0xf8f7fc
+dim=0xc2c0d2
+accent=0x68a0a9
+border=0x6f6d84
+mark=0x74a9b1
+
+chrome=0x5b5973
+chrome_hi=0x65637c
+pane=0x48465d
+pane_head=0x56546e
+grid=0x48465c
+line=0x6f6d84
+line_soft=0x615f78
+off=0x777587
+inv=0x0b0a10
+hov=0x5e5c75
+prs=0x69677f
+sel=0x334e53
+sel_ink=0xfbfeff
+acc_soft=0x565e76
+flash=0x565e76
+focus=0x74a9b1

@@ -1,0 +1,32 @@
+﻿# E 灰米：中间调，陶土/灰粉，不白也不黑。
+# 与圆角卡片同一套几何和字号，只换配色；字体/渐变可在“皮肤设置”里再调。
+name=灰米褐
+style=cards_rich
+order=8
+default=0
+
+base=0xc2bbaf
+surface=0xc2bbaf
+canvas=0xb0a99d
+ink=0x2d2a25
+dim=0x4b463f
+accent=0x8a4f40
+border=0x999286
+mark=0x5f3529
+
+chrome=0xc2bbaf
+chrome_hi=0xcec7bb
+pane=0xc9c2b6
+pane_head=0xcbc4b8
+grid=0xded8cc
+line=0x999286
+line_soft=0xb1aa9e
+off=0x645e55
+inv=0xf7efea
+hov=0xb9aa9c
+prs=0xa8a195
+sel=0xc9a596
+sel_ink=0x321813
+acc_soft=0xc9b0a4
+flash=0xd0b6aa
+focus=0x7e4638

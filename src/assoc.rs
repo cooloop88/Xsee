@@ -43,6 +43,11 @@ const EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "png", "bmp", "gif", "tif", "tiff", "ico", "jfif", "webp", "heic",
     "psd", "psb", "nef", "cr2", "cr3", "arw", "rw2", "dng", "orf", "raf", "pef", "srw", "x3f",
     "3fr", "fff", "iiq",
+    // image 库默认解码器段的格式，is_image 认了这边跟着列。
+    "avif", "tga", "dds", "qoi", "exr", "hdr", "ff", "pbm", "pgm", "ppm", "pnm", "pam",
+    // JPEG XR（WIC 内置）+ 2026-10-26 对照 ACDSee 补齐的 RAW 后缀（走 is_raw）。
+    "wdp", "hdp", "jxr", "crw", "nrw", "rwl", "mrw", "kdc", "k25", "dcr", "erf", "mos", "srf",
+    "sr2", "raw",
 ];
 
 pub fn supported_exts() -> Vec<&'static str> {

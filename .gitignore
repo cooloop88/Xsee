@@ -1,8 +1,11 @@
 /target
+/target-rel2/
 /.build/
 /data
 /thumbs
+/work/
 *.exe
 *.pdb
 *.prev_*
+qc_build*.log
 /dist/

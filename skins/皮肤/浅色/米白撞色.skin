@@ -1,0 +1,34 @@
+# E 新：暖米白骨架 × 两个彩色落点（靛蓝、朱橙）。
+# 旧版灰蒙蒙的实测原因：七个面色度全等于 19、正文/画布对比只有 6.1。
+# 骨架一律中性不上色相（悬停、按下、面板头、边线都只是明度变化），
+# 彩色只给三处：强调/选中底=靛蓝，标记=朱橙。撞色的力气来自落点少。
+name=米白撞色
+style=cards_rich
+order=20
+default=0
+
+base=0xe6e0d2
+surface=0xf0ebdf
+canvas=0xf3efe4
+ink=0x16150f
+dim=0x5a564a
+accent=0x1f4fa0
+border=0xcfc8b8
+mark=0xe2591f
+
+chrome=0xf0ebdf
+chrome_hi=0xf8f5ec
+pane=0xfaf8f1
+pane_head=0xece7db
+grid=0xffffff
+line=0xcfc8b8
+line_soft=0xe0dbcd
+off=0x948e7c
+inv=0xffffff
+hov=0xe9e3d4
+prs=0xded7c6
+sel=0x2f4a8c
+sel_ink=0xffffff
+acc_soft=0xdde3f0
+flash=0xf0ece0
+focus=0x1f4fa0

@@ -1,0 +1,32 @@
+﻿# F 雾银：中间调，雾蓝/灰绿，安静但不发闷。
+# 与圆角卡片同一套几何和字号，只换配色；字体/渐变可在“皮肤设置”里再调。
+name=雾银青
+style=cards_rich
+order=9
+default=0
+
+base=0xc3c7c6
+surface=0xbfc3c2
+canvas=0xadb2b1
+ink=0x293030
+dim=0x485050
+accent=0x4f6c6e
+border=0x969b9a
+mark=0x314b4d
+
+chrome=0xbfc3c2
+chrome_hi=0xccd0cf
+pane=0xccd0cf
+pane_head=0xc6cac9
+grid=0xdee1df
+line=0x969b9a
+line_soft=0xaeb3b2
+off=0x626a69
+inv=0xf1f5f4
+hov=0xa6b3b1
+prs=0xa5a9a8
+sel=0x9fbcbb
+sel_ink=0x142d2e
+acc_soft=0xa9c0bf
+flash=0xb7c6c6
+focus=0x4f6c6e

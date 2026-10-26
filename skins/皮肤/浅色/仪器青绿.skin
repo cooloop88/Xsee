@@ -1,0 +1,32 @@
+﻿# D 仪器：冷灰、墨绿，刻度感、等宽数字。
+# 与圆角卡片同一套几何和字号，只换配色；字体/渐变可在“皮肤设置”里再调。
+name=仪器青绿
+style=cards_rich
+order=7
+default=0
+
+base=0xeceef0
+surface=0xe4e7ea
+canvas=0xe9ebee
+ink=0x15181b
+dim=0x5d646c
+accent=0x0f7a5a
+border=0xc9ced3
+mark=0x0c6a4e
+
+chrome=0xe4e7ea
+chrome_hi=0xf1f3f4
+pane=0xf6f7f8
+pane_head=0xeef0f2
+grid=0xffffff
+line=0xc9ced3
+line_soft=0xdcdfe2
+off=0x98a0a8
+inv=0xffffff
+hov=0xdfe7ea
+prs=0xdbdfe3
+sel=0xc7e5d9
+sel_ink=0x064b36
+acc_soft=0xd4e9df
+flash=0xe2f0ea
+focus=0x0f7a5a

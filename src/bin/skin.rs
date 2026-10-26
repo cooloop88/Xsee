@@ -50,6 +50,8 @@ fn dump(s: &Skin) {
         ("base", s.win),
         ("chrome", s.chrome),
         ("chrome_hi", s.chrome_hi),
+        ("menu", s.menu),
+        ("popup", s.popup),
         ("canvas", s.canvas),
         ("pane", s.pane),
         ("pane_head", s.pane_head),

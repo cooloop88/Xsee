@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::Rgba;
 use crate::cache;
+use crate::scan;
 
 /// 相似图片的指纹库。指纹不再单独记账：缩略图索引每条记录后面就跟一枚指纹，
 /// 同一档缩略图生成/命中时一起写，搬文件时跟着搬。
@@ -307,7 +308,7 @@ fn remember(path: &str, bx: (u16, u16), st: (u32, u64), fp: Fp) {
 /// 这条是给"缓存命中了、那条记录里还没有指纹"补的。
 /// 相似库没打开过就只写盘、不建内存表：浏览缩略图不该为此等一次全库加载。
 pub fn note(path: &str, bw: u32, bh: u32, img: &Rgba) {
-    if !cache::on() || path.is_empty() || !usable(bw, bh) {
+    if !cache::on() || path.is_empty() || !usable(bw, bh) || scan::excluded(path) {
         return;
     }
     let Some(st) = stamp(path) else { return };
@@ -328,7 +329,8 @@ pub fn note(path: &str, bw: u32, bh: u32, img: &Rgba) {
 /// 相似库还没加载过就先不动——加载时从索引里一次读全。
 pub fn adopt(path: &str, bw: u32, bh: u32, fp: Option<Fp>) {
     let Some(fp) = fp else { return };
-    if !cache::on() || path.is_empty() || !usable(bw, bh) || LIB.get().is_none() {
+    if !cache::on() || path.is_empty() || !usable(bw, bh) || LIB.get().is_none() || scan::excluded(path)
+    {
         return;
     }
     let Some(st) = stamp(path) else { return };
@@ -385,6 +387,10 @@ pub fn fill(
     for (p, key, mtime, size) in todo {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        // 排除规则命中的不补：贴图不入账，就算缩略图还在也不进搜图库。
+        if scan::excluded(&p) {
+            continue;
         }
         prog.fetch_add(1, Ordering::Relaxed);
         let Some(img) = cache::thumb_at(key) else { continue };
@@ -560,40 +566,116 @@ pub fn stats_all() -> (usize, usize) {
     (l.maps.len(), l.maps.values().map(|m| m.len()).sum())
 }
 
-/// 这一档库里有多少条、其中多少条的原图已经不在盘上了。
-pub fn stat(bw: u32, bh: u32) -> (usize, usize) {
-    if !usable(bw, bh) {
-        return (0, 0);
-    }
-    let Ok(l) = lib().lock() else { return (0, 0) };
-    let Some(m) = l.maps.get(&(bw as u16, bh as u16)) else {
-        return (0, 0);
-    };
-    let dead = m.values().filter(|r| !Path::new(&r.path).exists()).count();
-    (m.len(), dead)
+/// 库里账最多的一档。相似库还没读进内存就是 None——界面线程用这个版本，
+/// 别为了挑个档把整库读进来；后台先 ensure_loaded 再问就有数了。
+pub fn biggest_tier_loaded() -> Option<(u16, u16)> {
+    LIB.get()?
+        .lock()
+        .ok()?
+        .maps
+        .iter()
+        .max_by_key(|(_, m)| m.len())
+        .map(|(k, _)| *k)
 }
 
-/// 把这一档里盘上已经没有的那些剔掉。指纹现在长在缩略图索引上，所以只摘指纹、
-/// 缩略图记录留着（文件回来还能命中，不用重解）；索引由缩略图库重写一次压实。
-pub fn prune(bw: u32, bh: u32) -> usize {
-    if !usable(bw, bh) {
-        return 0;
+/// 跨档搜索：查询图在哪几档有过缩略图，就各算一份指纹、各搜各的账——
+/// 指纹只有同档才可比，所以查询图的指纹也得按那一档的缩略图算。
+/// 结果按路径去重（同一张图在好几档都有账，取差异最小的那个），差异升序。
+/// 一档现成缩略图都没有就返回空，由调用方兜底解码入档。纯内存比对加
+/// 二十来次小 JPEG 解码，几十毫秒级。
+pub fn search_all_tiers(
+    q: &str,
+    rot: bool,
+    flip: bool,
+    algo: u8,
+    max_dist: u32,
+    limit: usize,
+) -> Vec<(u32, String)> {
+    if !cache::on() {
+        return Vec::new();
     }
-    let bx = (bw as u16, bh as u16);
+    let tiers: Vec<(u16, u16)> = {
+        let Ok(l) = lib().lock() else { return Vec::new() };
+        l.maps.keys().copied().collect()
+    };
+    let mut merged: Vec<(u32, String)> = Vec::new();
+    for (bw, bh) in tiers {
+        let Some(img) = cache::peek(q, bw as u32, bh as u32) else {
+            continue;
+        };
+        let qs = variants(&img, rot, flip);
+        merged.extend(search(bw as u32, bh as u32, &qs, algo, max_dist, limit));
+    }
+    merged.sort_by(|a, b| {
+        (a.0, a.1.to_ascii_lowercase()).cmp(&(b.0, b.1.to_ascii_lowercase()))
+    });
+    // 排序后相邻去重，留下的是差异最小的那一笔。
+    merged.dedup_by(|a, b| a.1.eq_ignore_ascii_case(&b.1));
+    merged
+}
+
+/// 四路并行问盘，返回没了的那些下标（升序）。exists 的耗时几乎全在慢盘上
+/// （网络盘、虚拟盘一次几毫秒，五万次就是几十秒级），并行等的就是这段；
+/// 本地盘暖机后一次几十微秒，四路照样有得赚。
+fn dead_of(paths: &[String]) -> Vec<usize> {
+    const W: usize = 4;
+    let mut dead: Vec<usize> = std::thread::scope(|s| {
+        let parts: Vec<_> = (0..W)
+            .map(|w| {
+                s.spawn(move || {
+                    paths
+                        .iter()
+                        .skip(w)
+                        .step_by(W)
+                        .enumerate()
+                        .filter(|(_, p)| !Path::new(p).exists())
+                        .map(|(i, _)| i * W + w)
+                        .collect::<Vec<usize>>()
+                })
+            })
+            .collect();
+        parts
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    dead.sort_unstable();
+    dead
+}
+
+/// 把全部档位里盘上已经没有的那些一次剔掉。指纹现在长在缩略图索引上，所以只摘
+/// 指纹、缩略图记录留着（文件回来还能命中，不用重解）；索引由缩略图库重写一次压实。
+/// 没有档位口径的地方（数据库维护页）用这条；返回 (摘掉的条数, 清完还剩的条数)。
+/// 问盘同样放锁外（dead_of 四路并行），一张原图只问一次；最后短锁摘账。
+pub fn prune_all() -> (usize, usize) {
+    // 同一张图可能在好几档都有一笔：路径先去重，问盘只问一次。
+    let mut uniq: Vec<String> = {
+        let Ok(l) = lib().lock() else { return (0, 0) };
+        l.maps
+            .values()
+            .flat_map(|m| m.values().map(|r| r.path.clone()))
+            .collect()
+    };
+    uniq.sort_unstable_by_key(|p| p.to_ascii_lowercase());
+    uniq.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    let dead: std::collections::HashSet<String> =
+        dead_of(&uniq).into_iter().map(|i| uniq[i].to_ascii_lowercase()).collect();
     let mut gone = Vec::new();
+    let mut left = 0usize;
     {
-        let Ok(mut l) = lib().lock() else { return 0 };
-        if let Some(m) = l.maps.get_mut(&bx) {
-            let dead: Vec<String> = m
+        let Ok(mut l) = lib().lock() else { return (0, 0) };
+        for (bx, m) in l.maps.iter_mut() {
+            let doomed: Vec<String> = m
                 .iter()
-                .filter(|(_, r)| !Path::new(&r.path).exists())
+                .filter(|(_, r)| dead.contains(&r.path.to_ascii_lowercase()))
                 .map(|(k, _)| k.clone())
                 .collect();
-            for k in &dead {
+            for k in &doomed {
                 if let Some(r) = m.remove(k) {
-                    gone.push((r.path, bx));
+                    gone.push((r.path, *bx));
                 }
             }
+            left += m.len();
         }
     }
     let keys: Vec<cache::Key> = gone
@@ -601,7 +683,37 @@ pub fn prune(bw: u32, bh: u32) -> usize {
         .map(|(p, b)| (cache::hash_of(p), b.0, b.1))
         .collect();
     cache::clear_fps(&keys);
-    gone.len()
+    (gone.len(), left)
+}
+
+/// 按排除规则把已入账的指纹摘掉（内存表和缩略图索引都清）。返回摘掉的条数。
+/// 规则只拦得住以后入库的，之前扫过/看过的存量要靠这一下清——规则对话框
+/// 保存后调它。缩略图本身保留，浏览不受影响。
+pub fn purge_excluded() -> usize {
+    if !cache::on() {
+        return 0;
+    }
+    let mut keys: Vec<cache::Key> = Vec::new();
+    {
+        let Ok(mut l) = lib().lock() else { return 0 };
+        for (bx, m) in l.maps.iter_mut() {
+            let doomed: Vec<String> = m
+                .iter()
+                .filter(|(_, r)| scan::excluded(&r.path))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &doomed {
+                if let Some(r) = m.remove(k) {
+                    keys.push((cache::hash_of(&r.path), bx.0, bx.1));
+                }
+            }
+        }
+    }
+    let n = keys.len();
+    if n > 0 {
+        cache::clear_fps(&keys);
+    }
+    n
 }
 
 /// 文件改了名：内存表跟着换键，不然这次运行里新路径搜不到、旧路径指向空。

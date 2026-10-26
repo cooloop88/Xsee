@@ -1,0 +1,34 @@
+# G 新：深咖啡骨架 × 两个彩色落点（亮琥珀、亮青绿）。
+# 旧版七层明度跨度只有 0.059、全挤在一档，正文/画布对比 6.5，所以平得发灰。
+# 改法是拉开骨架明度（画布最深、格子底抬两档），不是到处染色：
+# 彩色只给三处——强调/选中底=亮琥珀，标记=亮青绿。
+name=深岩撞色
+style=cards_rich
+order=22
+default=0
+
+base=0x1e1a14
+surface=0x241f18
+canvas=0x14110c
+ink=0xf5f1e8
+dim=0xb8b0a0
+accent=0xf2a93b
+border=0x463d2e
+mark=0x35d6c4
+
+chrome=0x241f18
+chrome_hi=0x302a1f
+pane=0x201b14
+pane_head=0x272118
+grid=0x2b251b
+line=0x463d2e
+line_soft=0x332c21
+off=0x7e7768
+inv=0x12100c
+hov=0x2e2820
+prs=0x3a3328
+sel=0xf2a93b
+sel_ink=0x1c1408
+acc_soft=0x5a4526
+flash=0x3f3728
+focus=0xf2a93b

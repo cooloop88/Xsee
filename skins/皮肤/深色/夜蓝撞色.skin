@@ -1,0 +1,33 @@
+# H 新：深板岩骨架 × 两个彩色落点（亮湖青、亮橙）。
+# 旧版选中底和工具栏的明度差只有 0.011——选中几乎看不出来，强调色是粉蓝。
+# 骨架走中性深蓝灰并把画布压深，彩色只给三处：强调/选中底=亮湖青，标记=亮橙。
+name=夜蓝撞色
+style=cards_rich
+order=23
+default=0
+
+base=0x161c22
+surface=0x1c232a
+canvas=0x111619
+ink=0xeef2f5
+dim=0xb0b8bf
+accent=0x18a5c4
+border=0x39434c
+mark=0xff8b3a
+
+chrome=0x1c232a
+chrome_hi=0x272f37
+pane=0x181e24
+pane_head=0x212930
+grid=0x232b33
+line=0x39434c
+line_soft=0x2a323a
+off=0x78818a
+inv=0x0a0e12
+hov=0x242c34
+prs=0x2e3741
+sel=0x18a5c4
+sel_ink=0x04181f
+acc_soft=0x1d3d47
+flash=0x39434c
+focus=0x18a5c4
