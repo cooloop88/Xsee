@@ -19,7 +19,7 @@ use xsee_host::{
     refwin,
     scan,
     sim, sysicon, Rgba,
-    theme::{self, mix, Style, Theme, cref},
+    theme::{self, mix, Style, Theme, cref, MENU_IC_W, MENU_IC_X},
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -66,6 +66,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+// JSON 命令口（xsee --cmd '...'）。单独一个文件，别往这九十万行里堆。
+// 路径要点名：bin 根文件的子模块默认往 src/bin/ 那一层找，会撞成另一个 bin。
+#[path = "browse/drive.rs"]
+mod drive;
 
 const CLASS: &str = "XseeBrowseWnd";
 const TITLE: &str = "Xsee 浏览";
@@ -362,7 +367,7 @@ static SEARCH_GEN: AtomicUsize = AtomicUsize::new(0);
 static SEARCH_RES: OnceLock<Mutex<Option<(usize, String, Vec<String>)>>> = OnceLock::new();
 /// 找相似也只认最后一次，前面慢的那条回来就丢掉。带回来的是耗时毫秒和整条结果行。
 static SIM_GEN: AtomicUsize = AtomicUsize::new(0);
-static SIM_RES: OnceLock<Mutex<Option<(usize, u128, Vec<SimHit>)>>> = OnceLock::new();
+static SIM_RES: OnceLock<Mutex<Option<(usize, u128, Vec<SimHit>, Option<String>)>>> = OnceLock::new();
 /// 两张预览也讲代数：连点几行只画最后点的那一张。
 static SIM_PV_GEN: AtomicUsize = AtomicUsize::new(0);
 /// 正拖着浮层。这是 App.dlg_drag 的一个镜像，只为让 refresh() 问一句就能走、
@@ -2134,6 +2139,11 @@ static UI_ZOOM: AtomicU32 = AtomicU32::new(0);
 
 /// 全量写一次。每个"这一次调整结束"的时刻调一次，攒到关窗才写的话崩一次就全丢。
 unsafe fn ui_save(a: &App, hwnd: HWND) {
+    // 命令口跑测试那一趟不写盘：跑完就退，把测试摆的位置和目录记到他偏好里，
+    // 下次他自己打开就发现软件"变了"。
+    if drive::quiet() {
+        return;
+    }
     let mut items = ui_items(a);
     items.extend(ui_win(hwnd));
     let key = uw(UI_KEY);
@@ -5743,6 +5753,10 @@ unsafe fn paint_title(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
             ink: s.skin.ink,
             dim: s.skin.ink_dim,
             hov: s.skin.hov,
+            popup: s.skin.popup,
+            off: s.skin.ink_off,
+            sep: s.skin.line_soft,
+            menu_row: theme::popup_row(s),
         },
     );
 }
@@ -5834,22 +5848,7 @@ unsafe fn paint_menu_bar(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
     }
 }
 
-/// 弹层左边那一列图标：顶着左缘放，只留这点空档（逻辑像素）。
-const MENU_IC_X: f64 = 6.0;
-const MENU_IC_W: f64 = 16.0;
-/// 图标列之后的文字起点：图标和文字之间留 8 个逻辑像素。勾选记号和图标
-/// 共用左边这一列（勾上时盖过图标），没登记图标或没勾选的行也照这一套
-/// 缩进，同一菜单里的字才对得齐。
-fn menu_text_x(k: f64) -> i32 {
-    ((MENU_IC_X + MENU_IC_W + 8.0) * k) as i32
-}
-
-/// 弹层一行的高度：主题行高再高 3 像素。树和面板继续用原来的行高，
-/// 只有右键菜单这一处放宽，选项之间不至于挤在一起。
-fn popup_row(s: &Theme) -> i32 {
-    s.row + (3.0 * s.scale) as i32
-}
-
+/// 弹层的尺寸全部读 `theme::MENU_*` 那一组令牌，画布那扇右键菜单读的是同一处。
 fn popup_metrics(_a: &App, s: &Theme, items: &[MenuItem]) -> (i32, i32, i32) {
     let k = s.scale;
     let mut lw = 0;
@@ -5863,12 +5862,16 @@ fn popup_metrics(_a: &App, s: &Theme, items: &[MenuItem]) -> (i32, i32, i32) {
             kw = kw.max(it.key.chars().count() as i32 * (s.font_sm / 2 + 1));
         }
     }
-    let w = menu_text_x(k) + lw + (14.0 * k) as i32 + kw + (16.0 * k) as i32 + (16.0 * k) as i32;
+    let w = theme::menu_width(k, lw, kw);
     let mut h = 0;
     for it in items {
-        h += if it.sep { (6.0 * k) as i32 } else { popup_row(s) };
+        h += if it.sep {
+            (theme::MENU_SEP_H * k) as i32
+        } else {
+            theme::popup_row(s)
+        };
     }
-    (w.max((150.0 * k) as i32), h + (4.0 * k) as i32, kw)
+    (w, h + (theme::MENU_INSET_Y * k) as i32, kw)
 }
 
 unsafe fn popup_layout(
@@ -5896,8 +5899,7 @@ unsafe fn popup_layout(
             kw = kw.max(text_w(hdc, it.key, a.font_sm));
         }
     }
-    let w = (menu_text_x(k) + lw + (14.0 * k) as i32 + kw + (16.0 * k) as i32 + (16.0 * k) as i32)
-        .max((150.0 * k) as i32);
+    let w = theme::menu_width(k, lw, kw);
     let mut x = ax;
     let mut y = ay;
     if x + w > rc.right - 2 {
@@ -5913,9 +5915,13 @@ unsafe fn popup_layout(
     }
     let rect = RECT { left: x, top: y, right: x + w, bottom: y + h };
     let mut rows = Vec::new();
-    let mut cy = rect.top + (2.0 * k) as i32;
+    let mut cy = rect.top + (theme::MENU_INSET * k) as i32;
     for (i, it) in items.iter().enumerate() {
-        let rh = if it.sep { (6.0 * k) as i32 } else { popup_row(s) };
+        let rh = if it.sep {
+            (theme::MENU_SEP_H * k) as i32
+        } else {
+            theme::popup_row(s)
+        };
         rows.push((i, RECT { left: rect.left, top: cy, right: rect.right, bottom: cy + rh }));
         cy += rh;
     }
@@ -5945,7 +5951,7 @@ unsafe fn paint_popup(
         );
     }
     frame(hdc, rect, s.skin.acc);
-    let pad = (8.0 * k) as i32;
+    let pad = (theme::MENU_SEP_PAD * k) as i32;
     for (idx, r) in rows {
         let it = &items[*idx];
         if it.sep {
@@ -6039,17 +6045,17 @@ unsafe fn paint_popup(
             );
         }
         let lr = RECT {
-            left: r.left + menu_text_x(k),
+            left: r.left + theme::menu_text_x(k),
             top: r.top,
-            right: r.right - (16.0 * k) as i32,
+            right: r.right - (theme::MENU_RIGHT * k) as i32,
             bottom: r.bottom,
         };
         txt(hdc, &lr, it.label, ink, a.font, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         if !it.key.is_empty() {
             let kr = RECT {
-                left: r.right - (16.0 * k) as i32 - (110.0 * k) as i32,
+                left: r.right - (theme::MENU_RIGHT * k) as i32 - (theme::MENU_KEY_MAX * k) as i32,
                 top: r.top,
-                right: r.right - (16.0 * k) as i32,
+                right: r.right - (theme::MENU_RIGHT * k) as i32,
                 bottom: r.bottom,
             };
             let kc = if hot {
@@ -14253,15 +14259,14 @@ fn img_of(px: Rgba) -> Img {
 unsafe fn sim_previews(hwnd: HWND) {
     let hp = hwnd.0 as isize;
     let gid = SIM_PV_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let (bw, bh, q, hit) = {
+    let (tier, q, hit) = {
         let g = app().lock().unwrap();
         // 预览跟搜索同一个目标档：图标/列表视图借库里最大的一档，不然预览
-        // 对着小格档要么没图、要么现解一张塞进不该有账的档里。
-        let Some((w, h)) = sim_target_tier(&g) else { return };
+        // 对着小格档要么没图、要么现解一张塞进不该有账的档里。那一档得等库
+        // 读进内存才知道，所以只在这里记下"当场能不能定"，定不了交给后台去问。
         let n = if g.sim_hits.is_empty() { usize::MAX } else { g.sim_sel.min(g.sim_hits.len() - 1) };
         (
-            w,
-            h,
+            sim_target_tier(&g),
             g.sim_path.clone(),
             if n == usize::MAX { None } else { Some(g.sim_hits[n].path.clone()) },
         )
@@ -14269,6 +14274,7 @@ unsafe fn sim_previews(hwnd: HWND) {
     std::thread::spawn(move || {
         let hwnd = HWND(hp as *mut core::ffi::c_void);
         job::init_com();
+        let Some((bw, bh)) = sim::resolve_tier(tier) else { return };
         let src = sim_rgba_at(&q, bw, bh).map(img_of);
         let dst = hit.as_deref().and_then(|p| sim_rgba_at(p, bw, bh).map(img_of));
         {
@@ -14575,9 +14581,8 @@ unsafe fn reveal_in_view(hwnd: HWND, p: &str) {
 /// 跑在后台线程，界面照旧能动，进度由 60 毫秒心跳现读。
 unsafe fn start_sim_search(hwnd: HWND) {
     let hp = hwnd.0 as isize;
-    let gid = SIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let prog = Arc::new(AtomicUsize::new(0));
-    let (bw, bh, q, pct, algo, rot, flip, auto) = {
+    let (gid, tier, q, pct, algo, rot, flip, auto) = {
         let mut g = app().lock().unwrap();
         if g.sim_busy {
             g.sim_lib_msg = "上一次还没跑完，等它一下".to_string();
@@ -14585,26 +14590,26 @@ unsafe fn start_sim_search(hwnd: HWND) {
             refresh(hwnd);
             return;
         }
-        let Some((tw, th)) = sim_target_tier(&g) else {
-            g.sim_lib_msg =
-                "指纹库还是空的：先在缩略图视图里翻几张图，或去缩略图数据库页扫描一批。".to_string();
-            drop(g);
-            refresh(hwnd);
-            return;
-        };
+        // 小图标/列表/详细资料这些档自己不建缩略图，目标档得借库里账最多的一份，
+        // 那一份只有把库读进内存才知道。界面线程问到空不能就此退出——退出就再没人
+        // 去读库了，那一页会永远说"指纹库还是空的"，连搜都搜不起来。交给后台线程问。
+        let tier = sim_target_tier(&g);
         if g.sim_path.is_empty() || !Path::new(&g.sim_path).is_file() {
             g.sim_lib_msg = "先挑一张要用来找的图片".to_string();
             drop(g);
             refresh(hwnd);
             return;
         }
+        // 代号只在真要起这一趟时才换：走到这儿又回去的那几条不换代，否则正在跑
+        // 那趟交回来的收尾消息会被当成过期丢掉，"查找中"就再也摘不掉了。
+        let gid = SIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         g.sim_busy = true;
         g.sim_done = prog.clone();
         g.sim_total = 0;
         g.sim_stop.store(false, Ordering::SeqCst);
         (
-            tw,
-            th,
+            gid,
+            tier,
             g.sim_path.clone(),
             g.sim_pct,
             g.sim_algo,
@@ -14619,6 +14624,22 @@ unsafe fn start_sim_search(hwnd: HWND) {
         let hwnd = HWND(hp as *mut core::ffi::c_void);
         job::init_com();
         let t0 = Instant::now();
+        // 收尾只留这一条路：落结果 + 让界面把"查找中"摘掉，别让人卡在灰按钮上。
+        let finish = |hits: Vec<SimHit>, msg: Option<String>| {
+            let ms = t0.elapsed().as_millis();
+            let slot = SIM_RES.get_or_init(|| Mutex::new(None));
+            *slot.lock().unwrap() = Some((gid, ms, hits, msg));
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_SIM_DONE, WPARAM(gid), LPARAM(0));
+            }
+        };
+        let Some((bw, bh)) = sim::resolve_tier(tier) else {
+            finish(
+                Vec::new(),
+                Some("指纹库还是空的：先在缩略图视图里翻几张图，或去缩略图数据库页扫描一批。".to_string()),
+            );
+            return;
+        };
         if auto {
             // 同"补齐指纹"：待补名单直接来自缩略图库，不再先翻一遍路径名单。
             sim::ensure_loaded();
@@ -14695,12 +14716,7 @@ unsafe fn start_sim_search(hwnd: HWND) {
             v.truncate(sim::MAX_HITS);
             v
         });
-        let ms = t0.elapsed().as_millis();
-        let slot = SIM_RES.get_or_init(|| Mutex::new(None));
-        *slot.lock().unwrap() = Some((gid, ms, hits.unwrap_or_default()));
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_SIM_DONE, WPARAM(gid), LPARAM(0));
-        }
+        finish(hits.unwrap_or_default(), None);
     });
 }
 
@@ -19029,12 +19045,16 @@ unsafe fn paint_bitems(
         );
     }
     frame(hdc, rect, s.skin.acc);
-    let pad = (8.0 * k) as i32;
+    let pad = (theme::MENU_SEP_PAD * k) as i32;
     let tst = theme::Strip::top(s);
     let mut rows = Vec::with_capacity(items.len());
-    let mut cy = rect.top + (2.0 * k) as i32;
+    let mut cy = rect.top + (theme::MENU_INSET * k) as i32;
     for (i, it) in items.iter().enumerate() {
-        let rh = if it.sep { (6.0 * k) as i32 } else { popup_row(s) };
+        let rh = if it.sep {
+            (theme::MENU_SEP_H * k) as i32
+        } else {
+            theme::popup_row(s)
+        };
         let r = RECT { left: rect.left, top: cy, right: rect.right, bottom: cy + rh };
         cy += rh;
         if it.sep {
@@ -19088,7 +19108,7 @@ unsafe fn paint_bitems(
             }
         }
         let lr = RECT {
-            left: r.left + menu_text_x(k),
+            left: r.left + theme::menu_text_x(k),
             top: r.top,
             right: r.right - (18.0 * k) as i32,
             bottom: r.bottom,
@@ -19135,16 +19155,16 @@ unsafe fn paint_bmenu(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
     };
     let k = s.scale;
     let mut lw = 0;
-    let mut h = (4.0 * k) as i32;
+    let mut h = (theme::MENU_INSET_Y * k) as i32;
     for it in &items {
         if it.sep {
-            h += (6.0 * k) as i32;
+            h += (theme::MENU_SEP_H * k) as i32;
             continue;
         }
-        h += popup_row(s);
+        h += theme::popup_row(s);
         lw = lw.max(text_w(hdc, &it.label, a.font));
     }
-    let w = (menu_text_x(k) + lw + (26.0 * k) as i32).max((150.0 * k) as i32);
+    let w = (theme::menu_text_x(k) + lw + (26.0 * k) as i32).max((150.0 * k) as i32);
     let mut x = ax;
     let mut y = ay;
     if x + w > rc.right - 2 {
@@ -19160,16 +19180,16 @@ unsafe fn paint_bmenu(hdc: HDC, a: &mut App, s: &Theme, rc: &RECT) {
     if let Some(pi) = sub_open {
         if let Some(sub) = items.get(pi).map(|it| &it.sub).filter(|v| !v.is_empty()) {
             let mut lw = 0;
-            let mut h = (4.0 * k) as i32;
+            let mut h = (theme::MENU_INSET_Y * k) as i32;
             for it in sub {
                 if it.sep {
-                    h += (6.0 * k) as i32;
+                    h += (theme::MENU_SEP_H * k) as i32;
                     continue;
                 }
-                h += popup_row(s);
+                h += theme::popup_row(s);
                 lw = lw.max(text_w(hdc, &it.label, a.font));
             }
-            let w2 = (menu_text_x(k) + lw + (26.0 * k) as i32).max((150.0 * k) as i32);
+            let w2 = (theme::menu_text_x(k) + lw + (26.0 * k) as i32).max((150.0 * k) as i32);
             let prow = rows.iter().find(|(i, _)| *i == pi).map(|(_, r)| *r).unwrap_or(rect);
             let mut sx = prow.right - (2.0 * k) as i32;
             let mut sy = prow.top - (3.0 * k) as i32;
@@ -21359,16 +21379,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 a.sim_busy = false;
                 a.sim_total = 0;
                 match got {
-                    Some((g, ms, hits)) if g == gid => {
+                    Some((g, ms, hits, msg)) if g == gid => {
                         let n = hits.len();
                         a.sim_ms = ms;
                         a.sim_hits = hits;
                         a.sim_sel = 0;
                         a.sim_scroll = 0;
-                        a.sim_lib_msg = if n == 0 {
-                            "一张都没对上。把相似度调低些，或者勾上\u{201c}查找之前先补齐\u{201d}，下次会先补库再找。".to_string()
-                        } else {
-                            format!("找到 {n} 张，用了 {ms} 毫秒")
+                        a.sim_lib_msg = match msg {
+                            Some(m) => m,
+                            None if n == 0 => {
+                                "一张都没对上。把相似度调低些，或者勾上\u{201c}查找之前先补齐\u{201d}，下次会先补库再找。".to_string()
+                            }
+                            None => format!("找到 {n} 张，用了 {ms} 毫秒"),
                         };
                     }
                     // 后台那条没交回结果也要把"忙"摘掉，不然下次点只会回"还没跑完"。
@@ -21653,7 +21675,17 @@ fn main() {
         let _ = windows::Win32::System::Ole::OleInitialize(None);
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // JSON 命令口：把 --cmd 那一份作业摘出去，剩下的才是目录/文件参数。
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.windows(2).any(|w| {
+        (w[0] == "--cmd" || w[0] == "-cmd") && matches!(w[1].as_str(), "help" | "?" | "--help")
+    }) {
+        println!("{}", drive::USAGE);
+        return;
+    }
+    let (job, args) = drive::take(&raw);
+    // 命令口默认把这扇摆到屏幕外：真画、真消息，但不挡住他手上的活
+    let off = job.as_ref().is_some_and(|j| !j.show);
     let start = args.first().cloned().unwrap_or_else(startup_dir);
     let file_mode = !Path::new(&start).is_dir();
     let dir = if file_mode {
@@ -21685,8 +21717,9 @@ fn main() {
         if RegisterClassExW(&cls) == 0 {
             std::process::exit(1);
         }
-        // 探针模式用工具窗样式：屏幕外显示时不进任务栏、不抢激活。
-        let exstyle = if probe_path.is_some() {
+        // 命令口/探针用工具窗样式：不进任务栏、不抢激活。摆哪儿是另一回事，
+        // 下面单独判 —— 拍图要 DWM 那份重定向位图，摆到屏幕外主窗口就拍不着了。
+        let exstyle = if probe_path.is_some() || job.is_some() {
             WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
         } else {
             WINDOW_EX_STYLE(0)
@@ -21767,10 +21800,11 @@ fn main() {
         }
         let flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE;
         // 探针把窗口摆到屏幕外：真显示、真画，但用户看不见，也不激活。
-        let (px, py) = if probe_path.is_some() { (-32000, -32000) } else { (wr.left, wr.top) };
+        let (px, py) = if probe_path.is_some() || off { (-32000, -32000) } else { (wr.left, wr.top) };
         let _ = SetWindowPos(hwnd, None, px, py, ww, wh, flags);
         // NOACTIVATE 只跳过激活那一跳，窗口还得拿到前台和键盘焦点。
-        if probe_path.is_none() {
+        // 命令口跑测试不抢这两下：他手上的活不该被一次测试打断。
+        if probe_path.is_none() && job.is_none() {
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(Some(hwnd));
         }
@@ -21859,6 +21893,12 @@ fn main() {
                 }
             }
             probe("probe_end");
+            std::process::exit(0);
+        }
+        if let Some(j) = job.as_ref() {
+            // JSON 命令口：把这一串跑完就退，结果那段 JSON 打到标准输出。
+            // 窗口在屏幕外也照样走真绘制，PrintWindow 拍得到。
+            println!("{}", drive::run(hwnd, j));
             std::process::exit(0);
         }
         let _ = SetTimer(Some(hwnd), TMR, 60, None);

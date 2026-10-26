@@ -772,6 +772,59 @@ impl Strip {
     }
 }
 
+// ---- 弹层（下拉菜单、右键菜单）那一套几何 ---------------------------------
+// 主窗口和画布那扇都读这里：一边改了另一边跟着变，不会各排各的。
+// 数值一律是逻辑像素，用的时候乘 `Theme::scale`（画布那扇乘 dpi/96，同一档）。
+
+/// 图标列贴左缘让出的距离
+pub const MENU_IC_X: f64 = 6.0;
+/// 图标列的格宽（勾选记号也画在这一列里）
+pub const MENU_IC_W: f64 = 16.0;
+/// 图标列到字的间距
+pub const MENU_IC_GAP: f64 = 8.0;
+/// 字到快捷键的间距
+pub const MENU_KEY_GAP: f64 = 14.0;
+/// 右缘留白；快捷键贴的就是这条线
+pub const MENU_RIGHT: f64 = 16.0;
+/// 快捷键那一列最多让多宽
+pub const MENU_KEY_MAX: f64 = 110.0;
+/// 一层面板最窄多宽
+pub const MENU_MIN_W: f64 = 150.0;
+/// 菜单一行比主题行高再放宽这么多，选项之间不至于挤在一起
+pub const MENU_ROW_EXTRA: f64 = 3.0;
+/// 分隔线自己占的那一行高
+pub const MENU_SEP_H: f64 = 6.0;
+/// 分隔线左右两端各让出的留白
+pub const MENU_SEP_PAD: f64 = 8.0;
+/// 第一行上面让出的那一条
+pub const MENU_INSET: f64 = 2.0;
+/// 面板上下内缩的总量。历史上就是一次按 4k 取整、和上面那条分开算的，
+/// 原样留着，免得某个缩放下差出一像素。
+pub const MENU_INSET_Y: f64 = 4.0;
+
+/// 图标列之后的文字起点。勾选记号和图标共用左边这一列，没登记图标、没勾选的
+/// 行也照这一套缩进，同一菜单里的字才对得齐。
+pub fn menu_text_x(k: f64) -> i32 {
+    ((MENU_IC_X + MENU_IC_W + MENU_IC_GAP) * k) as i32
+}
+
+/// 一层面板的宽度：图标列 + 最宽那行字 + 间距 + 快捷键 + 右缘两条 `MENU_RIGHT`
+/// （其中一条留给子菜单箭头）。`label_w` / `key_w` 是用实际字体量出来的像素宽。
+pub fn menu_width(k: f64, label_w: i32, key_w: i32) -> i32 {
+    (menu_text_x(k)
+        + label_w
+        + (MENU_KEY_GAP * k) as i32
+        + key_w
+        + (MENU_RIGHT * k) as i32
+        + (MENU_RIGHT * k) as i32)
+        .max((MENU_MIN_W * k) as i32)
+}
+
+/// 弹层一行的高度。树和格子继续用原来的行高，只有菜单这一处放宽。
+pub fn popup_row(s: &Theme) -> i32 {
+    s.row + (MENU_ROW_EXTRA * s.scale) as i32
+}
+
 /// 尺寸令牌（density 只改这一层，和皮肤正交）。
 #[derive(Clone)]
 pub struct Theme {

@@ -32,8 +32,8 @@ use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_SPACE,
-    VK_V,
+    GetKeyState, ReleaseCapture, SetCapture, VK_C, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN,
+    VK_SPACE, VK_V,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
@@ -103,6 +103,13 @@ pub struct Face {
     pub ink: u32,
     pub dim: u32,
     pub hov: u32,
+    /// 下面四样是右键弹层那套，和主窗口的菜单同源：面板底 `skin.popup`、
+    /// 点不动那行的字色 `skin.ink_off`、分隔线 `skin.line_soft`。
+    pub popup: u32,
+    pub off: u32,
+    pub sep: u32,
+    /// 主窗口弹层一行多高（物理像素）。画布这扇照着它排行。
+    pub menu_row: i32,
 }
 
 impl Face {
@@ -113,6 +120,10 @@ impl Face {
             ink: th.skin.ink,
             dim: th.skin.ink_dim,
             hov: th.skin.hov,
+            popup: th.skin.popup,
+            off: th.skin.ink_off,
+            sep: th.skin.line_soft,
+            menu_row: crate::theme::popup_row(th),
         }
     }
 }
@@ -309,9 +320,101 @@ pub fn set_strip(st: crate::theme::Strip, face: Face) {
     }
 }
 
+/// 命令行口用：这扇在不在（在的话给它句柄，好拍图、好投消息）。
+pub fn window() -> Option<HWND> {
+    hwnd_of()
+}
+
+/// 命令行口跑测试时置真：建这扇就摆到屏幕外、也不抢前台。PrintWindow 拍得到
+/// 屏幕外的窗，所以图照样出，他手上的软件不受打扰。
+pub fn set_headless(on: bool) {
+    HEADLESS.store(on, Ordering::SeqCst);
+}
+
+fn headless() -> bool {
+    HEADLESS.load(Ordering::SeqCst)
+}
+
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
+/// 字符串进 JSON 之前过一遍：路径里的反斜杠和引号不转义，读的那头就散了。
+fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// 命令行口用：把画布此刻的状态写成一段 JSON。哪张图落在哪儿、解码回来没有、
+/// 弹层开在哪、那几行各占哪一块 —— 全都报出去，脚本照着行心点，不用猜坐标。
+pub fn probe_json() -> String {
+    let Some(g) = state().lock().ok() else { return "{}".into() };
+    let Some(s) = g.as_ref() else { return "{\"open\":false}".into() };
+    let (w, h) = (s.rc.right - s.rc.left, s.rc.bottom - s.rc.top);
+    let mut o = format!(
+        "{{\"open\":true,\"client\":[{w},{h}],\"dpi\":{},\"strip\":{},\"bg\":{},\"intro\":{},\"clip\":{}",
+        s.dpi,
+        s.strip,
+        s.bg,
+        s.intro,
+        s.clip
+    );
+    o.push_str(",\"cards\":[");
+    for (i, c) in s.cards.iter().enumerate() {
+        let (x, y, cw, ch) = match on_screen(c, s) {
+            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => (c.x, c.y, 0, 0),
+        };
+        if i > 0 {
+            o.push(',');
+        }
+        o.push_str(&format!(
+            "{{\"id\":{},\"x\":{x},\"y\":{y},\"w\":{cw},\"h\":{ch},\"scale\":{:.4},\"ready\":{},\"path\":\"{}\"}}",
+            c.id,
+            c.scale,
+            c.view.is_some(),
+            esc(&c.path)
+        ));
+    }
+    o.push(']');
+    match s.menu.as_ref() {
+        Some(m) => {
+            let card = match m.card {
+                Some(id) => id.to_string(),
+                None => "null".to_string(),
+            };
+            o.push_str(&format!(
+                ",\"menu\":{{\"x\":{},\"y\":{},\"card\":{card},\"paste\":{},\"hot\":{},\"rows\":[",
+                m.x, m.y, m.paste, m.hot
+            ));
+            for (i, (id, r)) in m.rows.iter().enumerate() {
+                if i > 0 {
+                    o.push(',');
+                }
+                o.push_str(&format!(
+                    "[{id},[{}, {}, {}, {}]]",
+                    r.left, r.top, r.right, r.bottom
+                ));
+            }
+            o.push_str("]}");
+        }
+        None => o.push_str(",\"menu\":null"),
+    }
+    o.push('}');
+    o
+}
+
 /// 全局只有这一扇
-static WIN: AtomicIsize = AtomicIsize::new(0);
-static REGISTERED: AtomicBool = AtomicBool::new(false);
+static WIN: AtomicIsize = AtomicIsize::new(0);static REGISTERED: AtomicBool = AtomicBool::new(false);
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn hwnd_of() -> Option<HWND> {
@@ -391,8 +494,11 @@ pub fn open(path: &str, pick: HWND) {
     }
     add_file(&p, None);
     if let Some(h) = hwnd_of() {
-        unsafe {
-            let _ = SetForegroundWindow(h);
+        // 命令口跑测试时不抢前台：他那边正打字，前台被这扇抢走算事故
+        if !headless() {
+            unsafe {
+                let _ = SetForegroundWindow(h);
+            }
         }
     }
 }
@@ -422,6 +528,8 @@ fn ensure(pick: HWND) -> Option<HWND> {
         let wh = ((work.bottom - work.top) * 6 / 10).max(360).min(620);
         let x = work.left + (work.right - work.left - ww) / 2;
         let y = work.top + (work.bottom - work.top - wh) / 2;
+        // 命令口跑测试：摆到屏幕外，真画但看不见，也不挡住他手上的活
+        let (x, y) = if headless() { (-32000, -32000) } else { (x, y) };
         let t = wide(TITLE);
         let hinst = HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0);
         let hwnd = CreateWindowExW(
@@ -1309,8 +1417,19 @@ unsafe fn paint_strip(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
     opaque(px, w, h, &top);
 }
 
-/// 右键弹层。底色、字色、悬停那一层全都借标题条那一套（`strip_of`），
-/// 所以皮肤一换它跟着换，不会冒出一块系统白的菜单。
+/// 用当前选中的那支笔量一行字有多宽。量字和画字同一支笔，才不会量窄了裁字。
+unsafe fn text_w(hdc: HDC, t: &str) -> i32 {
+    let mut u: Vec<u16> = t.encode_utf16().collect();
+    let mut r = RECT { left: 0, top: 0, right: 4000, bottom: 4000 };
+    let _ = DrawTextW(hdc, &mut u, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    r.right
+}
+
+/// 右键弹层。设计就是系统菜单那一套，尺寸读主窗口菜单同一组令牌
+/// （`theme::MENU_*`）：中性面板底、一圈 accent 细框、左缘留出图标列、
+/// 快捷键贴右对齐、点不动的那行只把字压灰不铺底；只有悬停那一行铺
+/// 标题栏那一档底色。底色和字色由宿主画标题栏时喂进来的 `Face` 出，
+/// 皮肤一换整套跟着换。
 unsafe fn paint_menu(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
     use crate::theme as th;
     let (mx, my, card, hot, mw0) = match s.menu.as_ref() {
@@ -1319,34 +1438,41 @@ unsafe fn paint_menu(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
     };
     let paste = s.menu.as_ref().is_some_and(|m| m.paste);
     let st = strip_of(s.dpi);
-    let kk = |v: i32| v * s.dpi / 96;
-    let items = [("复制图像", MI_COPY), ("粘贴剪贴板图片", MI_PASTE), ("删除这张", MI_DEL)];
-    let rh = kk(26);
-    let padx = kk(12);
-    let pady = kk(6);
+    let fc = face_of(s.dpi);
+    let k = s.dpi as f64 / 96.0;
+    // (那一行的字, 快捷键, 编号, 上面要不要一道分隔线)
+    let items = [
+        ("复制图像", "Ctrl+C", MI_COPY, false),
+        ("粘贴剪贴板图片", "Ctrl+V", MI_PASTE, false),
+        ("删除这张", "Del", MI_DEL, true),
+    ];
+    let rh = fc.menu_row.max(1);
+    let sep_h = (th::MENU_SEP_H * k) as i32;
+    let seps = items.iter().filter(|(_, _, _, sp)| *sp).count() as i32;
+    let padx = th::menu_text_x(k);
+    let pr = (th::MENU_RIGHT * k) as i32;
+    let inset = (th::MENU_INSET * k) as i32;
     let f = HFONT(s.font as *mut core::ffi::c_void);
     SelectObject(hdc, HGDIOBJ(f.0));
     let _ = SetBkMode(hdc, TRANSPARENT);
-    // 盘子宽度按最宽那行量一次就存下来（量字和画字同一支笔，才不会量窄了裁字）：
-    // 菜单开着时鼠标每跨过一行都要推一面，不能每帧回头把字再量一遍。
-    let mut wide = 0i32;
+    // 盘子宽度按最宽那行量一次就存下来：菜单开着时鼠标每跨过一行都要推一面，
+    // 不能每帧回头把字再量一遍。
+    let (mut lw, mut kw) = (0i32, 0i32);
     if mw0 == 0 {
-        for (t, _) in items {
-            let mut u: Vec<u16> = t.encode_utf16().collect();
-            let mut r = RECT { left: 0, top: 0, right: 4000, bottom: 4000 };
-            let _ = DrawTextW(hdc, &mut u, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-            wide = wide.max(r.right);
+        for (t, key, _, _) in items {
+            lw = lw.max(text_w(hdc, t));
+            kw = kw.max(text_w(hdc, key));
         }
     }
-    let mw = if mw0 > 0 { mw0 } else { (wide + padx * 2).max(kk(150)) };
-    let mh = rh * items.len() as i32 + pady * 2;
+    let mw = if mw0 > 0 { mw0 } else { th::menu_width(k, lw, kw) };
+    let mh = rh * items.len() as i32 + sep_h * seps + (th::MENU_INSET_Y * k) as i32;
     // 贴着右边或下边右键时往回收，这块画布比菜单大不了多少的时候也不能出去
     let x = mx.clamp(2, (w - mw - 2).max(2));
     let y = my.clamp(s.strip + 2, (h - mh - 2).max(s.strip + 2));
     let panel = RECT { left: x, top: y, right: x + mw, bottom: y + mh };
-    // 跟主窗口那几类弹层同一套：同尺寸灰纱往右下让 6 像素，同一处按 50% 混，
+    // 跟主窗口那几类弹层同一套投法：同尺寸灰纱往右下让 6 像素，同一处按 50% 混，
     // 底下压着的图透得出来。
-    let off = (4.0 * (s.dpi as f64 / 96.0)) as i32 + 1;
+    let off = (4.0 * k) as i32 + 1;
     let sh = RECT {
         left: panel.left + off,
         top: panel.top + off,
@@ -1354,42 +1480,60 @@ unsafe fn paint_menu(hdc: HDC, s: &mut State, px: *mut u32, w: i32, h: i32) {
         bottom: panel.bottom + off,
     };
     veil_px(px, w, h, &sh, 0x009E9E9E, 128);
-    put(px, w, h, &panel, st.bar);
+    put(px, w, h, &panel, fc.popup);
     let mut rows: Vec<(usize, RECT)> = Vec::with_capacity(items.len());
-    for (i, (t, id)) in items.iter().enumerate() {
-        let r = RECT {
-            left: x + 1,
-            top: y + pady + i as i32 * rh,
-            right: x + mw - 1,
-            bottom: y + pady + (i as i32 + 1) * rh,
-        };
-        let on = menu_on(*id, card, paste);
+    let mut cy = y + inset;
+    for (i, (t, key, id, sp)) in items.into_iter().enumerate() {
+        if sp {
+            let spad = (th::MENU_SEP_PAD * k) as i32;
+            let mid = cy + sep_h / 2;
+            put(
+                px,
+                w,
+                h,
+                &RECT { left: x + spad, top: mid, right: x + mw - spad, bottom: mid + 1 },
+                fc.sep,
+            );
+            cy += sep_h;
+        }
+        let r = RECT { left: x, top: cy, right: x + mw, bottom: cy + rh };
+        cy += rh;
+        let on = menu_on(id, card, paste);
         let picked = on && hot == i as i32;
         if picked {
-            put(px, w, h, &r, st.hot);
+            put(px, w, h, &r, st.bar);
         }
         let col = if !on {
-            st.dim
+            fc.off
         } else if picked {
             st.fg
         } else {
-            st.ink
+            fc.ink
         };
         let _ = SetTextColor(hdc, th::cref(col));
-        let mut tr = RECT { left: r.left + padx, top: r.top, right: r.right - padx, bottom: r.bottom };
+        let mut tr = RECT { left: x + padx, top: r.top, right: r.right - pr, bottom: r.bottom };
         let mut u: Vec<u16> = t.encode_utf16().collect();
         let _ = DrawTextW(hdc, &mut u, &mut tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        rows.push((*id, r));
+        // 快捷键贴右那一列，和主窗口弹层同一条线
+        let _ = SetTextColor(hdc, th::cref(if picked { st.dim } else { fc.dim }));
+        let mut kr = RECT {
+            left: r.right - pr - (th::MENU_KEY_MAX * k) as i32,
+            top: r.top,
+            right: r.right - pr,
+            bottom: r.bottom,
+        };
+        let mut v: Vec<u16> = key.encode_utf16().collect();
+        let _ = DrawTextW(hdc, &mut v, &mut kr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        rows.push((id, r));
     }
-    // 一圈 1 像素实框，跟主窗口那几类弹层同一做法
-    let line = th::mix(st.bar, st.fg, 0.45);
+    // 一圈 1 像素实框：accent，和主窗口弹层同一色、同一做法
     for r in [
         RECT { left: x, top: y, right: x + mw, bottom: y + 1 },
         RECT { left: x, top: y + mh - 1, right: x + mw, bottom: y + mh },
         RECT { left: x, top: y, right: x + 1, bottom: y + mh },
         RECT { left: x + mw - 1, top: y, right: x + mw, bottom: y + mh },
     ] {
-        put(px, w, h, &r, line);
+        put(px, w, h, &r, st.bar);
     }
     // 框和字都画完了：这一整块钉成不透，不然半透的背景会从菜单底下透出来糊掉字
     opaque(px, w, h, &panel);
@@ -1856,6 +2000,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if wp.0 == VK_V.0 as usize && GetKeyState(VK_CONTROL.0 as i32) < 0 {
                 close_menu(hwnd);
                 paste_clip();
+                return LRESULT(0);
+            }
+            // Ctrl+C：复制鼠标底下那一张，和弹层那一行、和 Del 都是同一个落点。
+            if wp.0 == VK_C.0 as usize && GetKeyState(VK_CONTROL.0 as i32) < 0 {
+                close_menu(hwnd);
+                let card = {
+                    let g = state().lock().unwrap();
+                    g.as_ref().and_then(|s| hit(s, s.hover.0, s.hover.1).map(|i| s.cards[i].id))
+                };
+                menu_act(hwnd, MI_COPY, card);
                 return LRESULT(0);
             }
             let menu_open = state().lock().unwrap().as_ref().is_some_and(|s| s.menu.is_some());

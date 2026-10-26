@@ -17,6 +17,7 @@ pub mod preview;
 pub mod psd;
 pub mod refwin;
 pub mod scan;
+pub mod shot;
 pub mod sim;
 pub mod sysicon;
 pub mod theme;
