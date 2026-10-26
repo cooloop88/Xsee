@@ -7,16 +7,15 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::AtomicU64;
 use windows::Win32::Foundation::HANDLE;
 use xsee_host::{
     appicon, assoc, cache, clip, catdb, encode, fmticon, glyphs, job, menuicons,
     pool::Pool,
-    refwin,
+    preview, refwin,
     scan,
     sim, sysicon, Rgba,
     theme::{self, mix, Style, Theme, cref, MENU_IC_W, MENU_IC_X},
@@ -66,11 +65,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-
-// JSON 命令口（xsee --cmd '...'）。单独一个文件，别往这九十万行里堆。
-// 路径要点名：bin 根文件的子模块默认往 src/bin/ 那一层找，会撞成另一个 bin。
-#[path = "browse/drive.rs"]
-mod drive;
 
 const CLASS: &str = "XseeBrowseWnd";
 const TITLE: &str = "Xsee 浏览";
@@ -150,6 +144,8 @@ const M_SORT_REV: usize = 268;
 /// 按入库时间排：用的是我们自己库里那一列时间（第一次见到那张图时盖当下时间，
 /// 之后不再改）。排在末尾，不改动上面那批命令号。
 const M_SORT_ADDED: usize = 276;
+/// 按文件系统的创建时间排。
+const M_SORT_CRT: usize = 334;
 const M_NEWDIR: usize = 269;
 const M_PASTE: usize = 270;
 const M_CUT: usize = 271;
@@ -381,336 +377,6 @@ static CONV_STOP: AtomicBool = AtomicBool::new(false);
 static DB_RESULT: Mutex<(u8, String, bool)> = Mutex::new((0, String::new(), false));
 static INIT_WALL: OnceLock<Mutex<String>> = OnceLock::new();
 
-/// 这一帧是被谁引起的：1=滚轮，2=60 毫秒心跳，0=别处。paint 收尾时读一次并清零。
-static PAINT_SRC: AtomicU8 = AtomicU8::new(0);
-
-/// 一帧各段耗时累计（微秒）：建后备位图/上栏/树/网格/预览/侧栏/弹层纱/上屏。
-/// 只记滚轮帧，滚轮帧那批 flush 时才取走清零，免得别的帧把钱算混。
-static SEG_TOT: Mutex<[u32; 8]> = Mutex::new([0; 8]);
-static SEG_N: AtomicU32 = AtomicU32::new(0);
-/// 刚画完这一帧的各段耗时。中位再低也看不出"咯噔"那一下是怎么来的，
-/// 所以每帧的明细也要留一份，攒到批末尾跟汇总行一起写出去。
-static LAST_SEG: Mutex<[u32; 8]> = Mutex::new([0; 8]);
-static LAST_SUB: Mutex<[u32; 10]> = Mutex::new([0; 10]);
-
-fn seg_tracing() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XSEE_TRACE").is_some())
-}
-
-fn seg_add(v: &[u32; 8]) {
-    if let Ok(mut t) = SEG_TOT.lock() {
-        for i in 0..8 {
-            t[i] = t[i].saturating_add(v[i]);
-        }
-        SEG_N.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// 把累计的分段耗时折成平均每帧，交出去时清零。
-fn seg_take() -> Option<[f64; 8]> {
-    let n = SEG_N.swap(0, Ordering::Relaxed);
-    if n == 0 {
-        return None;
-    }
-    let mut t = SEG_TOT.lock().ok()?;
-    let mut out = [0.0f64; 8];
-    for i in 0..8 {
-        out[i] = t[i] as f64 / n as f64;
-        t[i] = 0;
-    }
-    drop(t);
-    Some(out)
-}
-
-/// 网格那一段里再拆三层：地面（钉在窗口上）/ 逐格（钉在内容上）/ 尾巴（列头+滚动条+外框）。
-/// 要判断滚动时哪些能整体搬进位图、哪些必须每帧重画，得先知道这两层各吃掉多少。
-static SUB_TOT: Mutex<[u32; 10]> = Mutex::new([0; 10]);
-static SUB_N: AtomicU32 = AtomicU32::new(0);
-
-fn sub_add(v: &[u32; 10]) {
-    if let Ok(mut t) = SUB_TOT.lock() {
-        for i in 0..10 {
-            t[i] = t[i].saturating_add(v[i]);
-        }
-        SUB_N.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn sub_take() -> Option<[f64; 10]> {
-    let n = SUB_N.swap(0, Ordering::Relaxed);
-    if n == 0 {
-        return None;
-    }
-    let mut t = SUB_TOT.lock().ok()?;
-    let mut out = [0.0f64; 10];
-    for i in 0..10 {
-        out[i] = t[i] as f64 / n as f64;
-        t[i] = 0;
-    }
-    drop(t);
-    Some(out)
-}
-
-/// 逐格这一层里再按调用点拆开量：画刷起落 / 取图缩放 / 圆角裁剪 / 排字 / 圆环。
-/// 只在滚轮帧的网格循环里开着（SUB_DEEP），关掉就只剩一次原子读，生产路径不吃这个钱。
-static SUB_DEEP: AtomicBool = AtomicBool::new(false);
-static DEEP_TOT: Mutex<[u32; 7]> = Mutex::new([0; 7]);
-/// 一格排两行字：尺寸行、名字行。两行的画法不一样（一个带省略号一个不带），
-/// 钱到底花在哪一行得分开看，所以排字这一档画之前先拨一下归哪一档。
-static TXT_SLOT: AtomicUsize = AtomicUsize::new(3);
-
-fn deep_snap() -> [u32; 7] {
-    DEEP_TOT.lock().map(|t| *t).unwrap_or([0; 7])
-}
-
-/// 开着才取时间戳；`on` 由调用点传 SUB_DEEP 那一次读的结果，一次调用只读一遍。
-fn deep_add(i: usize, t: Option<Instant>) {
-    if let Some(t) = t {
-        if let Ok(mut d) = DEEP_TOT.lock() {
-            d[i] = d[i].saturating_add(t.elapsed().as_micros() as u32);
-        }
-    }
-}
-
-/// 帧计时。设了 XSEE_TRACE 才记，攒满一批才落文件：逐帧写的话文件 IO 会混进
-/// 帧间隔里，"每帧画多久"就量不准了。滚轮帧和其余帧分两桶，滚动卡不卡只看前者。
-static FRAMES: OnceLock<Mutex<FrameAcc>> = OnceLock::new();
-const FRAME_BATCH: usize = 40;
-const FRAME_HOLD_US: u64 = 1_200_000;
-
-struct FrameAcc {
-    last_end: Option<Instant>,
-    last_flush: Instant,
-    w_used: Vec<u32>,
-    w_gap: Vec<u32>,
-    w_seg: Vec<[u32; 8]>,
-    w_sub: Vec<[u32; 10]>,
-    r_used: Vec<u32>,
-    r_gap: Vec<u32>,
-    cells: u32,
-    bw: i32,
-    bh: i32,
-    sty: &'static str,
-}
-
-fn frames() -> &'static Mutex<FrameAcc> {
-    FRAMES.get_or_init(|| {
-        Mutex::new(FrameAcc {
-            last_end: None,
-            last_flush: Instant::now(),
-            w_used: Vec::new(),
-            w_gap: Vec::new(),
-            w_seg: Vec::new(),
-            w_sub: Vec::new(),
-            r_used: Vec::new(),
-            r_gap: Vec::new(),
-            cells: 0,
-            bw: 0,
-            bh: 0,
-            sty: "-",
-        })
-    })
-}
-
-/// 分位数：先排序再按下标取，四舍五入到边界。
-fn pct(v: &mut [u32], q: f64) -> u32 {
-    if v.is_empty() {
-        return 0;
-    }
-    v.sort_unstable();
-    let i = ((v.len() as f64 - 1.0) * q).round() as usize;
-    v[i.min(v.len() - 1)]
-}
-
-fn frame_begin() -> (Instant, u32) {
-    let now = Instant::now();
-    let mut gap = 0u32;
-    if let Ok(a) = frames().lock() {
-        if let Some(e) = a.last_end {
-            gap = now.duration_since(e).as_micros() as u32;
-        }
-    }
-    (now, gap)
-}
-
-/// 把一桶帧样本汇成一行写进 XSEE_TRACE 那个文件。
-fn frame_emit(tag: &str, mut used_v: Vec<u32>, mut gap_v: Vec<u32>, cells: u32, bw: i32, bh: i32, sty: &str) {
-    let n = used_v.len();
-    if n == 0 {
-        return;
-    }
-    let paint_avg = used_v.iter().sum::<u32>() as f64 / n as f64;
-    let gap_avg = gap_v.iter().sum::<u32>() as f64 / n as f64;
-    let (u_min, u_p50, u_p95, u_max) = (
-        pct(&mut used_v, 0.0),
-        pct(&mut used_v, 0.5),
-        pct(&mut used_v, 0.95),
-        pct(&mut used_v, 1.0),
-    );
-    let (g_min, g_p50, g_p95, g_max) = (
-        pct(&mut gap_v, 0.0),
-        pct(&mut gap_v, 0.5),
-        pct(&mut gap_v, 0.95),
-        pct(&mut gap_v, 1.0),
-    );
-    if std::env::var_os("XSEE_TRACE").is_none() {
-        return;
-    }
-    // 分段耗时只属于滚轮帧那一行；other 那行不能把它们取走清零。
-    let seg = if tag == "wheel" {
-        seg_take().map(|s| {
-            format!(
-                " seg_back={:.0} seg_bar={:.0} seg_tree={:.0} seg_grid={:.0} seg_pv={:.0} seg_side={:.0} seg_pop={:.0} seg_blt={:.0}",
-                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]
-            )
-        }).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let sub = if tag == "wheel" {
-        sub_take().map(|s| format!(
-            " seg_ground={:.0} seg_cells={:.0} seg_tail={:.0} seg_fill={:.0} seg_dib={:.0} seg_clip={:.0} seg_txt={:.0} seg_ring={:.0} seg_dim={:.0} seg_grad={:.0}",
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]
-        ))
-        .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    // 这一批里真重缩了几次：正常只有第一次遇到那一格才缩，
-    // 数字贴着格子数就说明在每帧重缩，那这缓存白做。
-    let reb = if tag == "wheel" {
-        format!(" reb={}", RESAMPLES.swap(0, Ordering::Relaxed))
-    } else {
-        String::new()
-    };
-    // 列表帧里有多少走了条带、多少整块重画：band=0/N 就是条带一次都没生效。
-    let band = if tag == "wheel" {
-        format!(
-            " band={}/{}",
-            BAND_FRAMES.swap(0, Ordering::Relaxed),
-            GRID_FRAMES.swap(0, Ordering::Relaxed)
-        )
-    } else {
-        String::new()
-    };
-    let Some(mut guard) = trace_file() else { return };
-    let Some(f) = guard.as_mut() else { return };
-    let _ = writeln!(
-        f,
-        "ev=fps src={} sty={} n={} cells={} buf={}x{} paint_avg={:.0} paint_min={} paint_p50={} paint_p95={} paint_max={} gap_avg={:.0} gap_min={} gap_p50={} gap_p95={} gap_max={} fps={:.1}{}{}{}{}",
-        tag, sty, n, cells, bw, bh,
-        paint_avg, u_min, u_p50, u_p95, u_max,
-        gap_avg, g_min, g_p50, g_p95, g_max,
-        if gap_avg > 0.0 { 1_000_000.0 / gap_avg } else { 0.0 },
-        seg,
-        sub,
-        reb,
-        band,
-    );
-    let _ = f.flush();
-}
-
-/// 遥测文件：设了 XSEE_TRACE 才开，开了就一次握到底，批行和每帧明细共用这一份。
-fn trace_file() -> Option<std::sync::MutexGuard<'static, Option<std::fs::File>>> {
-    static F: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
-    let slot = F.get_or_init(|| match std::env::var_os("XSEE_TRACE") {
-        Some(p) => Mutex::new(
-            std::fs::OpenOptions::new().create(true).append(true).open(&p).ok(),
-        ),
-        None => Mutex::new(None),
-    });
-    slot.lock().ok()
-}
-
-/// 把这一批滚轮帧逐帧落一行。查"最差那一帧贵在哪一段"只能靠它，
-/// 汇总行里的 p95 只会告诉你有个洞，不会说是哪个洞。
-fn frame_rows(seg: &[[u32; 8]], sub: &[[u32; 10]], used: &[u32], gap: &[u32], sty: &str) {
-    let Some(mut guard) = trace_file() else { return };
-    let Some(f) = guard.as_mut() else { return };
-    for i in 0..used.len().min(seg.len()).min(sub.len()) {
-        let s = &seg[i];
-        let c = &sub[i];
-        let _ = writeln!(
-            f,
-            "ev=frm sty={} paint={} gap={} back={} bar={} tree={} grid={} pv={} side={} pop={} blt={} \
-             ground={} cells={} tail={} fill={} dib={} clip={} txt={} ring={} dim={} grad={}",
-            sty, used[i], gap[i],
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9],
-        );
-    }
-    let _ = f.flush();
-}
-
-/// 攒够一批、或者压着不满批已经过了一阵，就落一行。
-/// 快滚时多次滚轮会被并成一帧，只按固定帧数攒的话一批都出不来。
-fn frame_flush_due(a: &mut FrameAcc, force: bool) {
-    let nw = a.w_used.len();
-    let nr = a.r_used.len();
-    if nw + nr == 0 {
-        a.last_flush = Instant::now();
-        return;
-    }
-    let held = a.last_flush.elapsed().as_micros() as u64;
-    if !force && nw < FRAME_BATCH && nr < FRAME_BATCH && held < FRAME_HOLD_US {
-        return;
-    }
-    let (cells, bw, bh, sty) = (a.cells, a.bw, a.bh, a.sty);
-    if nw > 0 {
-        let (used, gapv) = (std::mem::take(&mut a.w_used), std::mem::take(&mut a.w_gap));
-        let (sg, sb) = (std::mem::take(&mut a.w_seg), std::mem::take(&mut a.w_sub));
-        // 明细行要用未排序的样本，汇总行排序时会就地打乱，所以先写明细。
-        frame_rows(&sg, &sb, &used, &gapv, sty);
-        frame_emit("wheel", used, gapv, cells, bw, bh, sty);
-    }
-    if nr > 0 {
-        frame_emit("other", std::mem::take(&mut a.r_used), std::mem::take(&mut a.r_gap), cells, bw, bh, sty);
-    }
-    a.last_flush = Instant::now();
-}
-
-unsafe fn frame_end(t0: Instant, gap: u32, hwnd: HWND) {
-    if std::env::var_os("XSEE_TRACE").is_none() {
-        return;
-    }
-    let used = t0.elapsed().as_micros() as u32;
-    let src = PAINT_SRC.swap(0, Ordering::Relaxed);
-    let rc = client(hwnd);
-    let (cells, sty) = app()
-        .lock()
-        .ok()
-        .map(|g| ((g.vis.1.saturating_sub(g.vis.0)) as u32, g.th.style.label()))
-        .unwrap_or((0, "-"));
-    let Ok(mut a) = frames().lock() else { return };
-    a.last_end = Some(Instant::now());
-    a.cells = cells;
-    a.sty = sty;
-    a.bw = rc.right.max(0);
-    a.bh = rc.bottom.max(0);
-    if src == 1 {
-        a.w_used.push(used);
-        a.w_gap.push(gap);
-        if let (Ok(s), Ok(c)) = (LAST_SEG.lock(), LAST_SUB.lock()) {
-            a.w_seg.push(*s);
-            a.w_sub.push(*c);
-        }
-    } else {
-        a.r_used.push(used);
-        a.r_gap.push(gap);
-    }
-    frame_flush_due(&mut a, false);
-}
-
-/// 心跳里补一句：滚完停手时最后一批不满整数的帧也要落文件。
-fn frame_tick() {
-    if std::env::var_os("XSEE_TRACE").is_none() {
-        return;
-    }
-    let Ok(mut a) = frames().lock() else { return };
-    frame_flush_due(&mut a, false);
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum SortKey {
     Name,
@@ -720,8 +386,10 @@ enum SortKey {
     Date,
     Image,
     Desc,
-    /// 库里记的入库时间。排在最后，前面几档的编号（会存进界面数）不动。
+    /// 库里记的入库时间。
     Added,
+    /// 文件系统的创建时间。新档只能往末尾加：编号会存进界面数。
+    Crt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -877,7 +545,8 @@ const ARRANGE: &[MenuItem] = &[
     mi("按扩展名(E)", "NumPad 2", M_SORT_EXT),
     mi("按大小", "NumPad 3", M_SORT_SIZE),
     mi("按类型", "NumPad 4", M_SORT_TYPE),
-    mi("按日期", "NumPad 5", M_SORT_DATE),
+    mi("按修改时间", "NumPad 5", M_SORT_DATE),
+    mi("按创建时间", "", M_SORT_CRT),
     mi("按图像属性", "NumPad 6", M_SORT_IMAGE),
     mi("按入库时间", "", M_SORT_ADDED),
     mi("按描述", "NumPad 0", M_SORT_DESC),
@@ -982,7 +651,8 @@ const CTX_ARRANGE: &[MenuItem] = &[
     mi("按名称", "", M_SORT_NAME),
     mi("按大小", "", M_SORT_SIZE),
     mi("按类型", "", M_SORT_TYPE),
-    mi("按日期", "", M_SORT_DATE),
+    mi("按修改时间", "", M_SORT_DATE),
+    mi("按创建时间", "", M_SORT_CRT),
     mi("按入库时间", "", M_SORT_ADDED),
     msep(),
     mi("正向放映", "", M_SORT_FWD),
@@ -1099,6 +769,9 @@ enum Mode {
 /// （`sim::MIN_SIDE`）——矮过它，看过的图会静默记不进指纹库。
 const THUMB_H_MIN: i32 = 100;
 const THUMB_H_MAX: i32 = 150;
+/// 缩略图的固定模板尺寸（宽×高）。滑块只调密度，这个数不动：
+/// 解码、缓存、指纹全都按它走，一档到底。
+const THUMB_TIER: (u32, u32) = (181, 125);
 const THUMB_H_STEP: i32 = 5;
 /// 内存里最多留多少缩略图像素（原尺寸那份 + 按显示尺寸缩好的那份）。
 /// 按字节算不按张数算：默认缩略图档一张约 60 KB，256 MB 足够一两千张的目录
@@ -1550,7 +1223,8 @@ struct App {
     scan_scroll: usize,
     /// 扫描进行中的计数，心跳和结果框都从这几个现读。
     scan_busy: bool,
-    scan_total: usize,
+    /// 已经找到的张数：找图和出图同时跑，这趟没有提前知道的总数。
+    scan_found: Arc<AtomicUsize>,
     scan_done: Arc<AtomicUsize>,
     scan_added: Arc<AtomicUsize>,
     scan_skip: Arc<AtomicUsize>,
@@ -2078,6 +1752,7 @@ fn sort_at(i: u32) -> SortKey {
         5 => SortKey::Image,
         6 => SortKey::Desc,
         7 => SortKey::Added,
+        8 => SortKey::Crt,
         _ => SortKey::Name,
     }
 }
@@ -2139,11 +1814,6 @@ static UI_ZOOM: AtomicU32 = AtomicU32::new(0);
 
 /// 全量写一次。每个"这一次调整结束"的时刻调一次，攒到关窗才写的话崩一次就全丢。
 unsafe fn ui_save(a: &App, hwnd: HWND) {
-    // 命令口跑测试那一趟不写盘：跑完就退，把测试摆的位置和目录记到他偏好里，
-    // 下次他自己打开就发现软件"变了"。
-    if drive::quiet() {
-        return;
-    }
     let mut items = ui_items(a);
     items.extend(ui_win(hwnd));
     let key = uw(UI_KEY);
@@ -2472,7 +2142,7 @@ fn app() -> &'static Mutex<App> {
             scan_list: RECT::default(),
             scan_scroll: 0,
             scan_busy: false,
-            scan_total: 0,
+            scan_found: Arc::new(AtomicUsize::new(0)),
             scan_done: Arc::new(AtomicUsize::new(0)),
             scan_added: Arc::new(AtomicUsize::new(0)),
             scan_skip: Arc::new(AtomicUsize::new(0)),
@@ -2715,17 +2385,15 @@ impl App {
         ((gw - pad * 2).max(1) / self.box_size().0.max(1)).max(1) as usize
     }
 
-    /// 缩略图向解码器要的目标框：格子扣掉边距和文件名行。
-    /// 图标档、列表档不生成缩略图，这个尺寸只给找相似那几块预览用，照格子档给。
+    /// 解码器/缓存/指纹用的缩略图尺寸：**固定模板，和滑块脱钩**。
+    /// 滑块只管一格多大、一屏几张（密度），不再顺手提一档新的缩略图。
+    /// 定在 181×125 有三个理由：这一尺寸就是当前版式在默认滑块下算出来的，
+    /// 库里已有的那五万条接着能用、一张都不用重做；短边 125 够指纹线（96）；
+    /// 长边 181 是 PSD 档内预览 160 的 1.13 倍，够得着预览那条快路，
+    /// 大 PSD 不会再整幅解（实测每张 480ms → 9ms）。
+    /// 以前滑块每挪一格就多一档缓存：同一批图存过 20 档，光近似重复的就白占三十几 MB。
     fn tbox(&self) -> (u32, u32) {
-        match self.mode {
-            Mode::Grid | Mode::Small => self.thumb_box(),
-            Mode::List | Mode::Detail => {
-                let (_, ch) = self.box_size();
-                let s = (ch - 2).clamp(16, 64) as u32;
-                (s, s)
-            }
-        }
+        THUMB_TIER
     }
 
     /// 这一档要不要开缩略图池。图标档、列表档只画图标，不开；
@@ -2999,47 +2667,6 @@ impl App {
         cache::hits().saturating_sub(self.hit0)
     }
 
-    /// 遥测：设了 XSEE_TRACE 就把关键计数按行追加进那个文件。
-    /// "命中为什么只有 100 多张""用时有没有自己涨"这类账，看文件比看截图准。
-    fn trace(&self, ev: &str) {
-        let Some(p) = std::env::var_os("XSEE_TRACE") else { return };
-        static F: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
-        let slot = F.get_or_init(|| {
-            Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&p).ok())
-        });
-        let Ok(mut guard) = slot.lock() else { return };
-        let Some(f) = guard.as_mut() else { return };
-        let (bw, bh) = self.tbox();
-        let _ = writeln!(
-            f,
-            "ev={} box={}x{} n={} got={} err={} q={} hits={} dir_hits={} mk={} sel={} anch={} t0={:.2} tdir={:.2} ready={:.2} dir={}",
-            ev,
-            bw,
-            bh,
-            self.n_images(),
-            self.got,
-            self.err,
-            self.queued.len(),
-            cache::hits(),
-            self.dir_hits(),
-            self.marked.len(),
-            if self.sel == usize::MAX {
-                -1isize
-            } else {
-                self.sel as isize
-            },
-            if self.anchor == usize::MAX {
-                -1isize
-            } else {
-                self.anchor as isize
-            },
-            self.t0.elapsed().as_secs_f64(),
-            self.t_dir.elapsed().as_secs_f64(),
-            self.ready_sec.unwrap_or(-1.0),
-            self.dir.display(),
-        );
-    }
-
     fn restart_pool(&mut self) {
         if let Some(o) = self.pool.take() {
             o.shutdown();
@@ -3054,7 +2681,6 @@ impl App {
         self.t0 = Instant::now();
         // 图标档、列表档只画图标、一张缩略图也不生成，池子索性不开。
         if !self.wants_thumb() {
-            self.trace("pool");
             return;
         }
         let paths: Vec<String> = self.entries.iter().map(|e| e.path.clone()).collect();
@@ -3076,7 +2702,6 @@ impl App {
         self.got = 0;
         self.err = 0;
         self.t0 = Instant::now();
-        self.trace("pool");
     }
 
     /// 按三个过滤开关把列表筛一遍。第一格那个"上一级"是回家的路，藏着就回不去了，永远留着。
@@ -3226,7 +2851,6 @@ impl App {
         self.ready_sec = None;
         self.hit0 = cache::hits();
         self.restart_pool();
-        self.trace("dir");
         self.sync_tree();
         let title = format!("Xsee · 浏览 — {}", self.dir.display());
         unsafe {
@@ -3257,27 +2881,28 @@ impl App {
         let anchor_path = self.entries.get(self.anchor).map(|e| e.path.clone());
         let up = if self.has_up { self.entries.first().cloned() } else { None };
         let base = usize::from(self.has_up);
-        let need_stat = matches!(self.sort, SortKey::Size | SortKey::Date);
+        let need_stat = matches!(self.sort, SortKey::Size | SortKey::Date | SortKey::Crt);
         let need_time = self.sort == SortKey::Added;
-        // (原下标, 名字, 扩展名, 类型, 大小, 日期, 像素数, 入库时间)
-        let mut rows: Vec<(usize, String, String, String, u64, u64, u64, u64)> = Vec::new();
+        // (原下标, 名字, 扩展名, 类型, 大小, 修改时间, 像素数, 入库时间, 创建时间)
+        let mut rows: Vec<(usize, String, String, String, u64, u64, u64, u64, u64)> = Vec::new();
         for i in base..self.entries.len() {
             let e = &self.entries[i];
             let (name, ext, typ) = sort_labels(&e.path);
-            let (size, date) = if need_stat {
+            let (size, date, created) = if need_stat {
                 match std::fs::metadata(&e.path) {
-                    Ok(m) => (
-                        m.len(),
-                        m.modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                    ),
-                    Err(_) => (0, 0),
+                    Ok(m) => {
+                        let secs = |t: std::io::Result<std::time::SystemTime>| {
+                            t.ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        };
+                        (m.len(), secs(m.modified()), secs(m.created()))
+                    }
+                    Err(_) => (0, 0, 0),
                 }
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
             let pix = self.dims.get(&i).map(|(w, h)| *w as u64 * *h as u64).unwrap_or(0);
             // 库里没记过时间的排到最后（正向时），不拿 0 冒充 1970 年
@@ -3286,7 +2911,7 @@ impl App {
             } else {
                 0
             };
-            rows.push((i, name, ext, typ, size, date, pix, added));
+            rows.push((i, name, ext, typ, size, date, pix, added, created));
         }
         let key = self.sort;
         let desc = self.sort_desc;
@@ -3306,6 +2931,7 @@ impl App {
                     SortKey::Date => a.5.cmp(&b.5).then(a.1.cmp(&b.1)),
                     SortKey::Image => a.6.cmp(&b.6).then(a.1.cmp(&b.1)),
                     SortKey::Added => a.7.cmp(&b.7).then(a.1.cmp(&b.1)),
+                    SortKey::Crt => a.8.cmp(&b.8).then(a.1.cmp(&b.1)),
                 };
                 if desc {
                     o = o.reverse();
@@ -3574,10 +3200,8 @@ impl App {
         if n > 0 && self.got + self.err >= n {
             if self.ready_sec.is_none() {
                 self.ready_sec = Some(self.t_dir.elapsed().as_secs_f64());
-                self.trace("ready");
             }
         }
-        self.trace("pump");
         self.prune();
         true
     }
@@ -3779,7 +3403,6 @@ impl App {
         self.ready_sec = None;
         self.hit0 = cache::hits();
         self.restart_pool();
-        self.trace("dir");
         unsafe {
             let _ = SetWindowTextW(
                 hwnd,
@@ -4083,9 +3706,7 @@ unsafe fn brush_cached(c: u32) -> HBRUSH {
 }
 
 unsafe fn fill(hdc: HDC, r: &RECT, c: u32) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let _ = FillRect(hdc, r, brush_cached(c));
-    deep_add(0, t);
 }
 
 unsafe fn frame(hdc: HDC, r: &RECT, c: u32) {
@@ -4153,12 +3774,10 @@ unsafe fn unclip(hdc: HDC) {
 /// 实测过，一帧省不下半毫秒 —— GDI 该起的临时面照样起，只是拿它去垫色而不是去混色。
 /// 既然没赚到，就不在字后面多盖一块底。
 unsafe fn txt(hdc: HDC, r: &RECT, s: &str, c: u32, font: HFONT, extra: DRAW_TEXT_FORMAT) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     txt_raw(hdc, r, s, c, font, extra);
-    deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
 }
 
-/// 不计时的那一半，给自带计时的调用方用，免得同一笔钱记两遍。
+/// 画字的底层实现。
 unsafe fn txt_raw(hdc: HDC, r: &RECT, s: &str, c: u32, font: HFONT, extra: DRAW_TEXT_FORMAT) {
     if s.is_empty() {
         return;
@@ -4184,7 +3803,6 @@ unsafe fn dib(hdc: HDC, dst: &RECT, src: &Img) {
     if src.w == 0 || src.h == 0 || dst.right <= dst.left || dst.bottom <= dst.top {
         return;
     }
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -4217,14 +3835,7 @@ unsafe fn dib(hdc: HDC, dst: &RECT, src: &Img) {
         DIB_RGB_COLORS,
         SRCCOPY,
     );
-    deep_add(1, t);
 }
-
-/// 这一批里后台工线真缩了几次（遥测用）：正常情况下每格只在头一次缩。
-static RESAMPLES: AtomicU32 = AtomicU32::new(0);
-/// 这一批里列表帧走了条带几次、整块重画几次（遥测用）：条带不生效就是白搬。
-static BAND_FRAMES: AtomicU32 = AtomicU32::new(0);
-static GRID_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 /// 32 位 BGRA 的 DIB 头；高取负数就是顶向下那套行序。
 fn dib_info(w: i32, h: i32) -> BITMAPINFO {
@@ -4245,7 +3856,6 @@ fn dib_info(w: i32, h: i32) -> BITMAPINFO {
 /// 把缓存那张缩到图位里的显示尺寸，结果抓回内存。同一目录、同一窗口宽度下
 /// 每格的显示尺寸帧帧一样，所以这张图只缩这一次；后面每帧贴的就是这份。
 unsafe fn resample(hdc: HDC, src: &Img, dw: i32, dh: i32) -> Option<Vec<u8>> {
-    RESAMPLES.fetch_add(1, Ordering::Relaxed);
     let sbmi = dib_info(src.w as i32, -(src.h as i32));
     let obmi = dib_info(dw, -dh);
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -4306,7 +3916,6 @@ unsafe fn dib_cache(hdc: HDC, dst: &RECT, im: &mut Img) {
     if im.w == 0 || im.h == 0 || dw <= 0 || dh <= 0 {
         return;
     }
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let same = im.fit.as_ref().map(|f| f.w == dw && f.h == dh).unwrap_or(false);
     if !same {
         if let Some(px) = resample(hdc, im, dw, dh) {
@@ -4331,10 +3940,29 @@ unsafe fn dib_cache(hdc: HDC, dst: &RECT, im: &mut Img) {
                 DIB_RGB_COLORS,
                 SRCCOPY,
             );
-            deep_add(1, t);
         }
         // 那份成品没抓住（内存吃紧）就退回逐帧重缩，画面不受影响
         None => dib(hdc, dst, im),
+    }
+}
+
+/// 格子里那张图的摆法：等比居中，但**允许放大到 1.5 倍**。
+/// 缩略图现在是固定模板，滑块拉到最大那一格比模板大，铺满是把同一张图放大取样；
+/// 真比模板小的（几百像素的老图）也照这条走，最多 1.5 倍，不至于撑成一团。
+fn box_fill(iw: u32, ih: u32, r: RECT) -> RECT {
+    let bw = (r.right - r.left).max(1);
+    let bh = (r.bottom - r.top).max(1);
+    let s = (bw as f64 / iw as f64)
+        .min(bh as f64 / ih as f64)
+        .min(1.5)
+        .max(0.01);
+    let w = (iw as f64 * s).round().max(1.0) as i32;
+    let h = (ih as f64 * s).round().max(1.0) as i32;
+    RECT {
+        left: r.left + (bw - w) / 2,
+        top: r.top + (bh - h) / 2,
+        right: r.left + (bw - w) / 2 + w,
+        bottom: r.top + (bh - h) / 2 + h,
     }
 }
 
@@ -5143,13 +4771,11 @@ unsafe fn dim_text(hdc: HDC, r: &RECT, s: &str, c: u32, font: HFONT, bk: u32, pa
     if s.is_empty() {
         return;
     }
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let extra = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
     let w = r.right - r.left;
     let h = r.bottom - r.top;
     if bk == NO_BK || w <= 2 * pad || h <= 0 {
         txt_raw(hdc, r, s, c, font, extra);
-        deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
         return;
     }
     let bw = w - 2 * pad;
@@ -5160,7 +4786,6 @@ unsafe fn dim_text(hdc: HDC, r: &RECT, s: &str, c: u32, font: HFONT, bk: u32, pa
         None => {
             let Some(built) = build_dim_tile(hdc, bw, h, s, c, font, bk, pad) else {
                 txt_raw(hdc, r, s, c, font, extra);
-                deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
                 return;
             };
             DIM_TILES.with(|m| {
@@ -5181,7 +4806,6 @@ unsafe fn dim_text(hdc: HDC, r: &RECT, s: &str, c: u32, font: HFONT, bk: u32, pa
     if !blit_cached(hdc, r.left + pad, r.top, bw, h, bmp) {
         txt_raw(hdc, r, s, c, font, extra);
     }
-    deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
 }
 
 /// 名字带整块（底 + 顶线 + 下划线 + 字）也存成小位图，跟尺寸行同一套路。
@@ -5279,13 +4903,11 @@ unsafe fn paint_band_now(hdc: HDC, b: &Band) {
 }
 
 unsafe fn band_paint(hdc: HDC, b: &Band) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let w = b.r.right - b.r.left;
     let h = b.r.bottom - b.r.top;
     let w4 = w - 4;
     if w4 <= 0 || h <= 0 {
         paint_band_now(hdc, b);
-        deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
         return;
     }
     let key = BandKey {
@@ -5307,7 +4929,6 @@ unsafe fn band_paint(hdc: HDC, b: &Band) {
         None => {
             let Some(built) = build_band_tile(hdc, w4, h, b) else {
                 paint_band_now(hdc, b);
-                deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
                 return;
             };
             BAND_TILES.with(|m| {
@@ -5329,7 +4950,6 @@ unsafe fn band_paint(hdc: HDC, b: &Band) {
     if !ok {
         paint_band_now(hdc, b);
     }
-    deep_add(TXT_SLOT.load(Ordering::Relaxed), t);
 }
 
 /// 装饰档判据。三档共用一套配色，绘制代码只问这两句，不在每个函数里各 match 一遍。
@@ -5448,7 +5068,6 @@ unsafe fn ground_gaps(hdc: HDC, a: &App, g: &RECT, s: &Theme) -> bool {
 /// 圆角裁剪。GDI 的裁剪区没有栈：先把当前那份取出来存着，画完再放回去，
 /// 不然这一个格子画完，后面整片都画不出来。
 unsafe fn round_clip(hdc: HDC, r: &RECT, rad: i32) -> Option<HRGN> {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let keep = CreateRectRgn(0, 0, 0, 0);
     let had = GetClipRgn(hdc, keep) == 1;
     let rgn = CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, rad * 2, rad * 2);
@@ -5458,12 +5077,10 @@ unsafe fn round_clip(hdc: HDC, r: &RECT, rad: i32) -> Option<HRGN> {
         let _ = DeleteObject(HGDIOBJ(keep.0));
         None
     };
-    deep_add(2, t);
     out
 }
 
 unsafe fn unround(hdc: HDC, keep: Option<HRGN>) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     match keep {
         Some(r) => {
             let _ = SelectClipRgn(hdc, Some(r));
@@ -5473,7 +5090,6 @@ unsafe fn unround(hdc: HDC, keep: Option<HRGN>) {
             let _ = SelectClipRgn(hdc, None);
         }
     }
-    deep_add(2, t);
 }
 
 /// 圆角描边一圈，inner 是紧贴里面的第二圈。GDI 描不了半透明，
@@ -5485,7 +5101,6 @@ unsafe fn rring(hdc: HDC, r: &RECT, rad: i32, c: u32, inner: Option<u32>) {
 /// 圆角框。w 是笔宽：GDI 的笔压在路径正中，要让它整条落在 r 里面，
 /// 传进来的 r 得先往里缩 w / 2。
 unsafe fn rring_w(hdc: HDC, r: &RECT, rad: i32, c: u32, w: i32, inner: Option<u32>) {
-    let t = SUB_DEEP.load(Ordering::Relaxed).then(Instant::now);
     let pen = CreatePen(PS_SOLID, w, cref(c));
     let op = SelectObject(hdc, HGDIOBJ(pen.0));
     let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -5500,7 +5115,6 @@ unsafe fn rring_w(hdc: HDC, r: &RECT, rad: i32, c: u32, w: i32, inner: Option<u3
     SelectObject(hdc, ob);
     SelectObject(hdc, op);
     let _ = DeleteObject(HGDIOBJ(pen.0));
-    deep_add(4, t);
 }
 
 /// 一个 ✕：两条对角线。字形 ✕ 换字体就换粗细，画出来才和 1px 的边线一个体系。
@@ -5969,6 +5583,7 @@ unsafe fn paint_popup(
             M_SORT_SIZE => a.sort == SortKey::Size,
             M_SORT_TYPE => a.sort == SortKey::Type,
             M_SORT_DATE => a.sort == SortKey::Date,
+            M_SORT_CRT => a.sort == SortKey::Crt,
             M_SORT_IMAGE => a.sort == SortKey::Image,
             M_SORT_ADDED => a.sort == SortKey::Added,
             M_SORT_DESC => a.sort == SortKey::Desc,
@@ -8791,8 +8406,7 @@ unsafe fn conv_command(hwnd: HWND, id: usize, x: i32, r: &RECT) -> bool {
 }
 
 /// 批量转换这一趟的经过，全落在缓存目录的 convert.log 上，一行一个事件。
-/// 界面上只留得下一行提示，"为什么没出文件"只能靠它。和 XSEE_TRACE 那套分开：
-/// 那个要预先设环境变量才开口，这个一直记，他自己点完就能看到。
+/// 界面上只留得下一行提示，"为什么没出文件"只能靠它，一直记，他自己点完就能看到。
 fn conv_log(s: &str) {
     static F: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
     let slot = F.get_or_init(|| {
@@ -8833,7 +8447,7 @@ fn conv_dump_hits(a: &App, body: &RECT) {
     s.push_str(
         &a.btns
             .iter()
-            .filter(|(id, _)| (*id >= C_FMT && *id <= C_SHARP_R))
+            .filter(|(id, _)| *id >= C_FMT && *id <= C_SHARP_R)
             .map(|(id, r)| format!("{id} {} {} {} {}\n", r.left, r.top, r.right, r.bottom))
             .collect::<String>(),
     );
@@ -9643,20 +9257,6 @@ struct GridText {
 /// `band` 是这一帧新露出来的那一条：给了它的帧，整屏格子沿用后备位图里搬过来的那一份，
 /// 这一帧只画压在这条带上的格子。没给就是照常整块列表从头画。
 unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&RECT>) {
-    // 只拆滚轮帧。地面钉在窗口上、逐格钉在内容上，滚动时这两层能不能一起搬进
-    // 常驻位图，得先知道各吃掉多少。
-    let sub_on = seg_tracing() && PAINT_SRC.load(Ordering::Relaxed) == 1;
-    let mut sub_acc = [0u32; 10];
-    let mut sub_t = Instant::now();
-    macro_rules! submark {
-        ($i:expr) => {{
-            if sub_on {
-                let now = Instant::now();
-                sub_acc[$i] = sub_acc[$i].saturating_add(now.duration_since(sub_t).as_micros() as u32);
-                sub_t = now;
-            }
-        }};
-    }
     a.zone(theme::Z_GRID);
     let g = z.grid;
     clip(hdc, &g);
@@ -9674,14 +9274,6 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
         fill(hdc, &g, s.skin.canvas);
         band = None;
     }
-    submark!(0);
-    // 逐格这一层再按调用点拆：只在这个循环里开着，地面和尾巴不算进来。
-    let deep0 = if sub_on {
-        SUB_DEEP.store(true, Ordering::Relaxed);
-        deep_snap()
-    } else {
-        [0; 7]
-    };
     let (first, last) = a.range(g);
     a.vis = (first, last);
     let listy = matches!(a.mode, Mode::List | Mode::Detail);
@@ -9975,7 +9567,7 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
                 }
             }
         } else if let Some(im) = a.thumbs.get_mut(&i) {
-            let d = box_in(im.w, im.h, pic_in);
+            let d = box_fill(im.w, im.h, pic_in);
             dib_cache(hdc, &d, im);
             // 设计稿：.cell.sel img{box-shadow:none} —— 选中时那圈外环已经够重，图边再描一道就糊了
             if !(cards(s) && on) {
@@ -10370,11 +9962,9 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
     }
     // 格子画完才补字：同一种字体连着画到底，字体切换从一帧一百多次降到三次。
     // 字都坐在自己的带子里，跟圆环、角标互不重叠，挪到最后画看不出来。
-    TXT_SLOT.store(5, Ordering::Relaxed);
     for t in &tl_dim {
         dim_text(hdc, &t.r, &t.s, t.c, a.font_num, t.bk, t.pad);
     }
-    TXT_SLOT.store(3, Ordering::Relaxed);
     for b in &tl_band {
         band_paint(hdc, b);
     }
@@ -10397,14 +9987,6 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
             a.font_b,
             DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
-    }
-    submark!(1);
-    if sub_on {
-        let deep1 = deep_snap();
-        SUB_DEEP.store(false, Ordering::Relaxed);
-        for i in 0..7 {
-            sub_acc[3 + i] = deep1[i].saturating_sub(deep0[i]);
-        }
     }
     // 列头在 grid 之外（布局时从列表顶上扣出去的那一条），必须先解除列表的裁剪，
     // 不然整条表头落在裁剪区外，一个字也画不出来。
@@ -10477,13 +10059,6 @@ unsafe fn paint_grid(hdc: HDC, a: &mut App, z: &Zones, s: &Theme, band: Option<&
     // 外部的文件拖到列表上：整圈描边，表示"松手就搬进当前文件夹"
     if matches!(a.drop_hl, Some(Hl::Here)) {
         frame(hdc, &g, s.skin.acc);
-    }
-    submark!(2);
-    if sub_on {
-        if let Ok(mut t) = LAST_SUB.lock() {
-            *t = sub_acc;
-        }
-        sub_add(&sub_acc);
     }
 }
 
@@ -12513,13 +12088,14 @@ unsafe fn paint_one_dlg(hdc: HDC, a: &mut App, s: &Theme, _rc: &RECT) {
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                if a.scan_total == 0 {
+                let found = a.scan_found.load(Ordering::Relaxed);
+                if found == 0 {
                     text.push_str("正在翻文件夹找图…");
                 } else {
                     text.push_str(&format!(
-                        "正在扫描：{} / {}，新增 {}，跳过 {}，失败 {}。",
+                        "正在扫描：已发现 {}，做完 {}，新增 {}，跳过 {}，失败 {}。",
+                        found,
                         a.scan_done.load(Ordering::Relaxed),
-                        a.scan_total,
                         a.scan_added.load(Ordering::Relaxed),
                         a.scan_skip.load(Ordering::Relaxed),
                         a.scan_err.load(Ordering::Relaxed)
@@ -13626,7 +13202,7 @@ unsafe fn open_rule_dlg(hwnd: HWND) {
 /// 规则对话框的两个输入框，预填选中那条根的现行规则。摆位在 paint 里按帧对齐。
 unsafe fn create_rule_edits(hwnd: HWND) {
     let (texts, font) = {
-        let mut g = app().lock().unwrap();
+        let g = app().lock().unwrap();
         if g.rule_edits.iter().any(|h| !h.0.is_null()) {
             return;
         }
@@ -14291,13 +13867,12 @@ unsafe fn sim_previews(hwnd: HWND) {
     });
 }
 
-/// 以图搜图用哪个档：缩略图视图用当前档；图标/列表/详细资料这些小格档自己
-/// 不生成缩略图、没有指纹，借库里账最多的一档。相似库还没读进内存就是 None
-/// （界面线程不该为了挑档把整库读进来），后台读完下一帧就有了。
+/// 以图搜图用哪个档：缩略图现在是固定模板，缩略图/详细资料档就是这一档；
+/// 图标档、列表档自己不生成缩略图，就借库里账最多的一档（相似库还没读进内存
+/// 就是 None，界面线程不该为了挑档把整库读进来，后台读完下一帧就有了）。
 fn sim_target_tier(g: &App) -> Option<(u32, u32)> {
-    let (w, h) = g.tbox();
-    if g.wants_thumb() && w.min(h) >= sim::MIN_SIDE {
-        return Some((w, h));
+    if g.wants_thumb() {
+        return Some(g.tbox());
     }
     sim::biggest_tier_loaded().map(|(bw, bh)| (bw as u32, bh as u32))
 }
@@ -14359,11 +13934,191 @@ unsafe fn start_db_prune(hwnd: HWND) {
     });
 }
 
+/// 同时找图的线程数。机械盘同一时刻只能待在一个位置，多开是拿"一个等盘时另一个干活"
+/// 换吞吐，不是越多越快；两路足够把等待叠起来，再多就要跟出图那几路抢盘了。
+const SCAN_WALKERS: usize = 2;
+/// 找图投给出图的通道容量。攒太多等于把整份名单先背进内存，压在这个数上让找图的
+/// 等一等，内存就稳在几千条路径那么大。
+const SCAN_QUEUE: usize = 2048;
+/// 出图那几路的读盘名额：起 4 路，最多试到 8 路，最少留 1 路。线程一次开满 8 个，
+/// 排在闸上等名额，所以加减名额不用重建线程。
+/// 不写死是因为盘的脾气不一样——这台机械盘实测 1/2/4/8 路 = 112/123/148/154 MB/s，
+/// 4 路基本到顶；固态还能往上吃。所以每做完一窗（40 张）把这一段的速度和上一段比：
+/// 涨过 10% 加一路，跌过 10% 减一路并且从此不再往上试（这盘就到这儿了），
+/// 持平也不再加——加路不涨速只是多占内存。
+const LANE_START: usize = 4;
+const LANE_MAX: usize = 8;
+const LANE_MIN: usize = 1;
+const LANE_WINDOW: usize = 40;
+/// 扫描行的在途字节预算：同时压在读盘上的字节不超过 1GB。看图、编辑那些线不受它管，
+/// 只有批量扫描这一趟走这道闸——一张几百 MB 的图八路各抱一份就是好几 GB。
+const READ_BUDGET: u64 = 1 << 30;
+
+/// 扫描出图那几路的读盘闸：名额 + 在途字节，外加一窗一窗的速度对比来调名额。
+struct ScanGate {
+    lanes: AtomicUsize,
+    active: AtomicUsize,
+    used: AtomicU64,
+    /// 已经试过加路但不涨：不再往上试。
+    latched: AtomicBool,
+    /// 上一窗的速度（MB/s，按 f64 的位存进原子数）。0 = 还没比过头。
+    last_mbps: AtomicU64,
+    win_n: AtomicUsize,
+    win_bytes: AtomicU64,
+    clock: Mutex<Instant>,
+    /// 等名额用的锁：和算速度那把钟分开，钟每窗都要改，等着的线程不该被它牵住。
+    wait: Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+impl ScanGate {
+    fn new() -> Self {
+        ScanGate {
+            lanes: AtomicUsize::new(LANE_START),
+            active: AtomicUsize::new(0),
+            used: AtomicU64::new(0),
+            latched: AtomicBool::new(false),
+            last_mbps: AtomicU64::new(0),
+            win_n: AtomicUsize::new(0),
+            win_bytes: AtomicU64::new(0),
+            clock: Mutex::new(Instant::now()),
+            wait: Mutex::new(()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// 占一个名额和这趟要读的字节。名额满了、或在途预算压不住，就在这儿等。
+    /// 一张图本身就比整份预算大时放行——不然它永远排不进去，扫描会卡死在这一张上。
+    fn enter(&self, bytes: u64) {
+        let mut g = self.wait.lock().unwrap();
+        loop {
+            let used = self.used.load(Ordering::Acquire);
+            let room = used == 0 || used.saturating_add(bytes) <= READ_BUDGET;
+            if room && self.active.load(Ordering::Acquire) < self.lanes.load(Ordering::Acquire) {
+                self.active.fetch_add(1, Ordering::AcqRel);
+                self.used.fetch_add(bytes, Ordering::AcqRel);
+                return;
+            }
+            g = match self.cv.wait_timeout(g, Duration::from_millis(100)) {
+                Ok((g, _)) => g,
+                Err(p) => p.into_inner().0,
+            };
+        }
+    }
+
+    fn exit(&self, bytes: u64) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+        self.cv.notify_all();
+    }
+
+    /// 这一张读掉的字节记账；攒满一窗就和上一窗比速度，据此加减名额。
+    fn tally(&self, bytes: u64) {
+        self.win_bytes.fetch_add(bytes, Ordering::AcqRel);
+        if self.win_n.fetch_add(1, Ordering::AcqRel) + 1 < LANE_WINDOW {
+            return;
+        }
+        self.win_n.store(0, Ordering::Relaxed);
+        let (secs, got) = {
+            let mut c = self.clock.lock().unwrap();
+            let e = c.elapsed().as_secs_f64().max(0.0001);
+            *c = Instant::now();
+            (e, self.win_bytes.swap(0, Ordering::AcqRel))
+        };
+        let mbps = got as f64 / secs / 1048576.0;
+        if self.latched.load(Ordering::Relaxed) {
+            self.last_mbps
+                .store(mbps.to_bits(), Ordering::Relaxed);
+            return;
+        }
+        let prev = f64::from_bits(self.last_mbps.swap(mbps.to_bits(), Ordering::Relaxed));
+        let (want, latched) = lane_after(self.lanes.load(Ordering::Acquire), prev, mbps);
+        if want != self.lanes.load(Ordering::Acquire) {
+            self.lanes.store(want, Ordering::Release);
+        }
+        if latched {
+            self.latched.store(true, Ordering::Relaxed);
+        }
+        self.cv.notify_all();
+    }
+
+    fn lanes(&self) -> usize {
+        self.lanes.load(Ordering::Acquire)
+    }
+}
+
+/// 两窗速度怎么变成名额：涨过 10% 加一路（顶到 8 路就锁住），跌过 10% 减一路并且
+/// 锁住不再试，持平也锁住——这盘就到这儿了，再加只是多占内存。
+/// 单独抽出来是为了能当场验，不用真跑一趟盘。
+fn lane_after(cur: usize, prev: f64, now: f64) -> (usize, bool) {
+    if prev <= 0.0 || now <= 0.0 {
+        return (cur, false);
+    }
+    if now > prev * 1.10 {
+        if cur < LANE_MAX {
+            (cur + 1, false)
+        } else {
+            (cur, true)
+        }
+    } else if now < prev * 0.90 {
+        (cur.saturating_sub(1).max(LANE_MIN), true)
+    } else {
+        (cur, true)
+    }
+}
+
+/// 这张图大概要从盘上搬多少字节：有档内预览可吃的只搬头那一截，RAW 要扫一段，
+/// 剩下（PNG、TIFF、BMP 这些）按整份算。判据用软件自己的那条，不另立一套。
+fn read_cost(path: &str, size: u64) -> u64 {
+    if preview::is_raw(path) {
+        8 << 20
+    } else if preview::has_preview(path) {
+        preview::HEAD as u64
+    } else {
+        size
+    }
+}
+
+/// 待走的一个文件夹。
+struct WalkJob {
+    path: String,
+    /// 这个文件夹自己的修改时间。0 = 没问到，那这一层不作"已经扫过"的凭据。
+    mtime: u32,
+    /// 归名单里第几个根：排除规则跟着根走。
+    root: usize,
+}
+
+/// 两路找图共用的那一摞待走文件夹。pending 数的是"已压进栈或正在走"的文件夹，
+/// 归零就说明这趟找图走完了，出图那边取空也就收工。
+/// 压新目录时不用碰 pending：手上正走着的这一层本身就还记着数，不会误判成走完了。
+struct WalkQ {
+    stack: Mutex<Vec<WalkJob>>,
+    pending: AtomicUsize,
+    cv: std::sync::Condvar,
+}
+
+/// 找到的一张图：路径外加枚举顺带带回的大小和修改时间。
+struct Found {
+    path: String,
+    size: u64,
+    mtime: u32,
+}
+
+/// 文件夹自己的修改时间，只在这趟扫描的起点用（子文件夹的时间由上一层枚举带回）。
+fn dir_mtime(dir: &str) -> u32 {
+    std::fs::metadata(dir)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
 /// 维护页的扫描文件夹：把名单里的文件夹（含子文件夹）里的图片直接生成缩略图入库，
-/// 不用一张张翻。跳过的口径：这一档已经有和原图对得上的缩略图（cache::has_thumb，
-/// 只查索引不解码）。先在后台把目录树走完拿总数，再四路分头照 job::make 那条线
-/// 出图——没命中就解码入库、指纹跟着写，命中说明扫过，直接跳过。
-/// 跑完把各根的扫描时间记回名单落盘，下次再扫同一份名单还是这个口径。
+/// 不用一张张翻。跳过的口径有两层：这一档已经有和原图对得上的缩略图（cache::has_thumb，
+/// 只查索引不解码），以及这一层文件夹上次就扫完过、修改时间没动过（scan::dir_done，
+/// 整层的文件根本不再收）。两路分头走文件夹，找到一张就投给四路出图，一边走一边出图；
+/// 跑完把走完的文件夹状态整批落盘、把各根的扫描时间记回名单。
 /// `only` 有值就只扫选中的那一个。
 unsafe fn start_dir_scan(hwnd: HWND, only: Option<usize>) {
     let hp = hwnd.0 as isize;
@@ -14376,16 +14131,10 @@ unsafe fn start_dir_scan(hwnd: HWND, only: Option<usize>) {
             return;
         }
         let (w, h) = g.tbox();
-        // 图标、列表档不出缩略图；档太小就算扫进去了也建不了指纹，搜不到。
-        if !g.wants_thumb() || w.min(h) < sim::MIN_SIDE {
-            g.msg = if g.wants_thumb() {
-                format!(
-                    "这一档缩略图只有 {w}×{h}，扫进去也建不了指纹（短边要 ≥{}）。按 F8 换成缩略图视图再扫。",
-                    sim::MIN_SIDE
-                )
-            } else {
-                "这一档只画图标，不生成缩略图。按 F8 换成缩略图视图再扫。".to_string()
-            };
+        // 图标、列表档只画图标、不生成缩略图，扫进去也没东西可搜。
+        // 尺寸这一关现在不用问：缩略图是固定模板，短边够指纹线（≥96）。
+        if !g.wants_thumb() {
+            g.msg = "这一档只画图标，不生成缩略图。按 F8 换成缩略图视图再扫。".to_string();
             drop(g);
             refresh(hwnd);
             return;
@@ -14404,9 +14153,9 @@ unsafe fn start_dir_scan(hwnd: HWND, only: Option<usize>) {
             return;
         }
         g.scan_busy = true;
-        g.scan_total = 0;
+        g.scan_found.store(0, Ordering::Relaxed);
         g.db_scan.clear();
-        (w, h, roots)
+        (w, h, Arc::new(roots))
     };
     let (done, added, skip, err, stop) = {
         let mut g = app().lock().unwrap();
@@ -14427,111 +14176,235 @@ unsafe fn start_dir_scan(hwnd: HWND, only: Option<usize>) {
     refresh(hwnd);
     std::thread::spawn(move || {
         job::init_com();
-        // 先把目录树走完才知道总数；两个根互相套住时（a 和 a\b 都在名单里）去重。
-        // 每个根带着自己的排除规则走：命中的文件夹整棵剪枝，贴图根本不枚举。
-        let mut all: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut ruled = 0usize;
-        for r in &roots {
-            if stop.load(Ordering::Relaxed) {
-                break;
+        // 找图和出图同时跑：两路分头揽文件夹，找到一张就投进通道，四路从通道里取着出图。
+        // 以前是先把整棵目录树走完才开始出图——慢盘上光是把几十万个文件名念一遍就要几十秒，
+        // 这段时间 CPU 全闲着，进度也一直停在零，看着像没动。
+        let (tx, rx) = crossbeam_channel::bounded::<Found>(SCAN_QUEUE);
+        let q = Arc::new(WalkQ {
+            stack: Mutex::new(Vec::new()),
+            pending: AtomicUsize::new(0),
+            cv: std::sync::Condvar::new(),
+        });
+        let walked = Arc::new(Mutex::new(Vec::<(String, u32)>::new()));
+        let ruled = Arc::new(AtomicUsize::new(0));
+        let same = Arc::new(AtomicUsize::new(0));
+        let found = app().lock().unwrap().scan_found.clone();
+        {
+            let mut g = q.stack.lock().unwrap();
+            for (i, r) in roots.iter().enumerate() {
+                g.push(WalkJob {
+                    path: r.path.clone(),
+                    mtime: dir_mtime(&r.path),
+                    root: i,
+                });
+                q.pending.fetch_add(1, Ordering::Relaxed);
             }
-            let (files, skipped) =
-                scan::walk_images(&r.path, &stop, &r.dirs, &r.exts);
-            ruled += skipped;
-            for p in files {
-                if seen.insert(p.to_ascii_lowercase()) {
-                    all.push(p);
+        }
+        let mut handles = Vec::new();
+        // 两个根互相套住时（a 和 a\b 都在名单里）会撞上同一批文件：两路共用一份去重表。
+        let seen: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        for _ in 0..SCAN_WALKERS {
+            let q = q.clone();
+            let (tx, walked, ruled, same, found, stop, roots, seen) = (
+                tx.clone(),
+                walked.clone(),
+                ruled.clone(),
+                same.clone(),
+                found.clone(),
+                stop.clone(),
+                roots.clone(),
+                seen.clone(),
+            );
+            handles.push(std::thread::spawn(move || {
+                job::init_com();
+                // 这一路走完的文件夹先攒着自己这份，收尾一次落盘。
+                let mut mine: Vec<(String, u32)> = Vec::new();
+                loop {
+                    let next = {
+                        let mut g = q.stack.lock().unwrap();
+                        loop {
+                            if stop.load(Ordering::Relaxed) {
+                                break None;
+                            }
+                            if let Some(j) = g.pop() {
+                                break Some(j);
+                            }
+                            if q.pending.load(Ordering::Relaxed) == 0 {
+                                break None;
+                            }
+                            // 别人正在走文件夹，等它压出新的子文件夹。带着超时等：
+                            // 按下停止时没人有空来叫醒，别把这一路钉死在这儿。
+                            g = q
+                                .cv
+                                .wait_timeout(g, Duration::from_millis(300))
+                                .unwrap()
+                                .0;
+                        }
+                    };
+                    let Some(j) = next else { break };
+                    let rule = &roots[j.root];
+                    let items = scan::read_level(&j.path);
+                    // 这一档、这个修改时间已经记着整层扫完过：只进去找子文件夹，
+                    // 本层的文件一个都不再问。
+                    let done_before = j.mtime != 0 && scan::dir_done(&j.path, bw, bh, j.mtime);
+                    if done_before {
+                        same.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for it in items {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if it.is_dir {
+                            if scan::skip_dir(&it, &rule.dirs) {
+                                continue;
+                            }
+                            q.stack.lock().unwrap().push(WalkJob {
+                                path: it.path,
+                                mtime: it.mtime,
+                                root: j.root,
+                            });
+                            q.pending.fetch_add(1, Ordering::Relaxed);
+                            q.cv.notify_all();
+                            continue;
+                        }
+                        // 这一层上次就扫完了：文件一个都不碰，连排除规则也不再计。
+                        if done_before {
+                            continue;
+                        }
+                        if scan::skip_file(&it.path, &rule.exts) {
+                            ruled.fetch_add(1, Ordering::Relaxed);
+                        } else if scan::is_image(&it.path)
+                            && seen.lock().unwrap().insert(cache::hash_of(&it.path))
+                        {
+                            found.fetch_add(1, Ordering::Relaxed);
+                            if tx
+                                .send(Found {
+                                    path: it.path,
+                                    size: it.size,
+                                    mtime: it.mtime,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    // 停下时正在走的那一层不算走完，别把它的状态记成"扫过了"。
+                    if !stop.load(Ordering::Relaxed) && j.mtime != 0 {
+                        mine.push((j.path, j.mtime));
+                    }
+                    q.pending.fetch_sub(1, Ordering::Relaxed);
+                    q.cv.notify_all();
                 }
-            }
+                if !stop.load(Ordering::Relaxed) && !mine.is_empty() {
+                    walked.lock().unwrap().extend(mine);
+                }
+                drop(tx);
+            }));
         }
-        all.sort_by_key(|p| p.to_ascii_lowercase());
-        let total = all.len();
-        app().lock().unwrap().scan_total = total;
-        // 轮流发牌，四路各自的队列长度差不到一张，和全部重建同一个分法。
-        let mut chunks: Vec<Vec<String>> = (0..4).map(|_| Vec::new()).collect();
-        for (i, p) in all.into_iter().enumerate() {
-            chunks[i % 4].push(p);
-        }
-        let live = Arc::new(AtomicUsize::new(chunks.len()));
-        for chunk in chunks {
-            let (live, done, added, skip, err, stop) = (
-                live.clone(),
+        let gate = Arc::new(ScanGate::new());
+        for _ in 0..LANE_MAX {
+            let (rx, done, added, skip, err, stop, gate) = (
+                rx.clone(),
                 done.clone(),
                 added.clone(),
                 skip.clone(),
                 err.clone(),
                 stop.clone(),
+                gate.clone(),
             );
-            // 收尾要用名单对回时间戳，四个 worker 各带一份小克隆。
-            let roots = roots.clone();
-            std::thread::spawn(move || {
-                let hwnd = HWND(hp as *mut core::ffi::c_void);
+            handles.push(std::thread::spawn(move || {
                 job::init_com();
-                for p in chunk {
+                while let Ok(f) = rx.recv() {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    if cache::has_thumb(&p, bw, bh) {
+                    // 把枚举顺带拿到的大小和修改时间交给这条线：一张图在这一趟里
+                    // 要问七八次这两个数，慢盘上那都是白跑的盘访问。
+                    cache::note_size(&f.path, f.size, f.mtime);
+                    if cache::has_thumb(&f.path, bw, bh) {
                         skip.fetch_add(1, Ordering::Relaxed);
-                        done.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                    } else {
+                        // 从这儿到出图结束都占着读盘名额和在途字节：几路能同时读盘、
+                        // 同时压多少字节，全由这道闸按实测吞吐现场调。
+                        let cost = read_cost(&f.path, f.size);
+                        gate.enter(cost);
+                        match job::make(&f.path, bw, bh) {
+                            Ok(_) => added.fetch_add(1, Ordering::Relaxed),
+                            Err(_) => err.fetch_add(1, Ordering::Relaxed),
+                        };
+                        gate.exit(cost);
+                        gate.tally(cost);
                     }
-                    match job::make(&p, bw, bh) {
-                        Ok(_) => added.fetch_add(1, Ordering::Relaxed),
-                        Err(_) => err.fetch_add(1, Ordering::Relaxed),
-                    };
+                    cache::forget_size();
                     done.fetch_add(1, Ordering::Relaxed);
                 }
-                if live.fetch_sub(1, Ordering::AcqRel) != 1 {
-                    return;
+            }));
+        }
+        // 主线程这一份发送端收掉：两路走完后通道自然关张，出图那几路取空就退。
+        drop(tx);
+        drop(rx);
+        for h in handles {
+            let _ = h.join();
+        }
+        let lanes_end = gate.lanes();
+        let stopped = stop.load(Ordering::Relaxed);
+        // 走完的文件夹整批落盘。中途停下的这一趟一条都不写：那轮没走完，
+        // 写了会把没做完的当成做过的。
+        if !stopped {
+            let list = std::mem::take(&mut *walked.lock().unwrap());
+            scan::note_dirs(&list, bw, bh);
+        }
+        let (n_found, n_done) = (
+            found.load(Ordering::Relaxed),
+            done.load(Ordering::Relaxed),
+        );
+        let (n_added, n_skip, n_err) = (
+            added.load(Ordering::Relaxed),
+            skip.load(Ordering::Relaxed),
+            err.load(Ordering::Relaxed),
+        );
+        // 命中排除规则的张数单独报，规则写没写对当场看得见。
+        let rule_tail = match ruled.load(Ordering::Relaxed) {
+            0 => String::new(),
+            n => format!("，按规则跳过 {n} 张"),
+        };
+        // 没动过的文件夹数报出来：第二次扫同一批目录时，这一句就是省下的活儿。
+        let same_tail = match same.load(Ordering::Relaxed) {
+            0 => String::new(),
+            n => format!("，{n} 个文件夹没动过、里面的图没再收"),
+        };
+        let msg = if stopped {
+            format!(
+                "扫描已停止：找到 {n_found} 张，做完 {n_done}，新增 {n_added}，跳过 {n_skip}，失败 {n_err}{rule_tail}。"
+            )
+        } else {
+            format!(
+                "扫描完成：找到 {n_found} 张，新增 {n_added} 张，跳过 {n_skip} 张（缩略图已有了），失败 {n_err} 张{rule_tail}{same_tail}。读盘名额最后停在 {lanes_end} 路。"
+            )
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut g = app().lock().unwrap();
+            // 只给这一轮真扫过的根盖时间。扫描当中新添的文件夹没参与这轮，
+            // 时间留在 0，界面上照旧显示"还没扫过"。
+            for r in g.scan_dirs.iter_mut() {
+                if roots.iter().any(|x| x.path.eq_ignore_ascii_case(&r.path)) {
+                    r.last = now;
                 }
-                // 最后一颗收尾：记账、报数、把各根的扫描时间写回名单。
-                let (n_done, n_added) = (
-                    done.load(Ordering::Relaxed),
-                    added.load(Ordering::Relaxed),
-                );
-                let (n_skip, n_err) =
-                    (skip.load(Ordering::Relaxed), err.load(Ordering::Relaxed));
-                let stopped = stop.load(Ordering::Relaxed);
-                // 命中排除规则的张数单独报，规则写没写对当场看得见。
-                let rule_tail = if ruled > 0 {
-                    format!("，按规则跳过 {ruled} 张")
-                } else {
-                    String::new()
-                };
-                let msg = if stopped {
-                    format!(
-                        "扫描已停止：走到 {n_done} / {total}，新增 {n_added}，跳过 {n_skip}，失败 {n_err}{rule_tail}。"
-                    )
-                } else {
-                    format!(
-                        "扫描完成：新增 {n_added} 张，跳过 {n_skip} 张（缩略图已有了），失败 {n_err} 张{rule_tail}。这一档 {bw}×{bh}。"
-                    )
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                {
-                    let mut g = app().lock().unwrap();
-                    // 只给这一轮真扫过的根盖时间。扫描当中新添的文件夹没参与这轮，
-                    // 时间留在 0，界面上照旧显示"还没扫过"。
-                    for r in g.scan_dirs.iter_mut() {
-                        if roots.iter().any(|x| x.path.eq_ignore_ascii_case(&r.path)) {
-                            r.last = now;
-                        }
-                    }
-                    save_scan_cfg(&g.scan_dirs);
-                    g.db_scan = msg.clone();
-                    g.scan_busy = false;
-                    g.scan_total = 0;
-                    g.msg = msg.lines().next().unwrap_or("扫描完成").to_string();
-                }
-                unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_PV, WPARAM(0), LPARAM(0));
-                }
-            });
+            }
+            save_scan_cfg(&g.scan_dirs);
+            g.db_scan = msg.clone();
+            g.scan_busy = false;
+            g.scan_found.store(0, Ordering::Relaxed);
+            g.msg = msg.lines().next().unwrap_or("扫描完成").to_string();
+        }
+        let hwnd = HWND(hp as *mut core::ffi::c_void);
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_PV, WPARAM(0), LPARAM(0));
         }
     });
 }
@@ -15895,7 +15768,6 @@ unsafe fn paint(hwnd: HWND) {
     ICON_SET.set(app().lock().unwrap().th.art);
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
-    let (ft, fgap) = frame_begin();
     let rc = client(hwnd);
     if xsee_host::viewer::is_open() {
         // 大图态整张脸都是查看器的。画在这块双缓冲上再一次性贴出去，
@@ -15924,7 +15796,6 @@ unsafe fn paint(hwnd: HWND) {
         SelectObject(mem, old);
         let _ = DeleteObject(HGDIOBJ(bmp.0));
         let _ = DeleteDC(mem);
-        frame_end(ft, fgap, hwnd);
         let _ = EndPaint(hwnd, &ps);
         return;
     }
@@ -15932,7 +15803,6 @@ unsafe fn paint(hwnd: HWND) {
     let drag = DRAGGING.load(Ordering::Relaxed);
     render_into(hwnd, hdc, drag, &ps.rcPaint);
     flush_edit_ops(hwnd);
-    frame_end(ft, fgap, hwnd);
     let _ = EndPaint(hwnd, &ps);
 }
 
@@ -15943,16 +15813,6 @@ unsafe fn paint(hwnd: HWND) {
 /// 右栏、上栏一个字都不动，就不重画它们了。
 unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
     let rc = client(hwnd);
-    let seg_on = seg_tracing() && PAINT_SRC.load(Ordering::Relaxed) == 1;
-    let mut seg_acc = [0u32; 8];
-    let mut seg_t = Instant::now();
-    macro_rules! segmark {
-        ($i:expr) => {{
-            let now = Instant::now();
-            seg_acc[$i] = seg_acc[$i].saturating_add(now.duration_since(seg_t).as_micros() as u32);
-            seg_t = now;
-        }};
-    }
     let mh = menu_h(hwnd);
     let mut g = app().lock().unwrap();
     let s = g.th.clone();
@@ -16011,13 +15871,6 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
         None if only_grid => fill(mem, &ur, s.skin.win),
         None => fill(mem, &RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom }, s.skin.win),
     }
-    if only_grid {
-        GRID_FRAMES.fetch_add(1, Ordering::Relaxed);
-        if band.is_some() {
-            BAND_FRAMES.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    segmark!(0);
     // 右键弹层盖着的时候，指针只是从弹层上扫过：画底下那屏时把指针当成不在屏上，
     // 树行、格子、按钮的悬停才不会在菜单底下跟着跑。只有弹层自己那几笔用真实位置。
     let pop = g.ctx_at.is_some() || g.ctx_cat.is_some();
@@ -16042,7 +15895,6 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
         paint_menu_bar(mem, &mut g, &st_menu, &rc);
         paint_path(mem, &mut g, &st_path);
     }
-    segmark!(1);
     // 浮层在不动的指针底下滑过去，一路上的按钮、树行、格子会跟着乱亮：拖动这一帧
     // 把指针当成不在屏上，松手那次全量重绘再恢复。
     if drag {
@@ -16051,7 +15903,6 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
     if !only_grid {
         paint_tree(mem, &mut g, &z, &st_tree);
     }
-    segmark!(2);
     paint_grid(mem, &mut g, &z, &st_grid, band.as_ref());
     // 框选框：只画一道深灰边，中间不加任何色纱 —— 拖框途中盖一层颜色会像已经选中了整片。
     // 这里也不碰主色，主色是"已经选中"的说法。框按内容坐标记，所以这里减掉滚动量。
@@ -16066,10 +15917,8 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
             frame(mem, &r, st_grid.skin.ink);
         }
     }
-    segmark!(3);
     if !only_grid {
         paint_pv(mem, &mut g, &z, &st_pv);
-        segmark!(4);
         // 右栏两页共用一块地方：当前是转换页就画转换，其余画整理
         if g.conv_open && (g.dock_tab == 1 || !g.org_open) {
             paint_conv(hwnd, mem, &mut g, &z, &st_org);
@@ -16118,7 +15967,6 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
             }
         }
     }
-    segmark!(5);
     // 弹层最后画，压在所有格子之上
     if pop {
         g.pt = live_pt;
@@ -16157,7 +16005,6 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
     if pop || drag {
         g.pt = live_pt;
     }
-    segmark!(6);
     // 只画列表那一帧，位图里列表以外那块和屏上本来就是同一份内容，拷上去也是白拷：
     // 上屏就限在列表那一块。
     if only_grid {
@@ -16170,18 +16017,11 @@ unsafe fn render_into(hwnd: HWND, hdc: HDC, drag: bool, upd: &RECT) {
     // 命中表按"这一帧真画上屏了"的那一份导出。以前只在画转换页时导出，
     // 面板被关掉之后文件里还是上一帧的旧坐标，照着它点就全点空。
     conv_dump_hits(&g, &z.org);
-    segmark!(7);
     // 记下这一帧画进位图的是哪个滚动位置，下一帧只挪动就搬它。
     // 位图刚重建过又只补了列表那一块的那一帧，别处还是空的，不认。
     g.paint_scroll = g.scroll;
     g.paint_ok = !only_grid || !fresh;
     g.grid_stale = false;
-    if seg_on {
-        if let Ok(mut t) = LAST_SEG.lock() {
-            *t = seg_acc;
-        }
-        seg_add(&seg_acc);
-    }
     drop(g);
 }
 
@@ -16383,7 +16223,6 @@ unsafe fn wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         grid_only = true;
     }
     drop(g);
-    PAINT_SRC.store(1, Ordering::Relaxed);
     if grid_only {
         // 有速度才挂帧节拍；顶到边冲量作废就照旧补一帧
         if app().lock().unwrap().scroll_vel != 0.0 {
@@ -16406,8 +16245,8 @@ unsafe extern "system" {
     fn timeEndPeriod(uperiod: u32) -> u32;
 }
 
-/// windows 那套绑定把 CreateWaitableTimerExW 挂在 Win32_Security 特性下，
-/// 只为这一个调用去多开一整个特性不划算，这里直接接 kernel32。
+// windows 那套绑定把 CreateWaitableTimerExW 挂在 Win32_Security 特性下，
+// 只为这一个调用去多开一整个特性不划算，这里直接接 kernel32。
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateWaitableTimerExW(
@@ -16490,7 +16329,6 @@ unsafe fn anim_tick(hwnd: HWND) {
     let done = v == 0.0;
     let moved = g.scroll != before;
     drop(g);
-    PAINT_SRC.store(1, Ordering::Relaxed);
     if done {
         stop_anim(hwnd);
         if deferred {
@@ -18243,28 +18081,6 @@ unsafe fn mouse_down(hwnd: HWND, lparam: LPARAM, keys: usize, dbl: bool) {
         }
         g.keep_visible(z.grid);
         g.drag_seed = Some((x, y, hit));
-        g.trace(&format!("pick{}{}", if ctrl { 'c' } else { '-' }, if shift { 's' } else { '-' }));
-        // 版式实测行：把命中项和格子的算法参数一起落一行，外面要核对"这点落在第几格"就够了。
-        let (cw, ch) = g.cell();
-        let nr = g.name_rect(hit, z.grid);
-        g.trace(&format!(
-            "geo{}|{},{},{},{}|{}x{}|{}|{}|{}|{}|{}|{},{}|d{}",
-            hit,
-            z.grid.left,
-            z.grid.top,
-            z.grid.right,
-            z.grid.bottom,
-            cw,
-            ch,
-            g.cols_n(z.grid.right - z.grid.left),
-            g.row_h(),
-            g.grid_pad(),
-            g.grid_x0(z.grid),
-            g.scroll,
-            nr.top,
-            nr.bottom,
-            is_dir as u8
-        ));
         drop(g);
         request_pv(hwnd);
         refresh(hwnd);
@@ -18562,7 +18378,6 @@ unsafe fn key(hwnd: HWND, vk: u32) {
                 }
                 g.sel_lit = g.marked.contains(&p);
                 g.anchor = g.sel;
-                g.trace("spc");
                 changed = true;
             }
         }
@@ -18610,7 +18425,6 @@ unsafe fn key(hwnd: HWND, vk: u32) {
             g.anchor = usize::MAX;
             // Esc 同时把键盘焦点从目录树收回文件区，和资源管理器一个规矩。
             g.tree_kb = false;
-            g.trace("esc");
             changed = true;
         }
         _ => {}
@@ -19391,7 +19205,6 @@ unsafe fn command(hwnd: HWND, id: usize) {
             // 人看不出这条命令到底跑没跑。
             let n = g.marked.len();
             g.msg = format!("已选取 {n} 个文件");
-            g.trace("all");
             drop(g);
             refresh(hwnd);
         }
@@ -19402,7 +19215,6 @@ unsafe fn command(hwnd: HWND, id: usize) {
             g.sel_lit = false;
             g.anchor = usize::MAX;
             g.stamp += 1;
-            g.trace("none");
             drop(g);
             refresh(hwnd);
         }
@@ -19451,8 +19263,8 @@ unsafe fn command(hwnd: HWND, id: usize) {
         M_VLIST => set_mode(hwnd, Mode::List),
         M_VDETAIL => set_mode(hwnd, Mode::Detail),
         M_ZOOM_DN | M_ZOOM_UP => nudge_thumb(hwnd, id == M_ZOOM_UP),
-        M_SORT_NAME | M_SORT_EXT | M_SORT_SIZE | M_SORT_TYPE | M_SORT_DATE | M_SORT_IMAGE
-        | M_SORT_ADDED | M_SORT_DESC | M_SORT_FWD | M_SORT_REV => {
+        M_SORT_NAME | M_SORT_EXT | M_SORT_SIZE | M_SORT_TYPE | M_SORT_DATE | M_SORT_CRT
+        | M_SORT_IMAGE | M_SORT_ADDED | M_SORT_DESC | M_SORT_FWD | M_SORT_REV => {
             {
                 let mut g = app().lock().unwrap();
                 match id {
@@ -19461,6 +19273,7 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     M_SORT_SIZE => g.sort = SortKey::Size,
                     M_SORT_TYPE => g.sort = SortKey::Type,
                     M_SORT_DATE => g.sort = SortKey::Date,
+                    M_SORT_CRT => g.sort = SortKey::Crt,
                     M_SORT_IMAGE => g.sort = SortKey::Image,
                     M_SORT_ADDED => g.sort = SortKey::Added,
                     M_SORT_DESC => g.sort = SortKey::Desc,
@@ -20640,21 +20453,9 @@ fn transfer_to_folder(hwnd: HWND, paths: Vec<String>, dir: String, copy: bool) {
             let dst = Path::new(&dir).join(dst_name);
             pairs.push((p.clone(), dst.display().to_string()));
         }
-        // 一个一个落：pTo 给完整目标路径才落得出我们算好的名字（见 clip::shell_move）
-        let mut done = 0usize;
-        let mut fail = 0usize;
-        let mut err = String::new();
-        for (src, dst) in &pairs {
-            match clip::shell_move(src, dst, !copy) {
-                Ok(()) => done += 1,
-                Err(e) => {
-                    fail += 1;
-                    if err.is_empty() {
-                        err = e;
-                    }
-                }
-            }
-        }
+        // 整批一次交给系统（资源管理器同款 IFileOperation），别一项一项地重新拉起拷贝引擎
+        let (done_items, fail, err) = clip::transfer_many(&pairs, !copy);
+        let done = done_items.len();
         *DROP_ERR.lock().unwrap() = err;
         // 动过的目录：目标那层 + 每个源的上层。树里这些节点缓存着子项，
         // 不重扫的话搬走的文件夹还钉在老位置、搬进来的那个也不出现。
@@ -21098,7 +20899,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 anim_tick(hwnd);
                 return LRESULT(0);
             }
-            frame_tick();
             // 启动复查挂在这第一颗心跳上：要读几十次注册表，塞在 main 里就挡在首帧前面了。
             if app().lock().unwrap().assoc_probe {
                 assoc_recheck(hwnd);
@@ -21146,10 +20946,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if g.scan_busy {
                     let d = g.scan_done.load(Ordering::Relaxed);
-                    g.msg = if g.scan_total == 0 {
+                    let f = g.scan_found.load(Ordering::Relaxed);
+                    g.msg = if f == 0 {
                         "正在扫描文件夹：翻目录找图…".to_string()
                     } else {
-                        format!("正在扫描文件夹：{d} / {}，新增 {}", g.scan_total, g.scan_added.load(Ordering::Relaxed))
+                        format!(
+                            "正在扫描文件夹：已发现 {f}，做完 {d}，新增 {}",
+                            g.scan_added.load(Ordering::Relaxed)
+                        )
                     };
                 }
             }
@@ -21192,14 +20996,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             if upd {
-                PAINT_SRC.store(2, Ordering::Relaxed);
-                {
-                    let mut g = app().lock().unwrap();
-                    g.queue_visible(z.grid);
-                    // 出图是一批一批到齐的：位图里那一屏有格子已经过时了，
-                    // 下一帧别搬旧的，整块列表重画。
-                    g.grid_stale = true;
-                }
+                let mut g = app().lock().unwrap();
+                g.queue_visible(z.grid);
+                // 出图是一批一批到齐的：位图里那一屏有格子已经过时了，
+                // 下一帧别搬旧的，整块列表重画。
+                g.grid_stale = true;
+                drop(g);
                 if full {
                     refresh(hwnd);
                 } else {
@@ -21497,7 +21299,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     g.band_add.clear();
                     g.stamp += 1;
-                    g.trace(&format!("band{}", hits.len()));
                 }
                 // 拖完这一下：交回真重绘一次，把贴出来的那张图换成当下该画的界面
                 // （进度、悬停、选中的色块都在这一步对齐）。
@@ -21675,17 +21476,7 @@ fn main() {
         let _ = windows::Win32::System::Ole::OleInitialize(None);
     }
 
-    // JSON 命令口：把 --cmd 那一份作业摘出去，剩下的才是目录/文件参数。
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.windows(2).any(|w| {
-        (w[0] == "--cmd" || w[0] == "-cmd") && matches!(w[1].as_str(), "help" | "?" | "--help")
-    }) {
-        println!("{}", drive::USAGE);
-        return;
-    }
-    let (job, args) = drive::take(&raw);
-    // 命令口默认把这扇摆到屏幕外：真画、真消息，但不挡住他手上的活
-    let off = job.as_ref().is_some_and(|j| !j.show);
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let start = args.first().cloned().unwrap_or_else(startup_dir);
     let file_mode = !Path::new(&start).is_dir();
     let dir = if file_mode {
@@ -21717,9 +21508,9 @@ fn main() {
         if RegisterClassExW(&cls) == 0 {
             std::process::exit(1);
         }
-        // 命令口/探针用工具窗样式：不进任务栏、不抢激活。摆哪儿是另一回事，
+        // 探针用工具窗样式：不进任务栏、不抢激活。摆哪儿是另一回事，
         // 下面单独判 —— 拍图要 DWM 那份重定向位图，摆到屏幕外主窗口就拍不着了。
-        let exstyle = if probe_path.is_some() || job.is_some() {
+        let exstyle = if probe_path.is_some() {
             WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
         } else {
             WINDOW_EX_STYLE(0)
@@ -21800,11 +21591,11 @@ fn main() {
         }
         let flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE;
         // 探针把窗口摆到屏幕外：真显示、真画，但用户看不见，也不激活。
-        let (px, py) = if probe_path.is_some() || off { (-32000, -32000) } else { (wr.left, wr.top) };
+        let (px, py) = if probe_path.is_some() { (-32000, -32000) } else { (wr.left, wr.top) };
         let _ = SetWindowPos(hwnd, None, px, py, ww, wh, flags);
         // NOACTIVATE 只跳过激活那一跳，窗口还得拿到前台和键盘焦点。
-        // 命令口跑测试不抢这两下：他手上的活不该被一次测试打断。
-        if probe_path.is_none() && job.is_none() {
+        // 探针不抢这两下：他手上的活不该被一次测试打断。
+        if probe_path.is_none() {
             let _ = SetForegroundWindow(hwnd);
             let _ = SetFocus(Some(hwnd));
         }
@@ -21893,12 +21684,6 @@ fn main() {
                 }
             }
             probe("probe_end");
-            std::process::exit(0);
-        }
-        if let Some(j) = job.as_ref() {
-            // JSON 命令口：把这一串跑完就退，结果那段 JSON 打到标准输出。
-            // 窗口在屏幕外也照样走真绘制，PrintWindow 拍得到。
-            println!("{}", drive::run(hwnd, j));
             std::process::exit(0);
         }
         let _ = SetTimer(Some(hwnd), TMR, 60, None);
@@ -22002,5 +21787,60 @@ mod tests {
         assert!(!tree[0].open, "第 0 行该折叠");
         assert!(tree[1].open, "第二行保持原样");
         assert_eq!(rows_of(&tree), vec![desk, desk]);
+    }
+}
+
+#[cfg(test)]
+mod scan_gate_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 加减名额的判断表：涨、跌、持平、已经到顶、还没测出速度。
+    #[test]
+    fn lane_table() {
+        assert_eq!(lane_after(4, 0.0, 100.0), (4, false), "第一窗没得比，不动");
+        assert_eq!(lane_after(4, 100.0, 120.0), (5, false), "涨 20% 加一路");
+        assert_eq!(lane_after(4, 100.0, 105.0), (4, true), "涨得不到 10% 就封顶不再试");
+        assert_eq!(lane_after(4, 100.0, 80.0), (3, true), "跌 20% 减一路并且锁住");
+        assert_eq!(lane_after(1, 100.0, 10.0), (1, true), "减到一路是底");
+        assert_eq!(lane_after(8, 100.0, 200.0), (8, true), "到顶还涨就只是锁住");
+    }
+
+    /// 八路线程一起挤这道闸：同时在读的不得超过当时的名额，
+    /// 在途字节不得压破预算，而且谁都不能卡在闸上出不来。
+    #[test]
+    fn gate_holds_the_line() {
+        let gate = Arc::new(ScanGate::new());
+        let peak = Arc::new(AtomicUsize::new(0));
+        let over = Arc::new(AtomicUsize::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..LANE_MAX {
+            let (gate, peak, over) = (gate.clone(), peak.clone(), over.clone());
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    // 每张按 300MB 要：预算 1GB，所以同时最多三张能进闸
+                    let cost: u64 = 300 << 20;
+                    gate.enter(cost);
+                    let a = gate.active.load(Ordering::Acquire);
+                    peak.fetch_max(a, Ordering::Relaxed);
+                    if gate.used.load(Ordering::Acquire) > READ_BUDGET + cost {
+                        over.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                    gate.exit(cost);
+                    gate.tally(cost);
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(over.load(Ordering::Relaxed), 0, "在途字节压破了预算");
+        assert!(peak.load(Ordering::Relaxed) <= LANE_MAX, "同时在读的多过线程数");
+        assert!(
+            gate.lanes() >= LANE_MIN && gate.lanes() <= LANE_MAX,
+            "名额跑出界外：{}",
+            gate.lanes()
+        );
     }
 }

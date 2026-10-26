@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
 
 use crate::Rgba;
 use crate::cache;
@@ -19,6 +18,11 @@ pub const MIN_SIDE: u32 = 96;
 /// 允许的最大不同位数（总共 319 位）。实测同一档内两张不同的图最小也差到 57 位，
 /// 所以 40 这一档只会漏不会认错。
 pub const MAX_DIST: u32 = 40;
+/// 一张图压成 17×16 之后 256 个比较位全是同一个值，说明它本身没有可比的信息：
+/// 纯色块、一两个像素的占位图、细长条都算这种。实测这一簇里 525 条互相差 0 位，
+/// 拿 40 位的线去捞会连着捞出整片无关的（250 张正常查询图在 40 位线内捞到 580 个这种
+/// 候选，压到 8 位线是 0 个），所以对它们只认 8 位以内——真一样的那张照样在。
+pub const FLAT_MAX: u32 = 8;
 /// 一次最多回报这么多张，够翻两页。
 pub const MAX_HITS: usize = 240;
 
@@ -51,15 +55,11 @@ struct Lib {
 
 static LIB: OnceLock<Mutex<Lib>> = OnceLock::new();
 
+/// 大小和修改时间：和缩略图索引同一份口径，扫描线带回来的现成值优先，
+/// 免得同一张图在这一趟里被反复问盘。
 fn stamp(path: &str) -> Option<(u32, u64)> {
-    let m = std::fs::metadata(path).ok()?;
-    let secs = m
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some((secs.min(u32::MAX as u64) as u32, m.len()))
+    let (size, mtime) = cache::file_stamp(path)?;
+    Some((mtime, size))
 }
 
 /// 上一版的指纹表按行记着路径和指纹；一次性并进缩略图索引后就删掉。
@@ -337,13 +337,15 @@ pub fn adopt(path: &str, bw: u32, bh: u32, fp: Option<Fp>) {
     remember(path, (bw as u16, bh as u16), st, fp);
 }
 
-/// 指纹一律从缓存里那张 JPEG 解回来算。入库和查询必须吃同一份像素，
-/// 不然纯色/平坦图会被编码噪声推成两张"不同"的图，自己搜不到自己。
-pub fn fp_from_cache(path: &str, bw: u32, bh: u32) -> Option<Fp> {
-    if !cache::on() || !usable(bw, bh) {
+/// 指纹一律从缓存里那张 JPEG 解回来算——入库和查询必须吃同一份像素，不然纯色/平坦图
+/// 会被编码噪声推成两张"不同"的图，自己搜不到自己。这条在这里落成实现：入库吃的就是
+/// 刚编好、准备落盘的那串字节（和盘上那张一模一样），省掉"写完再读回来重解一遍"。
+/// 短边不够这一档、路径空、被排除规则命中的都不算。
+pub fn fp_of_jpg(path: &str, bw: u32, bh: u32, jpg: &[u8]) -> Option<Fp> {
+    if !cache::on() || path.is_empty() || !usable(bw, bh) || scan::excluded(path) {
         return None;
     }
-    Some(fingerprint(&cache::peek(path, bw, bh)?))
+    Some(fingerprint(&cache::decode(jpg)?))
 }
 
 /// 把相似库读进内存，第一次顺带把旧的指纹表并进索引。补库要赶在挑
@@ -416,27 +418,6 @@ pub fn entries(bw: u32, bh: u32) -> Vec<(String, Fp)> {
     }
 }
 
-/// 和这张指纹对得上的那些，只在这一档里比。按差异从小到大，够不上阈值的不进来。
-pub fn similar(bw: u32, bh: u32, q: &Fp, limit: usize) -> Vec<String> {
-    if !usable(bw, bh) {
-        return Vec::new();
-    }
-    let Ok(l) = lib().lock() else { return Vec::new() };
-    let Some(m) = l.maps.get(&(bw as u16, bh as u16)) else {
-        return Vec::new();
-    };
-    let mut hits: Vec<(u32, String)> = m
-        .iter()
-        .filter_map(|(_, r)| {
-            let d = distance(q, &r.fp);
-            (d <= MAX_DIST).then(|| (d, r.path.clone()))
-        })
-        .collect();
-    hits.sort_by_key(|(d, p)| (*d, p.to_ascii_lowercase()));
-    hits.truncate(limit);
-    hits.into_iter().map(|(_, k)| k).collect()
-}
-
 /// 指纹两半各自的位数。只比其中一半时，相似度得按那一半的总位数换算。
 pub const D_BITS: u32 = 256;
 pub const C_BITS: u32 = 63;
@@ -468,6 +449,21 @@ pub fn distance_algo(a: &Fp, b: &Fp, algo: u8) -> u32 {
         n += (a.c ^ b.c).count_ones();
     }
     n
+}
+
+/// 这枚指纹在"要比的那几段"里是不是全同一个值——全同一个值就没得比，
+/// 只能靠收紧认亲线别让同簇的一起刷屏。哪一段在比就看哪一段，
+/// 两段都比时任一段没信息都算（差 0 位的那个坑不会因为另一半有信息就躲开）。
+fn flat_fp(fp: &Fp, algo: u8) -> bool {
+    let m = algo & ALGO_ALL;
+    let dn = fp.d.iter().map(|w| w.count_ones()).sum::<u32>();
+    let cn = fp.c.count_ones();
+    let (d_flat, c_flat) = (dn == 0 || dn == D_BITS, cn == 0 || cn == C_BITS);
+    match m {
+        ALGO_D => d_flat,
+        ALGO_C => c_flat,
+        _ => d_flat || c_flat,
+    }
 }
 
 /// 相似度百分比换成"允许差几位"。100 就是要求一位不差。
@@ -552,7 +548,12 @@ pub fn search(
         .iter()
         .filter_map(|(_, r)| {
             let d = qs.iter().map(|q| distance_algo(q, &r.fp, algo)).min().unwrap_or(u32::MAX);
-            (d <= max_dist).then(|| (d, r.path.clone()))
+            let line = if flat_fp(&r.fp, algo) {
+                max_dist.min(FLAT_MAX)
+            } else {
+                max_dist
+            };
+            (d <= line).then(|| (d, r.path.clone()))
         })
         .collect();
     hits.sort_by_key(|(d, p)| (*d, p.to_ascii_lowercase()));
@@ -743,5 +744,31 @@ pub fn moved(old: &str, new: &str) {
                 m.insert(nk.clone(), r);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 退化标记只在"要比的那一段真的没信息"时才亮：
+    /// 只比 DCT 时 dHash 全 0 不算没信息，反之亦然。
+    #[test]
+    fn flat_flag_follows_the_compared_half() {
+        let z = Fp { d: [0; 4], c: 0 };
+        let o = Fp {
+            d: [u64::MAX; 4],
+            c: u64::MAX,
+        };
+        let mix = Fp {
+            d: [1, 2, 3, 4],
+            c: 0x2A2A,
+        };
+        assert!(flat_fp(&z, ALGO_ALL), "全 0 就是没得比");
+        assert!(flat_fp(&o, ALGO_ALL), "全 1 同样");
+        assert!(!flat_fp(&mix, ALGO_ALL), "两段都有信息不该亮");
+        assert!(!flat_fp(&Fp { d: [0; 4], c: 0x2A2A }, ALGO_C), "只比 DCT 时不看 dHash");
+        assert!(flat_fp(&Fp { d: [1, 2, 3, 4], c: 0 }, ALGO_C), "只比 DCT 且 DCT 全 0 才亮");
+        assert!(flat_fp(&Fp { d: [0; 4], c: 0x2A2A }, ALGO_D), "只比 dHash 且全 0 该亮");
     }
 }

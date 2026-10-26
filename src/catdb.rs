@@ -203,10 +203,6 @@ impl CatEdit {
         self.children.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    pub fn has_kids(&self, id: i64) -> bool {
-        self.children.get(&id).map(|v| !v.is_empty()).unwrap_or(false)
-    }
-
     pub fn count(&self, id: i64) -> usize {
         self.counts.get(&id).copied().unwrap_or(0)
     }

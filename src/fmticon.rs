@@ -439,7 +439,7 @@ unsafe fn put(hdc: HDC, f: HFONT, s: &str, x: i32, sz: i32, base: i32, ink: u32)
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, cref(ink));
     let olda = SetTextAlign(hdc, TA_BASELINE | TA_LEFT);
-    let mut w: Vec<u16> = s.encode_utf16().collect();
+    let w: Vec<u16> = s.encode_utf16().collect();
     let mut size = SIZE::default();
     let _ = GetTextExtentPoint32W(hdc, &w, &mut size);
     let _ = TextOutW(hdc, x + (sz - size.cx) / 2, base, &w);

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -37,7 +38,10 @@ const DAT_FILE: &str = "cache2.dat";
 const NAME_FILE: &str = "cache2.name";
 /// 失败名单按我们自己的解码能力记账。加了新格式或新解码路径要把这个文件名换掉，
 /// 老名单是上一代能力下的结论（PSD 以前必然记在案，接上解码器后就再也试不到了）。
-const BAD_FILE: &str = "cache3.bad";
+/// 这次从 cache3.bad 换到 cache4.bad：PSD 改吃档内预览、出图线改成一次开档，
+/// 都是新的解码能力——旧名单里有 158 条是上一代试不出来记的，它们解不出路径
+/// （失败过的文件从没进过名字名单），留着就等于把这些图永久挡在缩略图库外。
+const BAD_FILE: &str = "cache4.bad";
 
 static DISABLED: AtomicBool = AtomicBool::new(false);
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -179,6 +183,14 @@ struct Stamp {
 
 /// 原图动了就作废，所以命中必须验这两项。
 fn stamp(path: &str) -> Option<Stamp> {
+    if let Some(st) = KNOWN.with(|k| {
+        k.borrow()
+            .as_ref()
+            .filter(|(p, _)| p == path)
+            .map(|(_, st)| *st)
+    }) {
+        return Some(st);
+    }
     let m = std::fs::metadata(path).ok()?;
     let secs = m
         .modified()
@@ -190,6 +202,38 @@ fn stamp(path: &str) -> Option<Stamp> {
         mtime: secs.min(u32::MAX as u64) as u32,
         size: m.len(),
     })
+}
+
+thread_local! {
+    /// 扫描线从目录枚举里顺手带回当前这一张的大小和修改时间。同一个文件在这一趟里
+    /// 要问七八次（查缓存、判大小、入库、挂指纹、算指纹），慢盘上这些都是白跑的
+    /// 盘访问。只有路径正是当前这一张才认这份现成的，对不上照常去问盘。
+    static KNOWN: RefCell<Option<(String, Stamp)>> = RefCell::new(None);
+}
+
+/// 开始处理这一张：把枚举时拿到的大小和修改时间（秒）记在当前线程上。
+pub fn note_size(path: &str, size: u64, mtime: u32) {
+    KNOWN.with(|k| {
+        *k.borrow_mut() = Some((
+            path.to_string(),
+            Stamp {
+                mtime: mtime.min(u32::MAX),
+                size,
+            },
+        ))
+    });
+}
+
+/// 这一张完了，别把这份数留给下一张。
+pub fn forget_size() {
+    KNOWN.with(|k| *k.borrow_mut() = None);
+}
+
+/// 文件的大小和修改时间：先认扫描线带回来的那份，问不到才去 stat。
+/// 出图那条线判大小、备缓冲区都靠它。
+pub fn file_stamp(path: &str) -> Option<(u64, u32)> {
+    let st = stamp(path)?;
+    Some((st.size, st.mtime))
 }
 
 fn rec_bytes(k: &Key, s: &Slot) -> [u8; REC] {
@@ -457,13 +501,8 @@ fn to_rgba(jpg: &[u8]) -> Option<Rgba> {
 }
 
 /// 命中就返回紧凑 RGBA；原图改过、数据段读飞了、JPEG 解不开都算没命中，
-/// 后两种顺手把这条缩略图清掉，免得每次滚回来都撞同一堵墙。
-pub fn lookup(path: &str, bw: u32, bh: u32) -> Option<Rgba> {
-    lookup_full(path, bw, bh).map(|(img, _)| img)
-}
-
-/// 同上，另外告诉调用方这条记录里有没有现成指纹——没有就顺手补一个，
-/// 不用等"补齐指纹"那一趟。缩略图和指纹同一条记录，这里只多问一次表。
+/// 后两种顺手把这条缩略图清掉，免得每次滚回来都撞同一堵墙。另外告诉调用方
+/// 这条记录里有没有现成指纹——没有就顺手补一个，不用等"补齐指纹"那一趟。
 pub fn lookup_full(path: &str, bw: u32, bh: u32) -> Option<(Rgba, bool)> {
     if !enabled() {
         return None;
@@ -495,7 +534,8 @@ pub fn peek(path: &str, bw: u32, bh: u32) -> Option<Rgba> {
 
 /// 这条路径在这一档有没有"现在还作数"的缩略图：原图时间戳、大小都得对得上，
 /// 长度还得真有数据（只剩指纹的记录不算）。只查索引不解 JPEG，也不碰数据段——
-/// 扫描文件夹判断"这张扫过没有"靠它，几万张也只是几万次 stat 加查表。
+/// 扫描文件夹判断"这张扫过没有"靠它；扫描线把枚举拿到的大小和时间递下来时，
+/// 连问盘那一步都省了，几万张就只是几万次数值比对。
 pub fn has_thumb(path: &str, bw: u32, bh: u32) -> bool {
     if !enabled() || bw > u16::MAX as u32 || bh > u16::MAX as u32 {
         return false;
@@ -615,20 +655,8 @@ pub fn store(path: &str, bw: u32, bh: u32, img: &Rgba) {
 /// 出图时顺手把指纹一起写进这条记录。指纹是这一档缩略图算出来的，
 /// 所以它就该和这张缩略图同生共死，不再另写一份表。
 pub fn store_fp(path: &str, bw: u32, bh: u32, img: &Rgba, fp: Option<Fp>) {
-    let Some((st, key)) = stamp_key(path, bw, bh, img) else {
-        return;
-    };
-    if fp.is_none() {
-        if let Ok(i) = idx().lock() {
-            if i.map
-                .get(&key)
-                .is_some_and(|s| s.mtime == st.mtime && s.size == st.size && s.len > 0)
-            {
-                return;
-            }
-        }
-    }
-    put(path, st, key, img, fp);
+    let Some(jpg) = encode(img) else { return };
+    put_at(path, bw, bh, img, jpg, fp, false);
 }
 
 /// 重建那条线要用：同一个键不能"已经存过就跳过"，必须拿新解出来的那张盖上去。
@@ -638,10 +666,35 @@ pub fn replace(path: &str, bw: u32, bh: u32, img: &Rgba) {
 }
 
 pub fn replace_fp(path: &str, bw: u32, bh: u32, img: &Rgba, fp: Option<Fp>) {
+    let Some(jpg) = encode(img) else { return };
+    put_at(path, bw, bh, img, jpg, fp, true);
+}
+
+/// 出图线专用：JPEG 字节已经在手（刚编出来准备算指纹的那串），直接用，不再编第二遍。
+/// 缩略图和它的指纹进同一条索引记录，一次落盘。
+pub fn store_jpg(path: &str, bw: u32, bh: u32, img: &Rgba, jpg: Vec<u8>, fp: Option<Fp>) {
+    put_at(path, bw, bh, img, jpg, fp, false);
+}
+
+pub fn replace_jpg(path: &str, bw: u32, bh: u32, img: &Rgba, jpg: Vec<u8>, fp: Option<Fp>) {
+    put_at(path, bw, bh, img, jpg, fp, true);
+}
+
+fn put_at(path: &str, bw: u32, bh: u32, img: &Rgba, jpg: Vec<u8>, fp: Option<Fp>, force: bool) {
     let Some((st, key)) = stamp_key(path, bw, bh, img) else {
         return;
     };
-    put(path, st, key, img, fp);
+    if !force && fp.is_none() {
+        if let Ok(i) = idx().lock() {
+            if i.map
+                .get(&key)
+                .is_some_and(|s| s.mtime == st.mtime && s.size == st.size && s.len > 0)
+            {
+                return;
+            }
+        }
+    }
+    put(path, st, key, jpg, fp)
 }
 
 fn stamp_key(path: &str, bw: u32, bh: u32, img: &Rgba) -> Option<(Stamp, Key)> {
@@ -652,8 +705,9 @@ fn stamp_key(path: &str, bw: u32, bh: u32, img: &Rgba) -> Option<(Stamp, Key)> {
     Some((st, (fnv(path), bw as u16, bh as u16)))
 }
 
-fn put(path: &str, st: Stamp, key: Key, img: &Rgba, fp: Option<Fp>) {
-    note_path(path);
+/// 把一张位图编成缓存里那种 JPEG 字节。出图线先编一次拿到手，指纹从这串字节算、
+/// 落盘也落这串字节——同一份像素，不用写完再从盘上读回来解一遍。
+pub fn encode(img: &Rgba) -> Option<Vec<u8>> {
     // image 的 JPEG 编码器只收 L8/Rgb8（给 Rgba8 直接回 Unsupported），
     // 缩略图本来全不透明，所以扔掉 alpha 再编。
     let mut rgb = Vec::with_capacity((img.w as usize) * (img.h as usize) * 3);
@@ -664,12 +718,22 @@ fn put(path: &str, st: Stamp, key: Key, img: &Rgba, fp: Option<Fp>) {
     {
         let mut enc = JpegEncoder::new_with_quality(&mut jpg, 75);
         if enc.encode(&rgb, img.w, img.h, ExtendedColorType::Rgb8).is_err() {
-            return;
+            return None;
         }
     }
     if jpg.is_empty() || jpg.len() as u32 > MAX_REC_LEN {
-        return;
+        return None;
     }
+    Some(jpg)
+}
+
+/// 缓存里那种 JPEG 字节解回紧凑 RGBA。和从盘上读回来那条用的是同一个解码器。
+pub fn decode(jpg: &[u8]) -> Option<Rgba> {
+    to_rgba(jpg)
+}
+
+fn put(path: &str, st: Stamp, key: Key, jpg: Vec<u8>, fp: Option<Fp>) {
+    note_path(path);
     let slot = {
         let mut d = match dat().lock() {
             Ok(d) => d,

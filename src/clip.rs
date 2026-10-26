@@ -3,8 +3,11 @@
 
 use std::path::Path;
 
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HGLOBAL, HANDLE, GlobalFree};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
     SetClipboardData,
@@ -12,8 +15,9 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_MOVE};
 use windows::Win32::UI::Shell::{
-    CFSTR_PREFERREDDROPEFFECT, DROPFILES, DragQueryFileW, FO_COPY, FO_DELETE, FO_MOVE,
-    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT, HDROP,
+    CFSTR_PREFERREDDROPEFFECT, DROPFILES, DragQueryFileW, FILEOPERATION_FLAGS, FO_DELETE,
+    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT, FileOperation,
+    HDROP, IFileOperation, IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
     SHFileOperationW, SHFILEOPSTRUCTW,
 };
 
@@ -205,17 +209,16 @@ pub fn copy_name(dir: &Path, name: &str) -> String {
     unreachable!()
 }
 
-/// `SHFileOperationW` 的返回码翻成一句人话。分开"这里不让写"和"同名已存在"这两类，
-/// 不然用户看到的都是同一句"没反应"。
-pub fn shell_err(r: i32) -> String {
-    match r {
-        0 => String::new(),
-        2 => "找不到源文件".to_string(),
-        5 | 70 | 120 => "这个目录不允许写入（要管理员权限），换个普通文件夹".to_string(),
-        124 => "目标路径不对".to_string(),
-        112 => "目标盘满了".to_string(),
-        1223 => "取消了".to_string(),
-        _ => format!("系统返回错误码 {r}"),
+/// `IFileOperation` 抛出来的是 HRESULT，不是 `SHFileOperationW` 那套返回码，
+/// 常见几种翻成人话，别让用户对着 0x8007… 猜。
+fn op_err(e: &windows::core::Error) -> String {
+    match e.code().0 as u32 {
+        0x8007_0002 => "找不到源文件".to_string(),
+        0x8007_0005 => "这个位置不允许写入（要管理员权限），换个普通文件夹".to_string(),
+        0x8007_0020 => "文件正被占用".to_string(),
+        0x8007_0070 => "目标盘满了".to_string(),
+        0x8007_04c7 | 0x8027_0000 => "取消了".to_string(),
+        _ => format!("{e}"),
     }
 }
 
@@ -240,31 +243,155 @@ pub fn same_folder(src: &str, dir: &str) -> bool {
     !a.is_empty() && a == norm(dir)
 }
 
-/// 一次一个文件地交给 shell：`pTo` 写成完整目标路径，落出来的名字才是我们算好的那个
-/// （"名字 - 副本.ext"）。整批一次拷时 shell 只认目录、按原名落，撞名就悄悄不动，
-/// 同目录粘贴看着就像"没反应"。
-/// 标志只压掉"建目录确认"，进度框、出错框、要管理员权限那一律留给系统弹——
-/// 资源管理器怎么做，这里就怎么做。
-pub fn shell_move(src: &str, dst: &str, cut: bool) -> Result<(), String> {
-    let from = wide_list(&[src.to_string()]);
-    let to = wide_list(&[dst.to_string()]);
-    let mut op = SHFILEOPSTRUCTW {
-        wFunc: if cut { FO_MOVE } else { FO_COPY },
-        pFrom: PCWSTR(from.as_ptr()),
-        pTo: PCWSTR(to.as_ptr()),
-        fFlags: (FOF_NOCONFIRMMKDIR.0 | FOF_ALLOWUNDO.0) as u16,
-        ..Default::default()
-    };
-    let r = unsafe { SHFileOperationW(&mut op) };
-    if r != 0 {
-        return Err(shell_err(r));
+/// 一批文件一次交给系统搬：资源管理器自己的"粘贴"走的就是这套 `IFileOperation`，
+/// 建一次操作实例、把每项排进队列、最后 `PerformOperations` 一次性执行。
+/// 以前是每个文件单独调一次 `SHFileOperationW`，那样每项都要重新拉起一套 shell 拷贝引擎，
+/// 几十个小文件光这笔固定开销就好几秒（实测每个 0.13~0.6 秒，比拷字节本身贵得多），
+/// 所以同目录粘贴一堆小图比资源管理器慢一大截。
+/// `items` 是 (源, 目标完整路径) 对；返回实际落地的那些、没落地的个数、首条错误。
+pub fn transfer_many(items: &[(String, String)], cut: bool) -> (Vec<(String, String)>, usize, String) {
+    if items.is_empty() {
+        return (Vec::new(), 0, String::new());
     }
-    // 用户在"替换/跳过"那类系统弹框里点取消时，返回值照样是 0，
-    // 真相在这个标志位上——不查它，没发生的搬运会被当成成功记账。
-    if op.fAnyOperationsAborted.as_bool() {
-        return Err("取消了".to_string());
+    // 操作前记下源的"大小 + 修改时间"。系统拷完是原样抄这两个值，事后靠它分清
+    // "目标上落了新拷贝"和"撞名框里点了跳过"——跳过时目标还是老内容，不能当成搬成功。
+    let stamp: Vec<Option<(u64, std::time::SystemTime)>> = items
+        .iter()
+        .map(|(s, _)| {
+            std::fs::metadata(s)
+                .ok()
+                .and_then(|m| m.modified().ok().map(|t| (m.len(), t)))
+        })
+        .collect();
+    let mut err = String::new();
+    let mut aborted = false;
+    unsafe {
+        // 界面线程早就 OleInitialize 成了 STA，这里只是配个对，让后台拖放线程也能用。
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let op: Option<IFileOperation> = match CoCreateInstance(&FileOperation, None, CLSCTX_ALL) {
+            Ok(op) => Some(op),
+            Err(e) => {
+                err = format!("系统文件操作初始化失败（{}）", op_err(&e));
+                None
+            }
+        };
+        if let Some(op) = op {
+            if let Err(e) =
+                op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOF_NOCONFIRMMKDIR.0))
+            {
+                err = format!("设置文件操作参数失败（{}）", op_err(&e));
+            } else {
+                let mut cur_dir = String::new();
+                let mut dir_item: Option<IShellItem> = None;
+                for (src, dst) in items {
+                    let dst_path = Path::new(dst);
+                    let Some(name) = dst_path.file_name().map(|n| n.to_string_lossy().to_string())
+                    else {
+                        if err.is_empty() {
+                            err = "目标名不合法".to_string();
+                        }
+                        continue;
+                    };
+                    let Some(parent) = dst_path.parent() else {
+                        if err.is_empty() {
+                            err = "目标路径不合法".to_string();
+                        }
+                        continue;
+                    };
+                    let parent = parent.display().to_string();
+                    if dir_item.is_none() || parent != cur_dir {
+                        let w = HSTRING::from(parent.replace('/', "\\"));
+                        let it: windows::core::Result<IShellItem> =
+                            SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None);
+                        match it {
+                            Ok(it) => {
+                                dir_item = Some(it);
+                                cur_dir = parent;
+                            }
+                            Err(e) => {
+                                if err.is_empty() {
+                                    err = format!("找不到目标文件夹（{}）", op_err(&e));
+                                }
+                                dir_item = None;
+                                continue;
+                            }
+                        }
+                    }
+                    let folder = dir_item.as_ref().expect("上面刚建好");
+                    let sw = HSTRING::from(src.replace('/', "\\"));
+                    let item: windows::core::Result<IShellItem> =
+                        SHCreateItemFromParsingName(PCWSTR(sw.as_ptr()), None);
+                    let item = match item {
+                        Ok(it) => it,
+                        Err(e) => {
+                            if err.is_empty() {
+                                err = format!("找不到源文件（{}）", op_err(&e));
+                            }
+                            continue;
+                        }
+                    };
+                    let nw = HSTRING::from(name);
+                    let queued = if cut {
+                        op.MoveItem(
+                            &item,
+                            folder,
+                            PCWSTR(nw.as_ptr()),
+                            None::<&IFileOperationProgressSink>,
+                        )
+                    } else {
+                        op.CopyItem(
+                            &item,
+                            folder,
+                            PCWSTR(nw.as_ptr()),
+                            None::<&IFileOperationProgressSink>,
+                        )
+                    };
+                    if let Err(e) = queued {
+                        if err.is_empty() {
+                            err = format!("文件操作排队失败（{}）", op_err(&e));
+                        }
+                    }
+                }
+                if let Err(e) = op.PerformOperations() {
+                    if err.is_empty() {
+                        err = format!("文件操作失败（{}）", op_err(&e));
+                    }
+                }
+                aborted = op
+                    .GetAnyOperationsAborted()
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false);
+            }
+        }
+        if com.is_ok() {
+            CoUninitialize();
+        }
     }
-    Ok(())
+    // 排进队列不等于真落了盘：撞名框点跳过、单个文件被占用，整批照样回成功。
+    // 按文件系统实际状态逐项认账。
+    let mut done = Vec::new();
+    let mut skip = 0;
+    for (i, (src, dst)) in items.iter().enumerate() {
+        let m = std::fs::metadata(dst).ok();
+        let landed = match (&m, &stamp[i]) {
+            (None, _) => false,
+            // 搬走 = 源没了、目标在；源还在说明这项没动
+            (Some(_), _) if cut => !Path::new(src).exists(),
+            (Some(m), Some((len, t))) => {
+                m.len() == *len && m.modified().ok().as_ref() == Some(t)
+            }
+            (Some(_), None) => true,
+        };
+        if landed {
+            done.push((src.clone(), dst.clone()));
+        } else {
+            skip += 1;
+        }
+    }
+    if err.is_empty() && aborted {
+        err = "取消了".to_string();
+    }
+    (done, skip, err)
 }
 
 /// 把剪贴板里那批文件落进 `dir`。返回（成功的 源→目标 对，跳过的个数，失败原因）。
@@ -287,20 +414,8 @@ pub fn paste_into(paths: &[String], dir: &str, cut: bool) -> (Vec<(String, Strin
         let dst = out.join(dst_name).display().to_string();
         pairs.push((p.clone(), dst));
     }
-    let mut done: Vec<(String, String)> = Vec::new();
-    let mut err = String::new();
-    for (src, dst) in pairs {
-        match shell_move(&src, &dst, cut) {
-            Ok(()) => done.push((src, dst)),
-            Err(e) => {
-                skip += 1;
-                if err.is_empty() {
-                    err = e;
-                }
-            }
-        }
-    }
-    (done, skip, err)
+    let (done, more, err) = transfer_many(&pairs, cut);
+    (done, skip + more, err)
 }
 
 /// 删除到回收站，确认框由调用方先问过。

@@ -320,101 +320,9 @@ pub fn set_strip(st: crate::theme::Strip, face: Face) {
     }
 }
 
-/// 命令行口用：这扇在不在（在的话给它句柄，好拍图、好投消息）。
-pub fn window() -> Option<HWND> {
-    hwnd_of()
-}
-
-/// 命令行口跑测试时置真：建这扇就摆到屏幕外、也不抢前台。PrintWindow 拍得到
-/// 屏幕外的窗，所以图照样出，他手上的软件不受打扰。
-pub fn set_headless(on: bool) {
-    HEADLESS.store(on, Ordering::SeqCst);
-}
-
-fn headless() -> bool {
-    HEADLESS.load(Ordering::SeqCst)
-}
-
-static HEADLESS: AtomicBool = AtomicBool::new(false);
-
-/// 字符串进 JSON 之前过一遍：路径里的反斜杠和引号不转义，读的那头就散了。
-fn esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
-}
-
-/// 命令行口用：把画布此刻的状态写成一段 JSON。哪张图落在哪儿、解码回来没有、
-/// 弹层开在哪、那几行各占哪一块 —— 全都报出去，脚本照着行心点，不用猜坐标。
-pub fn probe_json() -> String {
-    let Some(g) = state().lock().ok() else { return "{}".into() };
-    let Some(s) = g.as_ref() else { return "{\"open\":false}".into() };
-    let (w, h) = (s.rc.right - s.rc.left, s.rc.bottom - s.rc.top);
-    let mut o = format!(
-        "{{\"open\":true,\"client\":[{w},{h}],\"dpi\":{},\"strip\":{},\"bg\":{},\"intro\":{},\"clip\":{}",
-        s.dpi,
-        s.strip,
-        s.bg,
-        s.intro,
-        s.clip
-    );
-    o.push_str(",\"cards\":[");
-    for (i, c) in s.cards.iter().enumerate() {
-        let (x, y, cw, ch) = match on_screen(c, s) {
-            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
-            None => (c.x, c.y, 0, 0),
-        };
-        if i > 0 {
-            o.push(',');
-        }
-        o.push_str(&format!(
-            "{{\"id\":{},\"x\":{x},\"y\":{y},\"w\":{cw},\"h\":{ch},\"scale\":{:.4},\"ready\":{},\"path\":\"{}\"}}",
-            c.id,
-            c.scale,
-            c.view.is_some(),
-            esc(&c.path)
-        ));
-    }
-    o.push(']');
-    match s.menu.as_ref() {
-        Some(m) => {
-            let card = match m.card {
-                Some(id) => id.to_string(),
-                None => "null".to_string(),
-            };
-            o.push_str(&format!(
-                ",\"menu\":{{\"x\":{},\"y\":{},\"card\":{card},\"paste\":{},\"hot\":{},\"rows\":[",
-                m.x, m.y, m.paste, m.hot
-            ));
-            for (i, (id, r)) in m.rows.iter().enumerate() {
-                if i > 0 {
-                    o.push(',');
-                }
-                o.push_str(&format!(
-                    "[{id},[{}, {}, {}, {}]]",
-                    r.left, r.top, r.right, r.bottom
-                ));
-            }
-            o.push_str("]}");
-        }
-        None => o.push_str(",\"menu\":null"),
-    }
-    o.push('}');
-    o
-}
-
 /// 全局只有这一扇
-static WIN: AtomicIsize = AtomicIsize::new(0);static REGISTERED: AtomicBool = AtomicBool::new(false);
+static WIN: AtomicIsize = AtomicIsize::new(0);
+static REGISTERED: AtomicBool = AtomicBool::new(false);
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn hwnd_of() -> Option<HWND> {
@@ -494,11 +402,8 @@ pub fn open(path: &str, pick: HWND) {
     }
     add_file(&p, None);
     if let Some(h) = hwnd_of() {
-        // 命令口跑测试时不抢前台：他那边正打字，前台被这扇抢走算事故
-        if !headless() {
-            unsafe {
-                let _ = SetForegroundWindow(h);
-            }
+        unsafe {
+            let _ = SetForegroundWindow(h);
         }
     }
 }
@@ -528,8 +433,6 @@ fn ensure(pick: HWND) -> Option<HWND> {
         let wh = ((work.bottom - work.top) * 6 / 10).max(360).min(620);
         let x = work.left + (work.right - work.left - ww) / 2;
         let y = work.top + (work.bottom - work.top - wh) / 2;
-        // 命令口跑测试：摆到屏幕外，真画但看不见，也不挡住他手上的活
-        let (x, y) = if headless() { (-32000, -32000) } else { (x, y) };
         let t = wide(TITLE);
         let hinst = HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0);
         let hwnd = CreateWindowExW(

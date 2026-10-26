@@ -43,15 +43,26 @@ pub fn make(path: &str, bw: u32, bh: u32) -> Result<Thumb> {
         return Err(Error::new(E_FAIL, "这张上次就解不开，跳过重试"));
     }
     let t = decode(path, bw, bh)?;
-    // 先把缩略图写进缓存，指纹再从盘上那张 JPEG 解回来算。查询时缓存命中走的
-    // 也是这条解码路径，入库要是用编码前的位图，纯色/平坦图会被压缩噪声
-    // 推到阈值之外——同一张图自己都搜不到自己。
-    crate::cache::store(path, bw, bh, &t.img);
-    if let Some(fp) = crate::sim::fp_from_cache(path, bw, bh) {
-        crate::cache::attach_fp(path, bw, bh, fp);
+    stash(path, bw, bh, &t.img, false);
+    Ok(t)
+}
+
+/// 缩略图和它的指纹一次入库：JPEG 只编一遍，索引只写一条记录。
+/// 指纹吃的就是这串要落盘的字节，和查询时从盘上读回来解的是同一串，
+/// 所以"入库和查询必须吃同一份像素"这条仍然成立，但省掉写完再读回来那一趟。
+fn stash(path: &str, bw: u32, bh: u32, img: &Rgba, force: bool) {
+    let Some(jpg) = crate::cache::encode(img) else {
+        return;
+    };
+    let fp = crate::sim::fp_of_jpg(path, bw, bh, &jpg);
+    if force {
+        crate::cache::replace_jpg(path, bw, bh, img, jpg, fp);
+    } else {
+        crate::cache::store_jpg(path, bw, bh, img, jpg, fp);
+    }
+    if let Some(fp) = fp {
         crate::sim::adopt(path, bw, bh, Some(fp));
     }
-    Ok(t)
 }
 
 /// 重建：绕开缓存把原图重解一遍，顺手和缓存里那张比一眼。
@@ -60,11 +71,7 @@ pub fn remake(path: &str, bw: u32, bh: u32) -> Result<(Thumb, bool)> {
     let old = crate::cache::peek(path, bw, bh);
     let t = decode(path, bw, bh)?;
     let ok = old.as_ref().is_some_and(|o| same_pic(o, &t.img));
-    crate::cache::replace(path, bw, bh, &t.img);
-    if let Some(fp) = crate::sim::fp_from_cache(path, bw, bh) {
-        crate::cache::attach_fp(path, bw, bh, fp);
-        crate::sim::adopt(path, bw, bh, Some(fp));
-    }
+    stash(path, bw, bh, &t.img, true);
     Ok((t, ok))
 }
 
@@ -102,7 +109,16 @@ fn decode(path: &str, bw: u32, bh: u32) -> Result<Thumb> {
     // （44MP 峰值 350MB）且 16 位上慢 7 倍，端到端持平，所以仍旧只走 WIC。
     // 档内预览坏掉不能把整张图判死：内嵌段解不动就回落到老实开原图。
     // （xmppmax_v1_10_1_5_g.jpg 正是这种：内嵌那段报 0x88982F61，原图 WIC 全解 243ms 好好的。）
-    let made = from_embedded(path, bw, bh)
+    // 一次开档拿回来的头，档内预览和方向两件事都从它读；整幅解码那条要读全文件，
+    // 只能再开一次，但不再为"问个方向"单独开第三趟。
+    // 只有本来就要看档内预览的格式才读这一截：PNG、TIFF、BMP 这些没预览也没方向，
+    // 给它们读 256KB 头纯属白花一次盘。
+    let head = if preview::has_preview(path) || preview::is_raw(path) {
+        preview::read_head(path, preview::HEAD).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let made = from_embedded(path, bw, bh, &head)
         .map(Ok)
         .unwrap_or_else(|| {
             // PSD 没有 WIC 解码器，档内预览又不可用时只剩自己解合成图这一条。
@@ -125,14 +141,15 @@ fn decode(path: &str, bw: u32, bh: u32) -> Result<Thumb> {
         &mut t.img.px,
         &mut t.img.w,
         &mut t.img.h,
-        preview::orientation(path),
+        preview::orient_head(&head),
     );
     Ok(t)
 }
 
 /// 6 MB 以上的档全尺寸位图就上百 MB，按这个线卡并发。
+/// 大小先认扫描线从目录枚举带回来的那份，问不到才去 stat。
 fn big_file(path: &str) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 6_000_000).unwrap_or(false)
+    crate::cache::file_stamp(path).is_some_and(|(len, _)| len > 6_000_000)
 }
 
 struct Permit(Sender<()>);
@@ -161,12 +178,15 @@ fn big_permit() -> Option<Permit> {
 const MEM_DECODE_MAX: u64 = 160 * 1024 * 1024;
 
 fn read_all(path: &str) -> Option<Vec<u8>> {
-    let m = std::fs::metadata(path).ok()?;
-    if m.len() > MEM_DECODE_MAX {
+    // 大小先认扫描线带回来的那份，问不到才去 stat。
+    let len = crate::cache::file_stamp(path)
+        .map(|(l, _)| l)
+        .or_else(|| std::fs::metadata(path).ok().map(|m| m.len()))?;
+    if len > MEM_DECODE_MAX {
         return None;
     }
     let mut f = std::fs::File::open(path).ok()?;
-    let mut v = Vec::with_capacity(m.len() as usize);
+    let mut v = Vec::with_capacity(len as usize);
     std::io::Read::read_to_end(&mut f, &mut v).ok()?;
     Some(v)
 }
@@ -231,7 +251,8 @@ struct Embedded {
 /// 档内自带预览开成一个 WIC 帧。格式不对、没有预览、或预览最大边还短于
 /// `min_short` 返回 None。门槛由各调用方自己定：缩略图要求够大，
 /// 看图第一帧只求别是 32px 图标，糊一点也比空白强。
-fn embedded_frame(path: &str, min_short: u32) -> Option<Embedded> {
+/// `head` 是调用方一次开档拿回来的头，预览段就从它里找。
+fn embedded_frame(path: &str, min_short: u32, head: &[u8]) -> Option<Embedded> {
     let raw = preview::is_raw(path);
     if !(raw || preview::has_preview(path)) {
         return None;
@@ -241,7 +262,7 @@ fn embedded_frame(path: &str, min_short: u32) -> Option<Embedded> {
     let bytes = if raw {
         preview::raw_preview(path)
     } else {
-        preview::embedded_bytes(path)
+        preview::embedded_bytes_at(path, head)
     };
     let bytes = bytes?;
     let factory = FACTORY.with(|f| f.clone());
@@ -268,11 +289,12 @@ fn embedded_frame(path: &str, min_short: u32) -> Option<Embedded> {
 
 /// 看图第一帧：只吃档内预览，零全尺寸解码。JPEG 巨型档这条是 1ms 出图。
 pub fn embedded_view(path: &str, bw: u32, bh: u32) -> Option<View> {
-    let e = embedded_frame(path, 64)?;
+    let head = preview::read_head(path, preview::HEAD)?;
+    let e = embedded_frame(path, 64, &head)?;
     let (mut nw, mut nh) = (0u32, 0u32);
     unsafe { e.frame.GetSize(&mut nw, &mut nh).ok()? };
     let (mut w, mut h, mut px) = crate::dec::source_to_box_bgra(&e.factory, &e.frame, bw, bh).ok()?;
-    let o = preview::orientation(path);
+    let o = preview::orient_head(&head);
     crate::dec::orient(&mut px, &mut w, &mut h, o);
     let (nw, nh) = if o >= 5 { (nh, nw) } else { (nw, nh) };
     Some(View { w, h, nw, nh, px })
@@ -280,14 +302,23 @@ pub fn embedded_view(path: &str, bw: u32, bh: u32) -> Option<View> {
 
 /// 有档内预览就直接用，省掉整张解码。预览撑不满目标框、或预览段解不出像素
 /// （建得出帧、CopyPixels 失败的坏预览）都返回 None，让调用方回落老实解码。
-fn from_embedded(path: &str, bw: u32, bh: u32) -> Option<Thumb> {
-    let e = embedded_frame(path, bw.min(bh))?;
-    crate::dec::source_to_box(&e.factory, &e.frame, bw, bh)
-        .ok()
-        .map(|img| Thumb {
-            img,
-            from_preview: true,
-        })
+/// PSD 单独放宽：Max 写进档里的预览长边一律不超过 160，而合成图整幅几百 MB，
+/// 为两百上下的格位去解它要几百毫秒、还要占住"大文件只许两路"的名额；
+/// 实测同一张 PSD 两种来路的缩略图拿去搜同场景的导出图最多差 16 位（认亲线 40），
+/// 所以小中格位直接用预览。但放大过 1.5 倍就不干了——418×288 那种大格位
+/// 铺一张 160 的小图是糊，不是降取样档次，那种仍旧整幅解。
+fn from_embedded(path: &str, bw: u32, bh: u32, head: &[u8]) -> Option<Thumb> {
+    let psd = preview::is_psd(path);
+    let min_short = if psd { 0 } else { bw.min(bh) };
+    let e = embedded_frame(path, min_short, head)?;
+    let img = crate::dec::source_to_box(&e.factory, &e.frame, bw, bh).ok()?;
+    if psd && (bw.max(bh) as f64) > 1.5 * (img.w.max(img.h) as f64) {
+        return None;
+    }
+    Some(Thumb {
+        img,
+        from_preview: true,
+    })
 }
 
 /// 解 PSD 合成图并缩到目标框，返回 (原图宽, 原图高, 出图宽, 出图高, BGRA)。

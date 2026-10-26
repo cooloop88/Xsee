@@ -202,6 +202,12 @@ pub fn orientation(path: &str) -> u16 {
     orient_of(&read_head(path, SNIFF_IFD).unwrap_or_default())
 }
 
+/// 方向已经从档头问出来了就别再开一次文件：出图线一趟只开一次档，
+/// 头交给预览、方向、宽高三件事共用。
+pub fn orient_head(head: &[u8]) -> u16 {
+    orient_of(head)
+}
+
 fn orient_of(d: &[u8]) -> u16 {
     let Some((e, base)) = tiff_at(d) else {
         return 1;
@@ -306,7 +312,12 @@ pub fn embedded(buf: &[u8]) -> Option<(usize, usize)> {
 /// 半条 JPEG 只会让 WIC 报错或解出坏图，不如多读一次盘。
 pub fn embedded_bytes(path: &str) -> Option<Vec<u8>> {
     let head = read_head(path, HEAD)?;
-    let (start, len) = embedded(&head)?;
+    embedded_bytes_at(path, &head)
+}
+
+/// 同上，但头由调用方给：出图线一次开档拿回来的头，预览和方向都从它读。
+pub fn embedded_bytes_at(path: &str, head: &[u8]) -> Option<Vec<u8>> {
+    let (start, len) = embedded(head)?;
     if start + len <= head.len() {
         return Some(head[start..start + len].to_vec());
     }

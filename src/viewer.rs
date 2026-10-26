@@ -363,10 +363,6 @@ pub fn shown() -> Option<String> {
     app().lock().unwrap().as_ref().and_then(|c| c.files.get(c.idx).cloned())
 }
 
-pub fn zoom_scale() -> f64 {
-    app().lock().unwrap().as_ref().map(|c| c.scale).unwrap_or(1.0)
-}
-
 pub fn title() -> String {
     let g = app().lock().unwrap();
     let Some(c) = g.as_ref() else { return String::new() };
